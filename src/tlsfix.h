@@ -1,6 +1,7 @@
 #ifndef TLSFIX_H
 #define TLSFIX_H
 
+#include <TargetConditionals.h>
 #include <Security/SecureTransport.h>
 #include <Security/Security.h>
 #include <CoreFoundation/CoreFoundation.h>
@@ -15,6 +16,14 @@
 #define ST_PeerAuth       -9841
 #define ST_Connected       2
 #define ST_TLS12           8
+
+#if !TARGET_OS_IPHONE
+// Security.framework on OS X exports SecKeyRawSign (verified present on 10.9.5) but
+// declares it only in the iOS headers, so declare it here for the mtls signing path.
+extern OSStatus SecKeyRawSign(SecKeyRef key, SecPadding padding,
+                              const uint8_t *dataToSign, size_t dataToSignLen,
+                              uint8_t *sig, size_t *sigLen);
+#endif
 
 typedef struct {
     SSLContextRef    ctx;

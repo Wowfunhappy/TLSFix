@@ -137,11 +137,16 @@ void capture_identity(Shadow *s, CFArrayRef certRefs) {
     s->clientX509 = x; s->clientChain = chain; s->clientKey = key; s->clientBypass = 0;
 }
 
-// provide our client cert during the handshake; -1 suspends before sending it
-static int cert_cb(SSL *ssl, void *arg) {
-    (void)arg;
+// Provides our client cert during the handshake; -1 suspends before sending it.
+//
+// LibreSSL has no SSL_set_cert_cb, so this uses the older SSL_CTX_set_client_cert_cb
+// contract instead: hand back owned references in *px509 / *ppkey (LibreSSL installs
+// the pair and then calls X509_free / EVP_PKEY_free on them) and return 1. Returning
+// -1 sets rwstate = SSL_X509_LOOKUP, surfacing as SSL_ERROR_WANT_X509_LOOKUP, which
+// is the pause point the pinning path relies on.
+static int client_cert_cb(SSL *ssl, X509 **px509, EVP_PKEY **ppkey) {
     Shadow *s = (Shadow *)SSL_get_ex_data(ssl, gSslExIdx);
-    if (!s || !s->clientX509) return 1;
+    if (!s || !s->clientX509) return 0;          // no identity -> send no certificate
     if (s->breakAuth && !s->approved) return -1;
     EVP_PKEY *certpub = X509_get_pubkey(s->clientX509);
     if (!certpub) return 0;
@@ -156,11 +161,12 @@ static int cert_cb(SSL *ssl, void *arg) {
     EVP_PKEY *pk = EVP_PKEY_new();
     if (!pk) { RSA_free(r); return 0; }
     EVP_PKEY_assign_RSA(pk, r);
-    int ok = (SSL_use_certificate(ssl, s->clientX509) == 1) && (SSL_use_PrivateKey(ssl, pk) == 1);
-    EVP_PKEY_free(pk);
-    if (ok && s->clientChain)
+    if (s->clientChain)
         for (int i = 0; i < sk_X509_num(s->clientChain); i++) SSL_add1_chain_cert(ssl, sk_X509_value(s->clientChain, i));
-    return ok ? 1 : 0;
+    X509_up_ref(s->clientX509);                  // callee owns both references
+    *px509 = s->clientX509;
+    *ppkey = pk;
+    return 1;
 }
 
 int ossl_init(Shadow *s) {
@@ -175,9 +181,12 @@ int ossl_init(Shadow *s) {
     if (s->host[0]) { SSL_set_tlsext_host_name(s->ssl, s->host); SSL_set1_host(s->ssl, s->host); }
     SSL_set_connect_state(s->ssl);
     if (s->clientX509) {
+        // Cap at TLS 1.2: signing goes through SecKeyRawSign, which produces PKCS#1
+        // signatures only, and TLS 1.3 mandates RSA-PSS. LibreSSL exposes no sigalgs-list
+        // API to narrow what we advertise within TLS 1.2 either, so a server that insists
+        // on PSS will fail the handshake -- touch the disabled-mtls flag to hand client
+        // certificate connections back to the system stack if that happens in practice.
         SSL_set_max_proto_version(s->ssl, TLS1_2_VERSION);
-        SSL_set1_client_sigalgs_list(s->ssl, "RSA+SHA256:RSA+SHA384:RSA+SHA512:RSA+SHA1");
-        SSL_set_cert_cb(s->ssl, cert_cb, NULL);
     }
     s->inited = 1;
     return 0;
@@ -253,7 +262,9 @@ int sh_build_trust(Shadow *s, SecTrustRef *trust) {
 static int g_state = 0;                          // 0 unchecked, 1 active, -1 setup failed
 static pthread_once_t g_once = PTHREAD_ONCE_INIT;
 static void do_ready(void) {
+#if TARGET_OS_IPHONE
     setenv("OPENSSL_armcap", "0", 1);               // skip OpenSSL ARM CPU-feature probe (armv6)
+#endif
     OPENSSL_init_ssl(0, NULL);
     gRsaExIdx = RSA_get_ex_new_index(0, NULL, NULL, NULL, NULL);
     gRsaMeth = RSA_meth_dup(RSA_get_default_method());
@@ -266,6 +277,9 @@ static void do_ready(void) {
         SSL_CTX_set_verify(gCtx, SSL_VERIFY_PEER, NULL);
         gSslExIdx = SSL_get_ex_new_index(0, NULL, NULL, NULL, NULL);
         SSL_CTX_set_cert_verify_callback(gCtx, verify_chain, NULL);
+        // Per-context rather than per-SSL (LibreSSL has no SSL_set_cert_cb). Harmless on
+        // connections without a client identity: the callback returns 0 for "no cert".
+        SSL_CTX_set_client_cert_cb(gCtx, client_cert_cb);
     }
     gBioMeth = BIO_meth_new(BIO_get_new_index() | BIO_TYPE_SOURCE_SINK, "cfnetwork");
     if (gBioMeth) {
