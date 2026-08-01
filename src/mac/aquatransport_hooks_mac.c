@@ -1,7 +1,7 @@
-// macOS hook layer for TLSFix (10.6 - 10.9).
+// macOS hook layer for AquaTransport (10.6 - 10.9).
 //
 // Injection is via DYLD_INSERT_LIBRARIES, so hooks are installed with dyld
-// interposing rather than MSHookFunction. Two consequences differ from the iOS build:
+// interposing rather than the MSHookFunction the original iOS tweak used. Two consequences:
 //
 //   1. Interposing rebinds call sites instead of patching function bodies, so the
 //      "function too small, clobbers adjacent memory" problem does not exist and
@@ -15,14 +15,16 @@
 // Do NOT use dlsym(RTLD_NEXT, ...) here: it resolves back to the replacement and
 // recurses until the process dies.
 
-#include "../tlsfix.h"
-#include "tlsfix_config.h"
+#include "../aquatransport.h"
+#include "aquatransport_config.h"
 #include <pthread.h>
 #include <string.h>
 #include <stdlib.h>
 #include <stdio.h>
 #include <unistd.h>
 #include <dlfcn.h>
+#include <mach-o/dyld.h>
+#include <mach-o/loader.h>
 
 #define DYLD_INTERPOSE(_repl, _orig)                                              \
     __attribute__((used)) static struct { const void *repl; const void *orig; }   \
@@ -30,15 +32,16 @@
         (const void *)(unsigned long)&_repl, (const void *)(unsigned long)&_orig  \
     };
 
-// Processes where injecting would recurse or destabilise the system.
-// ocspd performs the revocation fetches that SecTrustEvaluate triggers, and
-// securityd backs the keychain that SecTrustEvaluate queries, so both would
-// re-enter our verify path. ReportCrash is excluded so a fault here cannot
-// amplify into a crash-reporting loop.
+// The trust infrastructure itself. This is not a list of things that happen to break --
+// it is a circular dependency: our verify path calls SecTrustEvaluate, which these
+// processes implement. Routing their own traffic through that check would make trust
+// evaluation depend on trust evaluation. tf_reentrant() in the engine guards the
+// same-thread case; these are the processes where the cycle spans a process boundary.
+//
+// Nothing else is listed. If any other process misbehaves under injection, that is a bug
+// in the engine to fix, not a name to add here.
 static const char *kDeny[] = {
-    "ocspd", "securityd", "securityd_service", "trustd", "launchd",
-    "ReportCrash", "kextd", "notifyd", "configd", "opendirectoryd",
-    "DirectoryService", "syslogd", "distnoted", "mds", "mdworker", 0
+    "ocspd", "securityd", "securityd_service", "trustd", 0
 };
 
 static int g_on = 0;
@@ -52,36 +55,26 @@ static void gate_init(void) {
 }
 
 // Runtime gate. Lazily evaluated rather than set from the constructor because another
-// inserted library's initialiser could reach a hook before ours has run.
-static inline int tf_on(void) { pthread_once(&g_gate, gate_init); return g_on; }
+// inserted library's initialiser could reach a hook before ours has run. Also off while
+// we are inside our own Security calls, so a revocation fetch triggered by our trust
+// evaluation goes out over the system stack instead of recursing into us.
+static inline int tf_on(void) {
+    pthread_once(&g_gate, gate_init);
+    return g_on && !tf_reentrant();
+}
 
-// The URL rewriter lives in a separate Foundation-linked bundle. It is loaded only where
-// Foundation is already present, so daemons and command-line tools never pull Foundation
-// in on our account. dlopen failure is ignored on purpose: the TLS engine has to keep
-// working even when rewriting cannot load, and unlike a failed dyld insertion (fatal to
-// every process launch) a failed dlopen costs nothing.
-//
-// This registers as early as possible so no request escapes unrewritten. Deferring to the
-// main queue would be gentler on initialiser ordering but risks missing the first request
-// in tools that never spin a run loop.
+// Installs the URL rewriter's CFNetwork hooks. Pure C -- see src/mac/aquatransport_rewrite.c for
+// why it is not an Objective-C NSURLProtocol bundle any more, and why it rebinds by name
+// instead of interposing. Safe in every process, so there is no gating beyond the kill
+// switch: nothing is loaded, no framework is pulled in, and processes that never touch
+// CFNetwork simply have nothing to rebind.
+extern void tf_rewrite_install(void);
+
 __attribute__((constructor))
-static void tlsfix_init(void) {
+static void aquatransport_init(void) {
     if (!tf_on()) return;
     if (tf_flag("disabled-rewrite")) return;
-
-    // Probe for Foundation with a plain C symbol. Objective-C class symbols are not
-    // usable here: x86_64 uses the modern ABI (_OBJC_CLASS_$_NSURLProtocol) while i386
-    // uses the legacy runtime (.objc_class_name_NSURLProtocol), so a class-symbol probe
-    // silently fails on every 32-bit process. NSLog is spelled the same in both.
-    if (!dlsym(RTLD_DEFAULT, "NSLog")) return;
-
-    char p[1024];
-    snprintf(p, sizeof p, "%s/rewrite.bundle/Contents/MacOS/rewrite", tf_dir());
-    if (!dlopen(p, RTLD_LAZY | RTLD_LOCAL) && tf_flag("debug")) {
-        const char *e = dlerror();
-        FILE *f = fopen("/tmp/tlsfix.log", "a");
-        if (f) { fprintf(f, "[%s] rewrite bundle load failed: %s\n", getprogname(), e ? e : "?"); fclose(f); }
-    }
+    tf_rewrite_install();
 }
 
 static OSStatus my_SSLSetIOFuncs(SSLContextRef c, SSLReadFunc rf, SSLWriteFunc wf) {

@@ -1,4 +1,4 @@
-#include "tlsfix.h"
+#include "aquatransport.h"
 #include <openssl/x509.h>
 #include <openssl/x509_vfy.h>
 #include <openssl/bio.h>
@@ -19,6 +19,23 @@ static BIO_METHOD *gBioMeth = NULL;   // custom BIO bridged to CFNetwork's IO fu
 static RSA_METHOD *gRsaMeth = NULL;   // custom RSA method: private op to SecKeyRawSign (mtls)
 static int gRsaExIdx = -1;
 static int gSslExIdx = -1;
+
+static pthread_key_t gGuardKey;
+static pthread_once_t gGuardOnce = PTHREAD_ONCE_INIT;
+static void guard_init(void) { pthread_key_create(&gGuardKey, NULL); }
+
+void tf_guard_enter(void) {
+    pthread_once(&gGuardOnce, guard_init);
+    pthread_setspecific(gGuardKey, (void *)1);
+}
+void tf_guard_leave(void) {
+    pthread_once(&gGuardOnce, guard_init);
+    pthread_setspecific(gGuardKey, (void *)0);
+}
+int tf_reentrant(void) {
+    pthread_once(&gGuardOnce, guard_init);
+    return pthread_getspecific(gGuardKey) != NULL;
+}
 
 static void sh_free_mem(Shadow *s) {
     if (!s) return;
@@ -212,6 +229,7 @@ static int verify_chain(X509_STORE_CTX *sctx, void *arg) {
         if (der) OPENSSL_free(der);
     }
     CFStringRef host = (s && s->host[0]) ? CFStringCreateWithCString(NULL, s->host, kCFStringEncodingUTF8) : NULL;
+    tf_guard_enter();                       // anything Security opens from here is not ours to hook
     SecPolicyRef pol = SecPolicyCreateSSL(true, host);
     SecTrustRef t = NULL; int ok = 0;
     if (SecTrustCreateWithCertificates(arr, pol, &t) == errSecSuccess && t) {
@@ -220,6 +238,7 @@ static int verify_chain(X509_STORE_CTX *sctx, void *arg) {
         CFRelease(t);
     }
     if (pol) CFRelease(pol);
+    tf_guard_leave();
     if (host) CFRelease(host);
     CFRelease(arr);
     return ok;
@@ -249,12 +268,14 @@ int sh_build_trust(Shadow *s, SecTrustRef *trust) {
     SecPolicyRef pol = SecPolicyCreateSSL(true, hostStr);
     if (hostStr) CFRelease(hostStr);
     SecTrustRef t = NULL;
+    tf_guard_enter();
     OSStatus r = SecTrustCreateWithCertificates(arr, pol, &t);
     if (pol) CFRelease(pol);
     CFRelease(arr);
-    if (r != errSecSuccess) return 0;
+    if (r != errSecSuccess) { tf_guard_leave(); return 0; }
     SecTrustResultType rr = kSecTrustResultInvalid;
     SecTrustEvaluate(t, &rr);   // populate internal chain, a native handshake returns an evaluated trust, and CFNetwork's SocketStream path derefs it (SecTrustCopyExceptions)
+    tf_guard_leave();
     *trust = t;
     return 1;
 }
@@ -262,13 +283,10 @@ int sh_build_trust(Shadow *s, SecTrustRef *trust) {
 static int g_state = 0;                          // 0 unchecked, 1 active, -1 setup failed
 static pthread_once_t g_once = PTHREAD_ONCE_INIT;
 static void do_ready(void) {
-#if TARGET_OS_IPHONE
-    setenv("OPENSSL_armcap", "0", 1);               // skip OpenSSL ARM CPU-feature probe (armv6)
-#endif
     OPENSSL_init_ssl(0, NULL);
     gRsaExIdx = RSA_get_ex_new_index(0, NULL, NULL, NULL, NULL);
     gRsaMeth = RSA_meth_dup(RSA_get_default_method());
-    if (gRsaMeth) { RSA_meth_set1_name(gRsaMeth, "tlsfix-seckey"); RSA_meth_set_priv_enc(gRsaMeth, rsa_seckey_priv_enc); }
+    if (gRsaMeth) { RSA_meth_set1_name(gRsaMeth, "aquatransport-seckey"); RSA_meth_set_priv_enc(gRsaMeth, rsa_seckey_priv_enc); }
     gCtx = SSL_CTX_new(TLS_client_method());
     if (gCtx) {
         SSL_CTX_set_security_level(gCtx, 0);                          // allow legacy crypto / 1024-bit identities

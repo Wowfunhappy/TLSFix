@@ -22,6 +22,20 @@ SOFTWARE.
 
 ---
 
-The MIT license above covers TLSFix's own code. This repository also vendors
-Mbed TLS (under src/include/ and src/lib/), which is licensed separately by its authors
-under the Apache-2.0 license. See https://github.com/Mbed-TLS/mbedtls.
+The MIT license above covers AquaTransport's own code. AquaTransport is derived from
+TLSFix by nfzerox and ObscureMosquito (https://github.com/ObscureMosquito/TLSFix); the
+TLS engine in src/aquatransport_engine.c is substantially their work.
+
+This repository also vendors third-party code, licensed separately by its authors:
+
+  LibreSSL — deps/libressl-4.3.2.tar.gz
+      Statically linked into aquatransport.dylib. Carries a mix of licences: OpenBSD's
+      own code is ISC, and code inherited from OpenSSL remains under the dual
+      OpenSSL/SSLeay licence. The full texts are in the COPYING file inside the tarball.
+      See https://www.libressl.org/
+
+  fishhook — deps/fishhook/
+      Copyright (c) 2013, Facebook, Inc. All rights reserved.
+      Three-clause BSD licence; the full text is reproduced at the top of
+      deps/fishhook/fishhook.c and must be retained in source and binary
+      redistributions. See https://github.com/facebook/fishhook

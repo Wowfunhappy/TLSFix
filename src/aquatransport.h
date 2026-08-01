@@ -1,7 +1,6 @@
-#ifndef TLSFIX_H
-#define TLSFIX_H
+#ifndef AQUATRANSPORT_H
+#define AQUATRANSPORT_H
 
-#include <TargetConditionals.h>
 #include <Security/SecureTransport.h>
 #include <Security/Security.h>
 #include <CoreFoundation/CoreFoundation.h>
@@ -17,13 +16,12 @@
 #define ST_Connected       2
 #define ST_TLS12           8
 
-#if !TARGET_OS_IPHONE
-// Security.framework on OS X exports SecKeyRawSign (verified present on 10.9.5) but
-// declares it only in the iOS headers, so declare it here for the mtls signing path.
+// Security.framework on OS X exports SecKeyRawSign -- verified present on both 10.6.8 and
+// 10.9.5, in both slices -- but declares it only in the iOS headers, so declare it here for
+// the mtls signing path.
 extern OSStatus SecKeyRawSign(SecKeyRef key, SecPadding padding,
                               const uint8_t *dataToSign, size_t dataToSignLen,
                               uint8_t *sig, size_t *sigLen);
-#endif
 
 typedef struct {
     SSLContextRef    ctx;
@@ -43,6 +41,15 @@ typedef struct {
     int              refcount;
     SSL             *ssl;
 } Shadow;
+
+// Re-entrancy guard. Our verify path calls into Security, which may itself open a
+// connection (revocation checks); without this, that nested connection would come back
+// through our hooks and call Security again. Set around our own Security calls; hooks
+// fall through to the system stack while it is set. pthread_specific rather than __thread
+// because native TLS needs a 10.7+ deployment target.
+void       tf_guard_enter(void);
+void       tf_guard_leave(void);
+int        tf_reentrant(void);
 
 int        ensure_ready(void);
 Shadow    *sh_get(SSLContextRef c);

@@ -1,12 +1,12 @@
-# Prebuilt OpenSSL (provide src/openssl: lib/{libcrypto,libssl}.a + include/, builtins baked in)
-src/openssl/
-
 # Build output / intermediates
 .build/
-Packages/
-*.deb
 *.dylib
 *.o
+
+# ...except the vendored PowerPC no-op slice. It needs gcc-4.2 from Xcode 3.2.6 (clang has
+# no ppc backend), so it is committed prebuilt. Without it a system-wide install on 10.6
+# with Rosetta stops every PowerPC app from launching. Source: src/mac/ppcstub.c
+!deps/ppcstub/*.dylib
 
 # misc
 .DS_Store

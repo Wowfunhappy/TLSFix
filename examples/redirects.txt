@@ -1,0 +1,32 @@
+# AquaTransport URL redirects.
+#
+# One rule per block, blocks separated by blank lines. Three lines each:
+#   1. scope   -- "*" for every process, or a space-separated list of app bundle
+#                 names ("Pages Numbers Keynote"). A trailing ".app" is optional.
+#   2. from    -- matched as a URL prefix, so the remainder of the path and any
+#                 query string are preserved.
+#   3. to      -- replaces the matched prefix.
+#
+# Scope matches the process that actually issues the request. That is the app itself
+# for WebKit1 apps (Dictionary, HelpViewer, iWork, Twitter) and for anything using
+# NSURLConnection/NSURLSession directly. A WebKit2 app hands loads to the shared
+# com.apple.WebKit.Networking service, so scoping a rule to Safari will NOT work.
+
+# Help Center's Flamingo script
+HelpViewer
+https://help.apple.com/Library/Documentation/Resources/Flamingo/6/flamingo.js
+https://mavericksforever.com/resources/flamingo.js
+
+# iWork remote defaults
+Pages Numbers Keynote
+https://configuration.apple.com/configurations/internetservices/iworkapps/RemoteDefaults.plist
+https://mavericksforever.com/resources/RemoteDefaults.plist
+
+# Twitter API bridge -- any client, not just Twitter.app
+*
+https://api.twitter.com/
+https://twb.preloading.dev/
+
+*
+https://upload.twitter.com/
+https://twb.preloading.dev/
