@@ -1,25 +1,20 @@
 // Shared configuration for both AquaTransport subsystems on macOS.
 //
 // Files live in /Library/AquaTransport (override with AQUATRANSPORT_DIR for development).
-// headers.txt and redirects.txt keep AquaProxy's exact on-disk format so existing
-// rule files carry over unchanged and reverting to the proxy stays a one-line change.
 //
-// Sentinel flags are empty files whose presence turns something off:
-//   disabled          everything
-//   disabled-tls      the Secure Transport engine only
-//   disabled-rewrite  the URL rewriter only
-//
-// The kill switch is a file *presence* check rather than removal of the dylib,
-// because a missing or unreadable inserted library is fatal to every process launch.
+// flags.txt holds one flag name per line. Recognised flags:
+//   debug           log handshakes to /tmp/aquatransport-<uid>.log
+//   disabled-mtls   hand client-certificate connections back to the system stack
 
 #ifndef AQUATRANSPORT_CONFIG_H
 #define AQUATRANSPORT_CONFIG_H
 
 const char *tf_dir(void);
-int         tf_flag(const char *name);
+int         tf_flag(const char *name);   // is <name> a line in flags.txt?
 
-// Diagnostics. No-op unless the "debug" sentinel exists; the flag is read once per
-// process so leaving the check in hot paths costs a branch. Appends to /tmp/aquatransport.log.
+// Diagnostics. tf_debug() is a no-op unless "debug" is in flags.txt; it reads the flag once
+// per process, so the check costs a branch in hot paths. tf_log appends to
+// /tmp/aquatransport-<uid>.log.
 void tf_log(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
 int  tf_debug(void);
 
@@ -27,11 +22,15 @@ int  tf_debug(void);
 // the rule patterns contain literal '?' characters (".../api.php?action=").
 // Matching is anchored at the start and open-ended at the end, so
 // "https://*.wikipedia.org/w/api.php?action=" matches any URL with that prefix.
+// '*' matches any run of characters other than '/', so it spans subdomain labels or a
+// single path segment but can never reach past the component it appears in.
+// Used for both files: headers.txt patterns and redirects.txt "from" lines.
 int tf_glob_prefix(const char *pattern, const char *s);
 
-// Every rule block begins with a scope line: "*" for all processes, or a space-separated
-// list of app bundle names ("Dictionary", "Pages Numbers Keynote"). A trailing ".app" is
-// accepted and ignored, and the executable name is matched as well as the bundle name.
+// Every rule block begins with a scope line: "*" for all processes, or a comma-separated
+// list of app bundle names ("Dictionary", "Pages, Numbers, Keynote"). Commas rather than
+// spaces because executable names contain spaces ("QuickTime Player"). A trailing ".app"
+// is accepted and ignored, and the executable name is matched as well as the bundle name.
 typedef struct { char *scope; char *from; char *to; } tf_redirect;
 typedef struct { char *scope; char *pattern; char **lines; int nlines; } tf_headerrule;
 

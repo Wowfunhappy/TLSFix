@@ -5,13 +5,13 @@
 #   1. process launch  -- paid by EVERY process on the system, including ones that never make
 #                         a network connection. This is the one that matters for a global install.
 #   2. memory          -- resident size added per process.
-#   3. handshake       -- LibreSSL doing a handshake vs Secure Transport doing one.
+#   3. handshake       -- OpenSSL doing a handshake vs Secure Transport doing one.
 #   4. rewriting       -- per-request rule matching, including the rules-file stat().
 #
 # Run from the repo root after ./build-macos.sh. Installs nothing.
 
 DIR="$(cd "$(dirname "$0")/.." && pwd)"
-T="$DIR/.build/stage/Library/AquaTransport"
+T="$DIR/build/stage/Library/AquaTransport"
 D="$T/aquatransport.dylib"
 N="${N:-40}"
 export AQUATRANSPORT_DIR="$T"
@@ -36,7 +36,7 @@ echo "=== 1. process launch overhead (n=$N) ==="
 bench "/usr/bin/true (links nothing)"     "$N" /usr/bin/true
 bench "/bin/echo"                         "$N" /bin/echo hi
 bench "sw_vers (CoreFoundation)"          "$N" /usr/bin/sw_vers
-bench "urlprobe (Foundation, no request)" "$N" "$DIR/.build/urlprobe"
+bench "urlprobe (Foundation, no request)" "$N" "$DIR/build/urlprobe"
 
 echo
 echo "=== 2. resident memory added ==="
@@ -53,7 +53,7 @@ echo "  (dylib text is file-backed and shared between processes; only dirty page
 
 echo
 echo "=== 3. handshake + fetch, n=10 (includes network variance) ==="
-bench "httpsprobe www.cloudflare.com" 10 "$DIR/.build/httpsprobe" https://www.cloudflare.com/
+bench "httpsprobe www.cloudflare.com" 10 "$DIR/build/httpsprobe" https://www.cloudflare.com/
 
 echo
 echo "=== 4. rewriting cost: one non-matching rule vs no rules file, n=10 ==="
@@ -64,9 +64,9 @@ https://nonmatching.invalid/x
 https://example.com/y
 EOF
 rm -f "$T/headers.txt"
-w=$( { time ( for i in $(seq 10); do DYLD_INSERT_LIBRARIES="$D" "$DIR/.build/urlprobe" https://www.cloudflare.com/ >/dev/null 2>&1; done ) ; } 2>&1 )
+w=$( { time ( for i in $(seq 10); do DYLD_INSERT_LIBRARIES="$D" "$DIR/build/urlprobe" https://www.cloudflare.com/ >/dev/null 2>&1; done ) ; } 2>&1 )
 rm -f "$T/redirects.txt"
-o=$( { time ( for i in $(seq 10); do DYLD_INSERT_LIBRARIES="$D" "$DIR/.build/urlprobe" https://www.cloudflare.com/ >/dev/null 2>&1; done ) ; } 2>&1 )
+o=$( { time ( for i in $(seq 10); do DYLD_INSERT_LIBRARIES="$D" "$DIR/build/urlprobe" https://www.cloudflare.com/ >/dev/null 2>&1; done ) ; } 2>&1 )
 [ -f "$T/redirects.txt.bak" ] && mv -f "$T/redirects.txt.bak" "$T/redirects.txt"
 [ -f "$T/headers.txt.bak" ]   && mv -f "$T/headers.txt.bak"   "$T/headers.txt"
 printf "  %-36s %7s ms -> %7s ms\n" "no rules file / one rule" "$(ms "$o" 10)" "$(ms "$w" 10)"

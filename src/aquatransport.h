@@ -13,6 +13,7 @@
 #define ST_ClosedGraceful -9805
 #define ST_ClosedAbort    -9806
 #define ST_PeerAuth       -9841
+#define ST_Internal       -9838
 #define ST_Connected       2
 #define ST_TLS12           8
 
@@ -22,6 +23,14 @@
 extern OSStatus SecKeyRawSign(SecKeyRef key, SecPadding padding,
                               const uint8_t *dataToSign, size_t dataToSignLen,
                               uint8_t *sig, size_t *sigLen);
+
+// Same story for SecKeyDecrypt, which is how the PSS path reaches a bare private-key
+// operation -- see rsa_seckey_priv_enc. SecKeyRawSign cannot do it: its kSecPaddingNone
+// still applies PKCS#1 v1.5 padding on OS X ("None" means no DigestInfo, not no padding),
+// measured as an input cap of blocksize-11 on 10.9.5 -- tools/pssprobe.c reproduces it.
+extern OSStatus SecKeyDecrypt(SecKeyRef key, SecPadding padding,
+                              const uint8_t *cipherText, size_t cipherTextLen,
+                              uint8_t *plainText, size_t *plainTextLen);
 
 typedef struct {
     SSLContextRef    ctx;
@@ -40,6 +49,9 @@ typedef struct {
     unsigned         lastUse;
     int              refcount;
     SSL             *ssl;
+    // Evaluated peer trust for this connection, built once. CFNetwork asks for it on every
+    // request, so it is built per connection rather than per request. See sh_build_trust.
+    SecTrustRef      trust;
 } Shadow;
 
 // Re-entrancy guard. Our verify path calls into Security, which may itself open a

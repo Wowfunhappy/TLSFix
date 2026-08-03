@@ -6,9 +6,13 @@
 #include <unistd.h>
 #include <pthread.h>
 #include <sys/stat.h>
+#include <sys/time.h>
+#include <time.h>
 #include <mach-o/dyld.h>
 
 #define TF_DEFAULT_DIR "/Library/AquaTransport"
+
+static int stat_mtime(const char *name, time_t *t);
 
 const char *tf_dir(void) {
     static const char *d = NULL;
@@ -23,10 +27,61 @@ static void tf_path(const char *name, char *out, size_t n) {
     snprintf(out, n, "%s/%s", tf_dir(), name);
 }
 
+// Rule and flag files are re-read whenever their mtime changes, so an edit applies without
+// restarting anything. The check is throttled to once a second: unthrottled it costs a stat()
+// per request for each of redirects.txt and headers.txt, and a full open/read of flags.txt on
+// every connection presenting a client certificate. A second is far below the granularity at
+// which anyone edits these files. Callers hold the relevant lock.
+static int recheck_due(time_t *last) {
+    time_t now = time(NULL);
+    if (now == *last) return 0;
+    *last = now;
+    return 1;
+}
+
+// A flag is on when its name appears on its own line in flags.txt (one flag per line),
+// alongside headers.txt and redirects.txt. Recognised flags: "debug" and "disabled-mtls".
+static pthread_mutex_t gFlagLock = PTHREAD_MUTEX_INITIALIZER;
+static char  **gFlagName = NULL;
+static int     gNFlag = 0;
+static time_t  gFlagMtime = 0, gFlagCheck = 0;
+static int     gFlagLoaded = 0;
+
 int tf_flag(const char *name) {
-    char p[1024]; struct stat st;
-    tf_path(name, p, sizeof p);
-    return stat(p, &st) == 0;
+    if (!name || !*name) return 0;
+    pthread_mutex_lock(&gFlagLock);
+    if (!gFlagLoaded || recheck_due(&gFlagCheck)) {
+        time_t m = 0;
+        int present = stat_mtime("flags.txt", &m);
+        if (!gFlagLoaded || (present && m != gFlagMtime) || (!present && gNFlag)) {
+            for (int i = 0; i < gNFlag; i++) free(gFlagName[i]);
+            free(gFlagName); gFlagName = NULL; gNFlag = 0;
+            char p[1024];
+            tf_path("flags.txt", p, sizeof p);
+            FILE *f = fopen(p, "r");
+            if (f) {
+                char buf[512];
+                while (fgets(buf, sizeof buf, f)) {
+                    size_t l = strlen(buf);
+                    while (l && (buf[l-1] == '\n' || buf[l-1] == '\r' || buf[l-1] == ' ' || buf[l-1] == '\t')) buf[--l] = 0;
+                    if (!l) continue;
+                    char **nn = (char **)realloc(gFlagName, sizeof(char *) * (gNFlag + 1));
+                    if (!nn) break;
+                    gFlagName = nn;
+                    gFlagName[gNFlag] = strdup(buf);
+                    if (!gFlagName[gNFlag]) break;
+                    gNFlag++;
+                }
+                fclose(f);
+            }
+            gFlagMtime = present ? m : 0;
+            gFlagLoaded = 1;
+        }
+    }
+    int hit = 0;
+    for (int i = 0; i < gNFlag; i++) if (!strcmp(gFlagName[i], name)) { hit = 1; break; }
+    pthread_mutex_unlock(&gFlagLock);
+    return hit;
 }
 
 static pthread_once_t gDbgOnce = PTHREAD_ONCE_INIT;
@@ -43,24 +98,46 @@ void tf_log(const char *fmt, ...) {
     snprintf(path, sizeof path, "/tmp/aquatransport-%u.log", (unsigned)getuid());
     FILE *f = fopen(path, "a");
     if (!f) return;
-    fprintf(f, "[%d %s] ", (int)getpid(), getprogname() ? getprogname() : "?");
+    struct timeval tv; gettimeofday(&tv, NULL);
+    fprintf(f, "%ld.%03d [%d %s] ", (long)tv.tv_sec, (int)(tv.tv_usec / 1000),
+            (int)getpid(), getprogname() ? getprogname() : "?");
     va_list ap; va_start(ap, fmt); vfprintf(f, fmt, ap); va_end(ap);
     fputc('\n', f);
     fclose(f);
 }
 
-int tf_glob_prefix(const char *pattern, const char *s) {
+// '*' deliberately does not match '/'. Without that restriction it backtracks across the
+// whole URL, so "https://*.apple.com/" also matches
+// "https://tracker.example/?u=https://cdn.apple.com/x" -- the star eats the real host and
+// a rule meant for one site fires on another. Confining it to a single path segment keeps
+// multi-label subdomains working ("*" covers "en.m" in "en.m.wikipedia.org") while a star
+// can never escape the component it sits in.
+//
+// On success *consumed, when given, receives how many bytes of s the pattern accounted for.
+// Redirects need that: with a wildcard in the pattern the matched length differs from
+// strlen(pattern), and the tail past it is what gets spliced onto the replacement.
+static int glob_prefix(const char *pattern, const char *s, size_t *consumed) {
     if (!pattern || !s) return 0;
+    const char *s0 = s;
     const char *star = NULL, *sp = NULL;
     while (*s) {
         if (*pattern == '*') { star = ++pattern; sp = s; }
         else if (*pattern == *s) { pattern++; s++; }
-        else if (star) { pattern = star; s = ++sp; }
+        else if (star && *sp != '/') { pattern = star; s = ++sp; }
         else return 0;
-        if (!*pattern) return 1;               // pattern exhausted -> prefix matched
+        if (!*pattern) {                       // pattern exhausted -> prefix matched
+            if (consumed) *consumed = (size_t)(s - s0);
+            return 1;
+        }
     }
     while (*pattern == '*') pattern++;
-    return *pattern == 0;
+    if (*pattern) return 0;                    // s ran out with pattern left over
+    if (consumed) *consumed = (size_t)(s - s0);
+    return 1;
+}
+
+int tf_glob_prefix(const char *pattern, const char *s) {
+    return glob_prefix(pattern, s, NULL);
 }
 
 // ---- scope matching --------------------------------------------------------
@@ -99,26 +176,31 @@ static void id_init(void) {
     }
 }
 
+// Tokens are separated by commas, not spaces: plenty of executables have a space in the
+// name ("QuickTime Player", "App Store"). Whitespace around a token is trimmed, so
+// "Pages, Numbers, Keynote" and "Pages,Numbers,Keynote" are the same list, and empty
+// tokens are skipped.
 int tf_scope_matches(const char *scope) {
     if (!scope || !*scope) return 0;
     pthread_once(&gIdOnce, id_init);
     const char *p = scope;
     while (*p) {
-        while (*p == ' ' || *p == '\t') p++;
-        if (!*p) break;
         const char *end = p;
-        while (*end && *end != ' ' && *end != '\t') end++;
-        size_t len = (size_t)(end - p);
+        while (*end && *end != ',') end++;
+        const char *tok_end = end;
+        while (p < tok_end && (*p == ' ' || *p == '\t')) p++;
+        while (tok_end > p && (tok_end[-1] == ' ' || tok_end[-1] == '\t')) tok_end--;
+        size_t len = (size_t)(tok_end - p);
         if (len == 1 && *p == '*') return 1;
         // Accept "Foo" and "Foo.app" alike.
-        if (len > 4 && !strncmp(end - 4, ".app", 4)) len -= 4;
+        if (len > 4 && !strncmp(tok_end - 4, ".app", 4)) len -= 4;
         if (len && len < 256) {
             char tok[256];
             memcpy(tok, p, len); tok[len] = 0;
             if (gAppName[0] && !strcmp(tok, gAppName)) return 1;
             if (gExeName[0] && !strcmp(tok, gExeName)) return 1;
         }
-        p = end;
+        p = (*end == ',') ? end + 1 : end;
     }
     return 0;
 }
@@ -150,7 +232,7 @@ static int read_blocks(const char *name, block **out, time_t *mtime) {
     while (fgets(buf, sizeof buf, f)) {
         size_t l = strlen(buf);
         while (l && (buf[l-1] == '\n' || buf[l-1] == '\r' || buf[l-1] == ' ' || buf[l-1] == '\t')) buf[--l] = 0;
-        if (l == 0 || buf[0] == '#') {                      // blank line or comment ends a block
+        if (l == 0) {                                       // blank line ends a block
             if (cur.n) {
                 blocks = (block *)realloc(blocks, sizeof(block) * (nb + 1));
                 blocks[nb++] = cur; cur.line = NULL; cur.n = 0;
@@ -170,6 +252,7 @@ static pthread_mutex_t gLock = PTHREAD_MUTEX_INITIALIZER;
 
 static tf_redirect *gRed = NULL; static int gNRed = 0; static time_t gRedMtime = 0; static int gRedLoaded = 0;
 static tf_headerrule *gHdr = NULL; static int gNHdr = 0; static time_t gHdrMtime = 0; static int gHdrLoaded = 0;
+static time_t gRedCheck = 0, gHdrCheck = 0;
 
 static int stat_mtime(const char *name, time_t *t) {
     char p[1024]; struct stat st;
@@ -181,8 +264,9 @@ static int stat_mtime(const char *name, time_t *t) {
 int tf_redirects(const tf_redirect **out) {
     pthread_mutex_lock(&gLock);
     time_t m = 0;
-    int present = stat_mtime("redirects.txt", &m);
-    if (!gRedLoaded || (present && m != gRedMtime) || (!present && gNRed)) {
+    int present = (!gRedLoaded || recheck_due(&gRedCheck)) ? stat_mtime("redirects.txt", &m) : -1;
+    if (present < 0) { /* checked within the last second; use what is loaded */ }
+    else if (!gRedLoaded || (present && m != gRedMtime) || (!present && gNRed)) {
         for (int i = 0; i < gNRed; i++) { free(gRed[i].scope); free(gRed[i].from); free(gRed[i].to); }
         free(gRed); gRed = NULL; gNRed = 0;
         block *b = NULL; time_t mt = 0;
@@ -195,11 +279,6 @@ int tf_redirects(const tf_redirect **out) {
                     gRed[gNRed].from  = strdup(b[i].line[1]);
                     gRed[gNRed].to    = strdup(b[i].line[2]);
                     gNRed++;
-                } else {
-                    // Most likely a pre-scope rules file, where a block was just from/to.
-                    tf_log("redirects.txt: ignoring %d-line block starting \"%s\" "
-                           "(needs a scope line first: \"*\" or app names)",
-                           b[i].n, b[i].n ? b[i].line[0] : "");
                 }
                 block_free(&b[i]);
             }
@@ -216,8 +295,9 @@ int tf_redirects(const tf_redirect **out) {
 int tf_headerrules(const tf_headerrule **out) {
     pthread_mutex_lock(&gLock);
     time_t m = 0;
-    int present = stat_mtime("headers.txt", &m);
-    if (!gHdrLoaded || (present && m != gHdrMtime) || (!present && gNHdr)) {
+    int present = (!gHdrLoaded || recheck_due(&gHdrCheck)) ? stat_mtime("headers.txt", &m) : -1;
+    if (present < 0) { /* checked within the last second; use what is loaded */ }
+    else if (!gHdrLoaded || (present && m != gHdrMtime) || (!present && gNHdr)) {
         for (int i = 0; i < gNHdr; i++) {
             free(gHdr[i].scope);
             free(gHdr[i].pattern);
@@ -237,10 +317,6 @@ int tf_headerrules(const tf_headerrule **out) {
                     gHdr[gNHdr].lines   = (char **)calloc(b[i].n - 2, sizeof(char *));
                     for (int j = 2; j < b[i].n; j++) gHdr[gNHdr].lines[j-2] = strdup(b[i].line[j]);
                     gNHdr++;
-                } else {
-                    tf_log("headers.txt: ignoring %d-line block starting \"%s\" "
-                           "(needs a scope line first: \"*\" or app names)",
-                           b[i].n, b[i].n ? b[i].line[0] : "");
                 }
                 block_free(&b[i]);
             }
@@ -265,7 +341,7 @@ int tf_name_listed(const char *file, const char *name) {
     while (fgets(buf, sizeof buf, f)) {
         size_t l = strlen(buf);
         while (l && (buf[l-1] == '\n' || buf[l-1] == '\r' || buf[l-1] == ' ' || buf[l-1] == '\t')) buf[--l] = 0;
-        if (l == 0 || buf[0] == '#') continue;
+        if (l == 0) continue;
         if (!strcmp(buf, name)) { hit = 1; break; }
     }
     fclose(f);
@@ -278,8 +354,8 @@ char *tf_apply_redirect(const char *url) {
     int n = tf_redirects(&r);
     for (int i = 0; i < n; i++) {
         if (!tf_scope_matches(r[i].scope)) continue;
-        size_t fl = strlen(r[i].from);
-        if (strncmp(url, r[i].from, fl) != 0) continue;
+        size_t fl = 0;
+        if (!glob_prefix(r[i].from, url, &fl)) continue;
         const char *tail = url + fl;
         size_t need = strlen(r[i].to) + strlen(tail) + 1;
         char *out = (char *)malloc(need);

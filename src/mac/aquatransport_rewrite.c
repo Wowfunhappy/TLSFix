@@ -2,14 +2,14 @@
 //
 // WHY NOT NSURLProtocol
 //
-// The original implementation was an Objective-C bundle dlopen'd into each process. That
-// pulls Foundation and the ObjC runtime in before main(), which is fatal to anything that
-// forks without exec: sshd's privilege-separation child aborted in libdispatch and every
-// ssh connection died. loginwindow was also implicated in a login-keychain failure. No
-// per-process gate fixed it -- "a Foundation symbol is resolvable" is true inside sshd,
-// and "the main executable links Foundation" excludes Safari and WebProcess (they reach it
-// through WebKit) while including loginwindow. Excluding processes by name only hides the
-// fragility.
+// An Objective-C NSURLProtocol bundle would have to dlopen into each process, pulling
+// Foundation and the ObjC runtime in before main() -- fatal to anything that forks without
+// exec: sshd's privilege-separation child aborts in libdispatch and every ssh connection
+// dies, and loginwindow hits a login-keychain failure. No per-process gate avoids it --
+// "a Foundation symbol is resolvable" is true inside sshd, and "the main executable links
+// Foundation" excludes Safari and WebProcess (they reach it through WebKit) while including
+// loginwindow. Excluding processes by name only hides the fragility. Pure C on CFNetwork's
+// own API touches none of that.
 //
 // Foundation's own URL loading is built on the C API used here (Foundation imports 69 of
 // these symbols on 10.9, 53 on 10.6.8), so working at this level covers NSURLConnection,
@@ -23,14 +23,13 @@
 //   10.9  /System/Library/Frameworks/CFNetwork.framework/Versions/A/CFNetwork
 //   10.6  /System/Library/Frameworks/CoreServices.framework/Versions/A/Frameworks/...
 //
-// A dylib linked against either path fails to load on the other, and a failed insertion is
-// fatal to every process. fishhook rebinds by *name* at runtime, so nothing is linked and
-// processes without CFNetwork are untouched.
+// A dylib linked against either path fails to load at all on the other OS. fishhook rebinds
+// by *name* at runtime, so nothing is linked and processes without CFNetwork are untouched.
 //
-// THE HOOK POINTS were determined by experiment, not from headers. Sync and async funnel
-// through different entry points, and the request argument position was identified by
-// recording pointers returned from the request-creating functions and testing the funnel
-// arguments for pointer *equality* -- no guessed pointer is ever dereferenced:
+// THE HOOK POINTS come from experiment, not from headers. Sync and async funnel through
+// different entry points, and the request argument position is the one found by recording
+// pointers returned from the request-creating functions and testing the funnel arguments for
+// pointer *equality* -- no guessed pointer is ever dereferenced:
 //
 //   CFURLConnectionSendSynchronousRequest   arg0 = CFURLRequestRef   (sync)
 //   CFURLConnectionCreateWithProperties     arg1 = CFURLRequestRef   (async)
@@ -82,11 +81,10 @@ static const tf_headerrule *match_headers(const char *url) {
 }
 
 // Applies the rules to an already-mutable request, in place. Returns 1 if anything
-// changed. Idempotent: once a redirect has been applied the rule's "from" prefix no longer
-// matches, so a second pass over the same request does nothing.
+// changed. Idempotent: an applied redirect leaves a URL the rule's "from" prefix does not
+// match, so a second pass over the same request does nothing.
 static int apply_rules(void *m) {
     if (!m || !resolved()) return 0;
-    if (tf_flag("disabled") || tf_flag("disabled-rewrite")) return 0;
 
     CFURLRef url = p_GetURL(m);
     if (!url) return 0;
@@ -105,7 +103,14 @@ static int apply_rules(void *m) {
             p_SetURL(m, nu);
             // Host is derived from the URL; a stale explicit one would follow us to the
             // new host and be wrong.
-            p_SetHeader(m, CFSTR("Host"), NULL);
+            //
+            // Built rather than written as CFSTR("Host"): a constant CFString is a *data*
+            // reference to CoreFoundation (___CFConstantStringClassReference), and the one
+            // thing lazy linking does not allow is a data reference. Lazy linking is what
+            // lets this library be loaded into a process that has not initialised
+            // CoreFoundation, which is what removes the need for any load-time gate.
+            CFStringRef hostKey = CFStringCreateWithCString(NULL, "Host", kCFStringEncodingUTF8);
+            if (hostKey) { p_SetHeader(m, hostKey, NULL); CFRelease(hostKey); }
             CFRelease(nu);
         }
         if (s) CFRelease(s);

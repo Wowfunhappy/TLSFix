@@ -1,5 +1,5 @@
 # Build output / intermediates
-.build/
+build/
 *.dylib
 *.o
 

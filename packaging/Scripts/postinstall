@@ -1,0 +1,96 @@
+#!/bin/bash
+# AquaTransport postinstall.
+#
+# Runs after the payload (/Library/AquaTransport/{aquatransport.dylib,aqinject,aqwatch} plus
+# rule files) is on disk. It installs the aqwatch LaunchDaemon, which loads the library into
+# each process as the process launches, and loads it into everything already running. Nothing
+# is written to launchd's global environment, so a faulty library is confined to the process
+# it is loaded into and can never keep the machine from starting.
+#
+# $3 is the target volume, which is not always "/".
+
+set -e
+TARGET="${3:-/}"
+DEST="$TARGET/Library/AquaTransport"
+DYLIB="$DEST/aquatransport.dylib"
+PLIST_LABEL="org.aquatransport.watch"
+PLIST="$TARGET/Library/LaunchDaemons/$PLIST_LABEL.plist"
+
+say() { echo "AquaTransport: $*"; }
+
+# ---- 1. sanity-check the payload ------------------------------------------------------
+# aqinject loads a chosen slice into a chosen process, so a missing slice would only leave
+# some targets unpatched -- but a build missing a slice is a packaging error, so refuse it.
+[ -f "$DYLIB" ]        || { say "FATAL: $DYLIB missing"; exit 1; }
+[ -x "$DEST/aqinject" ] || { say "FATAL: $DEST/aqinject missing"; exit 1; }
+[ -x "$DEST/aqwatch" ]  || { say "FATAL: $DEST/aqwatch missing"; exit 1; }
+
+if [ -x /usr/bin/lipo ]; then ARCHS=$(/usr/bin/lipo -info "$DYLIB" 2>/dev/null | sed 's/.*://')
+else ARCHS=$(/usr/bin/file "$DYLIB" 2>/dev/null); fi
+for a in x86_64 i386; do
+  case "$ARCHS" in
+    *"$a"*) ;;
+    *) say "FATAL: $DYLIB has no $a slice (found:$ARCHS); aqinject could not load into $a processes."
+       exit 1 ;;
+  esac
+done
+
+# ---- 2. ownership and permissions ----------------------------------------------------
+# The dylib is loaded into root daemons, so a user-writable path would be a privilege
+# escalation. Enforce regardless of how the payload was built.
+chown -R root:wheel "$DEST"
+chmod 0755 "$DEST"
+find "$DEST" -type f -exec chmod 0644 {} +
+chmod 0755 "$DEST/aqinject" "$DEST/aqwatch"
+[ -f "$DEST/uninstall.sh" ] && chmod 0755 "$DEST/uninstall.sh"
+
+# ---- 3. seed config files without overwriting existing ones --------------------------
+for f in redirects.txt headers.txt flags.txt; do
+  if [ ! -f "$DEST/$f" ] && [ -f "$DEST/examples/$f" ]; then
+    cp "$DEST/examples/$f" "$DEST/$f"
+    chown root:wheel "$DEST/$f"; chmod 0644 "$DEST/$f"
+    say "installed default $f"
+  else
+    say "kept existing $f"
+  fi
+done
+
+# ---- 4. install the watcher LaunchDaemon ---------------------------------------------
+mkdir -p "$TARGET/Library/LaunchDaemons"
+cat > "$PLIST" <<PLIST_EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>$PLIST_LABEL</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/Library/AquaTransport/aqwatch</string>
+    <string>/Library/AquaTransport/aquatransport.dylib</string>
+    <string>/Library/AquaTransport/aqinject</string>
+  </array>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><true/>
+</dict>
+</plist>
+PLIST_EOF
+chown root:wheel "$PLIST"; chmod 0644 "$PLIST"
+
+# ---- 5. start now if installing onto the running system -------------------------------
+# On a target volume that is not the running system, only the plist is placed; it starts on
+# that volume's next boot. On the live system, start the watcher and cover what is running.
+if [ "$TARGET" = "/" ]; then
+  launchctl load -w /System/Library/LaunchDaemons/com.apple.auditd.plist 2>/dev/null || true
+  audit -i 2>/dev/null || true
+  launchctl unload "$PLIST" 2>/dev/null || true
+  launchctl load "$PLIST" 2>/dev/null || true
+  "$DEST/aqinject" --all "$DYLIB" 2>/dev/null || true
+  say "watcher running; loaded into running processes."
+else
+  say "watcher installed on $TARGET; it starts on that volume's next boot."
+fi
+
+say "installed. No restart required."
+say "Optional flags (one per line) go in $DEST/flags.txt:  debug, disabled-mtls"
+say "To uninstall:  sudo $DEST/uninstall.sh"
+exit 0

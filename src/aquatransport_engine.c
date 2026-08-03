@@ -8,6 +8,29 @@
 #include <pthread.h>
 #include <string.h>
 #include <stdlib.h>
+#include <dlfcn.h>
+#include <sys/time.h>
+
+extern void tf_log(const char *fmt, ...);
+extern int  tf_debug(void);
+
+// CoreFoundation and Security are linked lazily, so this library can be loaded into a process
+// that has not initialised them -- which is what lets it be loaded into any process at any
+// time, with no gate (see build-macos.sh and the header of aquatransport_hooks_mac.c). A
+// *data* reference would defeat that: the linker refuses outright with "illegal data
+// reference to _kCFTypeArrayCallBacks in lazy loaded dylib". So the one callbacks struct we
+// need is looked up by name instead of referenced directly.
+//
+// Only ever reached from inside a hook, which means from a process that is already using
+// CoreFoundation, so the lookup always succeeds there. The racing initialisation is benign:
+// both threads resolve the same address.
+static double tf_now_ms(void);
+
+static const CFArrayCallBacks *cf_type_array_cb(void) {
+    static const CFArrayCallBacks *cb = NULL;
+    if (!cb) cb = (const CFArrayCallBacks *)dlsym(RTLD_DEFAULT, "kCFTypeArrayCallBacks");
+    return cb;
+}
 
 #define MAXSH 256
 static Shadow *gTab[MAXSH];
@@ -37,12 +60,88 @@ int tf_reentrant(void) {
     return pthread_getspecific(gGuardKey) != NULL;
 }
 
+// ---- client session cache --------------------------------------------------
+//
+// Secure Transport keeps a session cache, so the engine keeps one too: without it every
+// connection pays a full handshake where the stock stack resumes, costing an extra round trip
+// against a TLS 1.2 server plus the certificate chain and its signature checks. A browser
+// opens a lot of connections to the same host, so this is the difference that matters most.
+//
+// Keyed on the peer name, which is the name the handshake is bound to (SSL_set1_host) and
+// therefore the only thing a session may be reused for.
+//
+// Connections carrying a client certificate are deliberately never cached or resumed: the
+// cache key does not include the identity, so a resumed session could otherwise carry an
+// identity the caller did not choose for this connection. mTLS connections are rare and a
+// full handshake for them costs nothing anyone will notice.
+//
+// Resumption skips the certificate message, so verify_chain does not run on a resumed
+// connection. That is correct and is what every TLS client does -- a session only enters this
+// cache after a handshake that already verified -- and it does not weaken the app-verified
+// path either: the chain lives on in the SSL_SESSION, so SSLCopyPeerTrust still hands
+// CFNetwork the same certificates to evaluate, on a resumed connection as on a fresh one.
+#define MAXSESS 32
+typedef struct { char host[256]; SSL_SESSION *sess; unsigned lastUse; } SessEnt;
+static SessEnt gSess[MAXSESS];
+static unsigned gSessClock = 0;
+static pthread_mutex_t gSessLock = PTHREAD_MUTEX_INITIALIZER;
+
+static SSL_SESSION *sess_get(const char *host) {
+    if (!host || !host[0]) return NULL;
+    SSL_SESSION *r = NULL;
+    pthread_mutex_lock(&gSessLock);
+    for (int i = 0; i < MAXSESS; i++) {
+        if (gSess[i].sess && !strcmp(gSess[i].host, host)) {
+            gSess[i].lastUse = ++gSessClock;
+            r = gSess[i].sess;
+            SSL_SESSION_up_ref(r);
+            break;
+        }
+    }
+    pthread_mutex_unlock(&gSessLock);
+    return r;
+}
+
+// Takes ownership of sess (the new_session_cb reference).
+static void sess_put(const char *host, SSL_SESSION *sess) {
+    if (!host || !host[0] || !sess) { if (sess) SSL_SESSION_free(sess); return; }
+    SSL_SESSION *drop = NULL;
+    pthread_mutex_lock(&gSessLock);
+    int slot = -1;
+    for (int i = 0; i < MAXSESS; i++) {
+        if (gSess[i].sess && !strcmp(gSess[i].host, host)) { slot = i; break; }
+        if (!gSess[i].sess && slot < 0) slot = i;
+    }
+    if (slot < 0) {                                  // full: evict least recently used
+        slot = 0;
+        for (int i = 1; i < MAXSESS; i++) if (gSess[i].lastUse < gSess[slot].lastUse) slot = i;
+    }
+    drop = gSess[slot].sess;                         // replaced or evicted, freed below
+    snprintf(gSess[slot].host, sizeof gSess[slot].host, "%s", host);
+    gSess[slot].sess = sess;
+    gSess[slot].lastUse = ++gSessClock;
+    pthread_mutex_unlock(&gSessLock);
+    if (drop) SSL_SESSION_free(drop);
+}
+
+// Returning 1 keeps the reference OpenSSL handed us; returning 0 lets it free the session.
+// For TLS 1.3 this fires when the server's NewSessionTicket arrives, which is after the
+// handshake -- during an SSL_read -- so it must not assume it is running inside a handshake.
+static int new_session_cb(SSL *ssl, SSL_SESSION *sess) {
+    Shadow *s = (Shadow *)SSL_get_ex_data(ssl, gSslExIdx);
+    if (!s || !s->host[0] || s->clientX509) return 0;
+    if (tf_debug()) tf_log("session cached  host=%s", s->host);
+    sess_put(s->host, sess);
+    return 1;
+}
+
 static void sh_free_mem(Shadow *s) {
     if (!s) return;
     if (s->ssl) SSL_free(s->ssl);
     if (s->clientX509) X509_free(s->clientX509);
     if (s->clientChain) sk_X509_pop_free(s->clientChain, X509_free);
     if (s->clientKey) CFRelease(s->clientKey);
+    if (s->trust) CFRelease(s->trust);
     free(s);
 }
 void sh_release(Shadow *s) {
@@ -63,6 +162,7 @@ Shadow *sh_get(SSLContextRef c) {
 }
 Shadow *sh_create(SSLContextRef c) {
     Shadow *evicted = NULL; int freeEvicted = 0;
+    const char *evictedHost = NULL; int evictedState = 0;
     pthread_mutex_lock(&gLock);
     Shadow *s = NULL;
     for (int i = 0; i < MAXSH; i++) if (gTab[i] && gTab[i]->ctx == c) { s = gTab[i]; s->lastUse = ++gClock; s->refcount++; break; }
@@ -76,11 +176,14 @@ Shadow *sh_create(SSLContextRef c) {
                 int lru = 0; for (int i = 1; i < MAXSH; i++) if (gTab[i]->lastUse < gTab[lru]->lastUse) lru = i;
                 evicted = gTab[lru]; slot = lru;
                 if (--evicted->refcount == 0) freeEvicted = 1;
+                evictedHost = evicted->host; evictedState = evicted->state;
             }
             gTab[slot] = s;
         }
     }
     pthread_mutex_unlock(&gLock);
+    if (evictedHost && tf_debug())
+        tf_log("SHADOW TABLE FULL: evicted host=%s state=%d", evictedHost[0] ? evictedHost : "(none)", evictedState);
     if (freeEvicted) sh_free_mem(evicted);
     return s;
 }
@@ -116,12 +219,54 @@ static long bio_ctrl(BIO *b, int cmd, long num, void *ptr) { (void)b; (void)num;
 static int bio_create(BIO *b) { BIO_set_init(b, 1); return 1; }
 static int bio_destroy(BIO *b) { (void)b; return 1; }
 
+// Signs with the Keychain's copy of the private key; the key itself never leaves it.
+//
+// Two padding modes arrive here, and both are needed. OpenSSL chooses the CertificateVerify
+// algorithm from what the server offers, without consulting what this method supports, and
+// rsa_pss_rsae_* sits ahead of rsa_pkcs1_* in the modern defaults; TLS 1.3 goes further and
+// permits nothing but PSS. So a PKCS#1-only signer would lose the handshake against most
+// current servers and every 1.3 one.
+//
+// SSL_set1_client_sigalgs_list could force PKCS#1 instead -- that is what the iOS original
+// does -- but it trades away TLS 1.3 client certificates altogether. Signing PSS properly is
+// the better side of that trade, and costs one extra branch here.
+//
+// PKCS#1 goes to SecKeyRawSign whole. PSS cannot: OpenSSL has already built the padded block
+// (rsa_pmeth.c: RSA_padding_add_PKCS1_PSS_mgf1, then RSA_private_encrypt with RSA_NO_PADDING)
+// and needs a bare m^d mod n over it, but SecKeyRawSign's kSecPaddingNone still applies PKCS#1
+// v1.5 padding on OS X and rejects a full-block input outright. SecKeyDecrypt's kSecPaddingNone
+// is the operation we actually want -- an RSA private decrypt with no padding is the same
+// modular exponentiation as a raw sign. Measured on 10.9.5 by tools/pssprobe.c, which signs
+// through this exact path and verifies the result against the public key.
+//
+// The key still never leaves the keychain either way.
 static int rsa_seckey_priv_enc(int flen, const unsigned char *from, unsigned char *to, RSA *rsa, int padding) {
     SecKeyRef key = (SecKeyRef)RSA_get_ex_data(rsa, gRsaExIdx);
-    if (!key || padding != RSA_PKCS1_PADDING) return -1;
-    size_t tlen = SecKeyGetBlockSize(key);
-    OSStatus s = SecKeyRawSign(key, kSecPaddingPKCS1, from, (size_t)flen, to, &tlen);
-    return (s == errSecSuccess) ? (int)tlen : -1;
+    if (!key) return -1;
+    size_t blk = SecKeyGetBlockSize(key);
+    if (blk == 0 || flen < 0 || (size_t)flen > blk) return -1;
+    size_t tlen = blk;
+    OSStatus st;
+    if (padding == RSA_PKCS1_PADDING) {
+        st = SecKeyRawSign(key, kSecPaddingPKCS1, from, (size_t)flen, to, &tlen);
+    } else if (padding == RSA_NO_PADDING) {
+        if ((size_t)flen != blk) return -1;      // a raw op takes exactly one block
+        st = SecKeyDecrypt(key, kSecPaddingNone, from, (size_t)flen, to, &tlen);
+    } else {
+        return -1;
+    }
+    if (st != errSecSuccess) return -1;
+    if (tlen == 0 || tlen > blk) return -1;
+    // The result is m^d mod n, so it carries a leading zero byte about one time in 256, and a
+    // CSP that hands back the minimal-length integer would return a short block. OpenSSL uses
+    // this return value verbatim as the signature length (rsa_pmeth.c: *siglen = ret), so a
+    // short block would be an intermittent malformed signature. Right-align and zero-fill.
+    if (tlen < blk) {
+        memmove(to + (blk - tlen), to, tlen);
+        memset(to, 0, blk - tlen);
+        tlen = blk;
+    }
+    return (int)tlen;
 }
 
 void capture_identity(Shadow *s, CFArrayRef certRefs) {
@@ -156,11 +301,15 @@ void capture_identity(Shadow *s, CFArrayRef certRefs) {
 
 // Provides our client cert during the handshake; -1 suspends before sending it.
 //
-// LibreSSL has no SSL_set_cert_cb, so this uses the older SSL_CTX_set_client_cert_cb
-// contract instead: hand back owned references in *px509 / *ppkey (LibreSSL installs
-// the pair and then calls X509_free / EVP_PKEY_free on them) and return 1. Returning
-// -1 sets rwstate = SSL_X509_LOOKUP, surfacing as SSL_ERROR_WANT_X509_LOOKUP, which
-// is the pause point the pinning path relies on.
+// Uses the SSL_CTX_set_client_cert_cb contract: hand back owned references in
+// *px509 / *ppkey (tls_prepare_client_certificate installs the pair, then calls
+// X509_free / EVP_PKEY_free on them) and return 1. Returning -1 sets
+// rwstate = SSL_X509_LOOKUP, surfacing as SSL_ERROR_WANT_X509_LOOKUP, which is the
+// pause point the pinning path relies on -- and which OpenSSL honours at every TLS
+// version, so this one callback covers 1.0 through 1.3.
+//
+// SSL_set_cert_cb would be the per-SSL alternative, but it has no way to say "suspend",
+// so the pinning pause could not be expressed through it.
 static int client_cert_cb(SSL *ssl, X509 **px509, EVP_PKEY **ppkey) {
     Shadow *s = (Shadow *)SSL_get_ex_data(ssl, gSslExIdx);
     if (!s || !s->clientX509) return 0;          // no identity -> send no certificate
@@ -196,17 +345,55 @@ int ossl_init(Shadow *s) {
     BIO_set_init(bio, 1);
     SSL_set_bio(s->ssl, bio, bio);
     if (s->host[0]) { SSL_set_tlsext_host_name(s->ssl, s->host); SSL_set1_host(s->ssl, s->host); }
-    SSL_set_connect_state(s->ssl);
-    if (s->clientX509) {
-        // Cap at TLS 1.2: signing goes through SecKeyRawSign, which produces PKCS#1
-        // signatures only, and TLS 1.3 mandates RSA-PSS. LibreSSL exposes no sigalgs-list
-        // API to narrow what we advertise within TLS 1.2 either, so a server that insists
-        // on PSS will fail the handshake -- touch the disabled-mtls flag to hand client
-        // certificate connections back to the system stack if that happens in practice.
-        SSL_set_max_proto_version(s->ssl, TLS1_2_VERSION);
+    // Ask the server to staple its OCSP response into the handshake. A server that does not
+    // support this ignores the extension. See attach_stapled_ocsp for what the response saves.
+    SSL_set_tlsext_status_type(s->ssl, TLSEXT_STATUSTYPE_ocsp);
+    // Offer a cached session for this host, if we have one and this connection is not
+    // presenting a client certificate (see the cache comment). OpenSSL checks the session's
+    // own validity and falls back to a full handshake if it has expired or the server
+    // declines it, so nothing here has to reason about lifetime.
+    if (!s->clientX509) {
+        SSL_SESSION *cached = sess_get(s->host);
+        if (tf_debug()) tf_log("session %s   host=%s", cached ? "offered" : "MISS   ", s->host);
+        if (cached) { SSL_set_session(s->ssl, cached); SSL_SESSION_free(cached); }
     }
+    SSL_set_connect_state(s->ssl);
+    // Client-certificate connections need no version cap. Both halves TLS 1.3 requires are
+    // in place: rsa_seckey_priv_enc produces the RSA-PSS signature it mandates, and OpenSSL
+    // drives the client certificate from tls_prepare_client_certificate(), which is version
+    // agnostic -- it calls client_cert_cb for 1.3 as well, and honours the same -1 ->
+    // SSL_X509_LOOKUP suspend the pinning pause depends on. tools/mtlsprobe.c covers this
+    // against a tls1_3-only server requiring a client certificate.
     s->inited = 1;
     return 0;
+}
+
+// Hands Security the OCSP response the server stapled into the handshake, before it evaluates.
+//
+// Trust evaluation on OS X checks revocation, and with nothing stapled it asks ocspd, which
+// fetches from the CA over the network -- a synchronous round trip sitting on the connection's
+// critical path, paid on every chain it has not seen before. Requesting the staple and passing
+// it here answers the same question without leaving the machine.
+//
+// Resolved by name because the deployment range reaches back to 10.6; where it is absent the
+// evaluation simply proceeds as it did before.
+// Returns the size of the response attached, or 0 if the server stapled nothing.
+static long attach_stapled_ocsp(Shadow *s, SecTrustRef t) {
+    static OSStatus (*setResp)(SecTrustRef, CFTypeRef);
+    static int resolved;
+    if (!resolved) {
+        resolved = 1;
+        setResp = (OSStatus (*)(SecTrustRef, CFTypeRef))dlsym(RTLD_DEFAULT, "SecTrustSetOCSPResponse");
+    }
+    if (!setResp || !s || !s->ssl) return 0;
+    const unsigned char *resp = NULL;
+    long n = SSL_get_tlsext_status_ocsp_resp(s->ssl, &resp);
+    if (n <= 0 || !resp) return 0;
+    CFDataRef d = CFDataCreate(NULL, resp, (CFIndex)n);
+    if (!d) return 0;
+    setResp(t, d);
+    CFRelease(d);
+    return n;
 }
 
 // verification: the device's own system trust store
@@ -217,7 +404,8 @@ static int verify_chain(X509_STORE_CTX *sctx, void *arg) {
     if (s && s->breakAuth) return 1;
     STACK_OF(X509) *chain = X509_STORE_CTX_get0_untrusted(sctx);
     if (!chain || sk_X509_num(chain) < 1) return 0;
-    CFMutableArrayRef arr = CFArrayCreateMutable(NULL, 0, &kCFTypeArrayCallBacks);
+    double vt0 = tf_debug() ? tf_now_ms() : 0;
+    CFMutableArrayRef arr = CFArrayCreateMutable(NULL, 0, cf_type_array_cb());
     for (int i = 0; i < sk_X509_num(chain); i++) {
         unsigned char *der = NULL; int dl = i2d_X509(sk_X509_value(chain, i), &der);
         if (dl > 0 && der) {
@@ -233,12 +421,16 @@ static int verify_chain(X509_STORE_CTX *sctx, void *arg) {
     SecPolicyRef pol = SecPolicyCreateSSL(true, host);
     SecTrustRef t = NULL; int ok = 0;
     if (SecTrustCreateWithCertificates(arr, pol, &t) == errSecSuccess && t) {
+        attach_stapled_ocsp(s, t);
         SecTrustResultType rr = kSecTrustResultInvalid;
         if (SecTrustEvaluate(t, &rr) == errSecSuccess && (rr == kSecTrustResultProceed || rr == kSecTrustResultUnspecified)) ok = 1;
         CFRelease(t);
     }
     if (pol) CFRelease(pol);
     tf_guard_leave();
+    if (tf_debug()) tf_log("verify_chain host=%s took %.0f ms certs=%ld ok=%d",
+                           s && s->host[0] ? s->host : "?", tf_now_ms() - vt0,
+                           (long)CFArrayGetCount(arr), ok);
     if (host) CFRelease(host);
     CFRelease(arr);
     return ok;
@@ -248,7 +440,7 @@ static int verify_chain(X509_STORE_CTX *sctx, void *arg) {
 CFArrayRef sh_cert_array(Shadow *s) {
     STACK_OF(X509) *chain = SSL_get_peer_cert_chain(s->ssl);
     if (!chain) return NULL;
-    CFMutableArrayRef arr = CFArrayCreateMutable(NULL, 0, &kCFTypeArrayCallBacks);
+    CFMutableArrayRef arr = CFArrayCreateMutable(NULL, 0, cf_type_array_cb());
     for (int i = 0; i < sk_X509_num(chain); i++) {
         unsigned char *der = NULL; int dl = i2d_X509(sk_X509_value(chain, i), &der);
         if (dl > 0 && der) {
@@ -261,9 +453,31 @@ CFArrayRef sh_cert_array(Shadow *s) {
     }
     return arr;
 }
+static double tf_now_ms(void){struct timeval t;gettimeofday(&t,NULL);return t.tv_sec*1000.0+t.tv_usec/1000.0;}
+
+// Builds the peer trust CFNetwork evaluates, once per connection.
+//
+// CFNetwork calls SSLCopyPeerTrust for every *request*, and each fresh SecTrustRef costs a
+// fresh SecTrustEvaluate: ~335ms on this hardware, effectively all of it in
+// Security.framework's CryptKit bignum routines verifying the chain's signatures. Caching per
+// connection is what keeps that off the per-request path, and the system's own caching cannot
+// stand in for it, because every call hands it newly created certificates.
+//
+// Once per connection is also what the stock stack does. Measured, native CPU on 10.9.5,
+// same host: one connection serving 6 requests costs 0.595s and 12 requests 0.644s, so
+// requests are free; six connections serving one request each cost 2.164s, about 314ms per
+// connection. It evaluates per connection and does not carry the result between connections.
+//
+// The peer chain cannot change within a connection, so the decision cannot either. Each caller
+// gets its own reference, because SSLCopyPeerTrust has copy semantics and CFNetwork releases
+// what it is given. The cache is dropped whenever the SSL object is re-initialised, since that
+// means a new handshake and a new chain.
 int sh_build_trust(Shadow *s, SecTrustRef *trust) {
+    if (s->trust) { CFRetain(s->trust); *trust = s->trust; return 1; }
+    double t0 = tf_debug() ? tf_now_ms() : 0;
     CFArrayRef arr = sh_cert_array(s);
     if (!arr) return 0;
+    long ncerts = (long)CFArrayGetCount(arr);
     CFStringRef hostStr = s->host[0] ? CFStringCreateWithCString(NULL, s->host, kCFStringEncodingUTF8) : NULL;
     SecPolicyRef pol = SecPolicyCreateSSL(true, hostStr);
     if (hostStr) CFRelease(hostStr);
@@ -273,9 +487,13 @@ int sh_build_trust(Shadow *s, SecTrustRef *trust) {
     if (pol) CFRelease(pol);
     CFRelease(arr);
     if (r != errSecSuccess) { tf_guard_leave(); return 0; }
+    long stapled = attach_stapled_ocsp(s, t);
     SecTrustResultType rr = kSecTrustResultInvalid;
     SecTrustEvaluate(t, &rr);   // populate internal chain, a native handshake returns an evaluated trust, and CFNetwork's SocketStream path derefs it (SecTrustCopyExceptions)
     tf_guard_leave();
+    if (tf_debug()) tf_log("build_trust host=%s took %.0f ms stapled=%ld certs=%ld resumed=%d", s->host, tf_now_ms() - t0, stapled, ncerts, SSL_session_reused(s->ssl));
+    s->trust = t;                 // connection's copy, released with the Shadow
+    CFRetain(t);                  // caller's copy: SSLCopyPeerTrust hands out a reference
     *trust = t;
     return 1;
 }
@@ -292,11 +510,26 @@ static void do_ready(void) {
         SSL_CTX_set_security_level(gCtx, 0);                          // allow legacy crypto / 1024-bit identities
         SSL_CTX_set_min_proto_version(gCtx, TLS1_VERSION);            // TLS 1.0 .. 1.3
         SSL_CTX_set_max_proto_version(gCtx, TLS1_3_VERSION);
+        // Security level 0 permits the old suites but does not offer them: the default list
+        // still excludes them, so a TLS 1.0-only server sees nothing it can use and the
+        // handshake dies on cipher overlap rather than version. "ALL" restores the legacy
+        // suites; level 0 above is what makes them usable once selected. This pair is the
+        // whole reason a stock 10.6-era server stays reachable.
+        SSL_CTX_set_cipher_list(gCtx, "ALL");
         SSL_CTX_set_verify(gCtx, SSL_VERIFY_PEER, NULL);
         gSslExIdx = SSL_get_ex_new_index(0, NULL, NULL, NULL, NULL);
         SSL_CTX_set_cert_verify_callback(gCtx, verify_chain, NULL);
-        // Per-context rather than per-SSL (LibreSSL has no SSL_set_cert_cb). Harmless on
-        // connections without a client identity: the callback returns 0 for "no cert".
+        // Client session cache. OpenSSL's own store is server-side only, so the sessions are
+        // kept by new_session_cb above; NO_INTERNAL_STORE says so explicitly rather than
+        // relying on that. Without CACHE_CLIENT the callback is never invoked at all.
+        SSL_CTX_set_session_cache_mode(gCtx, SSL_SESS_CACHE_CLIENT | SSL_SESS_CACHE_NO_INTERNAL_STORE);
+        SSL_CTX_sess_set_new_cb(gCtx, new_session_cb);
+        // Frees the 34KB of read/write buffers an idle connection would otherwise hold. A
+        // browser keeps many connections open and mostly idle, so this is the difference
+        // between tens of KB and a megabyte or two of dirty pages per process.
+        SSL_CTX_set_mode(gCtx, SSL_MODE_RELEASE_BUFFERS);
+        // Per-context rather than per-SSL. Harmless on connections without a client
+        // identity: the callback returns 0 for "no cert".
         SSL_CTX_set_client_cert_cb(gCtx, client_cert_cb);
     }
     gBioMeth = BIO_meth_new(BIO_get_new_index() | BIO_TYPE_SOURCE_SINK, "cfnetwork");

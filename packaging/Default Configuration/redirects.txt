@@ -1,0 +1,15 @@
+HelpViewer
+https://help.apple.com/Library/Documentation/Resources/Flamingo/6/flamingo.js
+https://mavericksforever.com/resources/flamingo.js
+
+Pages, Numbers, Keynote
+https://configuration.apple.com/configurations/internetservices/iworkapps/RemoteDefaults.plist
+https://mavericksforever.com/resources/RemoteDefaults.plist
+
+*
+https://api.twitter.com/
+https://twb.preloading.dev/
+
+*
+https://upload.twitter.com/
+https://twb.preloading.dev/

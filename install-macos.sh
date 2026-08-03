@@ -1,44 +1,38 @@
 #!/bin/bash
-# Installs AquaTransport system-wide on Mac OS X 10.6 - 10.9.
+# Installs AquaTransport on Mac OS X 10.6 - 10.9.
 #
-#   sudo ./install-macos.sh stage      copy files into /Library/AquaTransport, inject nothing
-#   sudo ./install-macos.sh session    also inject into the current login session
-#   sudo ./install-macos.sh boot       also inject at boot via /etc/launchd.conf
-#   sudo ./install-macos.sh uninstall  remove injection, then the files
+#   sudo ./install-macos.sh stage      copy files into /Library/AquaTransport, load nothing
+#   sudo ./install-macos.sh inject     load into every eligible process running right now
+#   sudo ./install-macos.sh watch      install a daemon that loads into each process as it starts
+#   sudo ./install-macos.sh uninstall  remove the daemon, then the files
 #
-# READ THIS FIRST
+# The dylib is loaded into a target process with aqinject (task_for_pid + a hand-built
+# mach_inject), using the target's own dlopen. It edits no system launch configuration, so a
+# faulty dylib is confined to the process it is loaded into -- it can never keep the machine or
+# any other process from starting.
 #
-# The `boot` step puts DYLD_INSERT_LIBRARIES into launchd's environment, which every
-# process on the system inherits. dyld treats a failed insertion as FATAL: if the dylib
-# is missing, unreadable, or lacks the running process's architecture, that process dies
-# at launch with SIGTRAP. With the variable set in /etc/launchd.conf that means nothing
-# boots -- including Terminal and Finder.
+#   inject  Loads the dylib into each eligible process running at the time. Covers what is
+#           running now; reaches GUI apps and daemons alike.
+#   watch   Runs aqwatch from a LaunchDaemon (starting at each boot), which loads the dylib
+#           into each process as the process launches. Covers processes started later too.
+#           Recommended for full coverage; run `inject` once alongside it for the current session.
 #
-# Consequences, all enforced below:
-#   * both i386 and x86_64 slices must be present
-#   * files are installed BEFORE the variable is set, and on uninstall the variable is
-#     cleared BEFORE the files are removed
-#   * updates use rename(2), never an in-place write, so no truncated file is ever visible
-#   * root-owned and not group/world writable: this dylib loads into root daemons, so a
-#     user-writable path would be a privilege escalation
+# The dylib is installed root-owned and not group/world writable: it loads into root daemons,
+# so a user-writable path would be a privilege escalation. Updates use rename(2), never an
+# in-place write, so a partially written dylib is never visible to a load in progress.
 #
-# TO DISABLE WITHOUT REBOOTING, DO NOT DELETE THE DYLIB. Touch the kill switch instead:
-#     sudo touch /Library/AquaTransport/disabled
-# Deleting the dylib while the variable is set is exactly what makes a machine unbootable.
-#
-# RECOVERY, if a machine will not boot after `boot`:
-#   Boot single-user (Cmd-S), then:
-#     /sbin/mount -uw /
-#     rm /etc/launchd.conf        (or delete just the setenv line)
-#     reboot
-#   Or boot from another volume and delete /etc/launchd.conf on the affected disk.
+# /Library/AquaTransport/flags.txt holds one flag name per line, read at runtime by every
+# loaded copy:
+#     debug           log handshakes to /tmp/aquatransport-<uid>.log
+#     disabled-mtls   hand client-certificate connections back to the system stack
 
 set -e
 DIR="$(cd "$(dirname "$0")" && pwd)"
-SRC="$DIR/.build/stage/Library/AquaTransport"
+SRC="$DIR/build/stage/Library/AquaTransport"
 DEST="/Library/AquaTransport"
 DYLIB="$DEST/aquatransport.dylib"
-CONF="/etc/launchd.conf"
+PLIST_LABEL="org.aquatransport.watch"
+PLIST="/Library/LaunchDaemons/$PLIST_LABEL.plist"
 MODE="${1:-}"
 
 need_root() { [ "$(id -u)" = "0" ] || { echo "must run as root (use sudo)"; exit 1; }; }
@@ -49,131 +43,96 @@ verify_build() {
   for a in x86_64 i386; do
     echo "$have" | grep -qw "$a" || {
       echo "REFUSING TO INSTALL: dylib is missing the $a slice."
-      echo "Every $a process on this machine would die at launch."; exit 1; }
+      echo "aqinject could not load into $a processes."; exit 1; }
   done
   n=$(nm -arch x86_64 -g "$SRC/aquatransport.dylib" 2>/dev/null | grep -cE " (T|D|B|S) _" || true)
   [ "$n" = "0" ] || { echo "REFUSING TO INSTALL: dylib exports $n symbols"; exit 1; }
   echo "  verified: both slices present, no exported symbols"
 }
 
+# Install one file atomically: write alongside with its final owner and mode, then rename over,
+# so a load in progress never sees a partial or wrong-permissioned file.
+stage_file() { # src dst mode
+  [ -f "$1" ] || { echo "missing $1 -- run ./build-macos.sh first"; exit 1; }
+  cp "$1" "$2.new"; chown root:wheel "$2.new"; chmod "$3" "$2.new"; mv -f "$2.new" "$2"
+}
+
 do_stage() {
   verify_build
-  mkdir -p "$DEST"
-  # Atomic replace: write alongside, then rename over. A partially written dylib at this
-  # path would brick every process launch.
-  cp "$SRC/aquatransport.dylib" "$DEST/.aquatransport.dylib.new"
-  chown root:wheel "$DEST/.aquatransport.dylib.new"
-  chmod 0644 "$DEST/.aquatransport.dylib.new"
-  mv -f "$DEST/.aquatransport.dylib.new" "$DYLIB"
+  mkdir -p "$DEST"; chown root:wheel "$DEST"; chmod 0755 "$DEST"
 
-  rm -rf "$DEST/.rewrite.bundle.new"
-  cp -R "$SRC/rewrite.bundle" "$DEST/.rewrite.bundle.new"
-  rm -rf "$DEST/rewrite.bundle"
-  mv -f "$DEST/.rewrite.bundle.new" "$DEST/rewrite.bundle"
+  stage_file "$SRC/aquatransport.dylib" "$DYLIB"         0644
+  stage_file "$SRC/aqinject"            "$DEST/aqinject" 0755
+  stage_file "$SRC/aqwatch"             "$DEST/aqwatch"  0755
 
-  # Preserve existing rule files; seed from examples/ on a fresh install.
-  #
-  # Deliberately NOT seeded from /Library/AquaProxy any more: rule blocks now begin with a
-  # scope line ("*" or a list of app bundle names), so AquaProxy's files would parse as
-  # zero usable rules. Enable the debug flag to see ignored blocks reported.
-  for f in headers.txt redirects.txt; do
-    if [ ! -f "$DEST/$f" ]; then
-      if [ -f "$DIR/examples/$f" ]; then cp "$DIR/examples/$f" "$DEST/$f"
-      else : > "$DEST/$f"; fi
-    fi
-  done
-  for f in headers.txt redirects.txt; do
-    if [ -f "/Library/AquaProxy/$f" ] && ! grep -qE '^\*$|^[A-Za-z]' "$DEST/$f" 2>/dev/null; then
-      echo "  note: $DEST/$f has no scope lines -- see examples/$f for the format"
-    fi
+  # Seed config files on a fresh install without clobbering existing edits.
+  for f in headers.txt redirects.txt flags.txt; do
+    [ -f "$DEST/$f" ] && continue
+    if [ -f "$DIR/examples/$f" ]; then cp "$DIR/examples/$f" "$DEST/$f"; else : > "$DEST/$f"; fi
+    chown root:wheel "$DEST/$f"; chmod 0644 "$DEST/$f"
   done
 
-  chown -R root:wheel "$DEST"
-  chmod 0755 "$DEST"
-  find "$DEST" -type f -exec chmod 0644 {} +
-  chmod 0755 "$DEST/rewrite.bundle/Contents/MacOS/rewrite"
-  echo "  installed to $DEST (nothing injected yet)"
-  echo
-  echo "  test it on one process before going system-wide:"
-  echo "    DYLD_INSERT_LIBRARIES=$DYLIB curl -v https://api.twitter.com"
+  echo "  installed to $DEST (nothing loaded yet)"
+  echo "  test on one process first:  DYLD_INSERT_LIBRARIES=$DYLIB curl -v https://api.twitter.com"
 }
 
-do_session() {
-  [ -f "$DYLIB" ] || { echo "run 'stage' first"; exit 1; }
-
-  # There are two launchd contexts and they do not share environment. Running
-  # `sudo launchctl setenv` only touches the system one, which injects into DAEMONS --
-  # the opposite of what "session" implies, and how this script once killed every sshd.
-  launchctl setenv DYLD_INSERT_LIBRARIES "$DYLIB"
-  echo "  system context set (daemons launched from now on)"
-
-  # The Aqua login session runs its own per-user launchd that does not inherit the above.
-  # Reach it by entering the bootstrap of a process already inside that session.
-  gui=$(ps -axo pid,comm | awk '/\/Dock$|\/Finder$/{print $1; exit}')
-  if [ -n "$gui" ]; then
-    if launchctl bsexec "$gui" launchctl setenv DYLD_INSERT_LIBRARIES "$DYLIB" 2>/dev/null; then
-      echo "  Aqua session context set via pid $gui (GUI apps launched from now on)"
-    else
-      echo "  WARNING: could not reach the Aqua session; GUI apps will NOT be injected"
-    fi
-  else
-    echo "  no GUI session found; only the system context was set"
-  fi
-
-  echo "  Already-running processes are unaffected."
-  echo "  Undo: sudo launchctl unsetenv DYLD_INSERT_LIBRARIES"
-  echo "        sudo launchctl bsexec <gui-pid> launchctl unsetenv DYLD_INSERT_LIBRARIES"
+do_inject() {
+  echo "  loading into all eligible running processes..."
+  "$DEST/aqinject" --all "$DYLIB"
+  echo "  done. To cover processes started later, use 'watch'."
 }
 
-do_boot() {
-  [ -f "$DYLIB" ] || { echo "run 'stage' first"; exit 1; }
-  verify_build
-  echo
-  echo "  About to add DYLD_INSERT_LIBRARIES to $CONF."
-  echo "  Every process on this machine will load $DYLIB at launch."
-  echo "  If that file is ever missing or corrupt, THE MACHINE WILL NOT BOOT."
-  echo "  Recovery is single-user mode (Cmd-S) and deleting $CONF."
-  echo
-  # AQUATRANSPORT_ASSUME_YES=1 skips the prompt for scripted installs (VMs, test rigs). Do not
-  # use it on a machine you cannot reach the console of: recovery from a bad install
-  # requires single-user mode.
-  if [ "${AQUATRANSPORT_ASSUME_YES:-}" = "1" ]; then
-    echo "  AQUATRANSPORT_ASSUME_YES=1 -- proceeding without confirmation"
-  else
-    printf "  Type EXACTLY 'i understand' to proceed: "
-    read -r ack
-    [ "$ack" = "i understand" ] || { echo "  aborted"; exit 1; }
-  fi
+do_watch() {
+  # aqwatch polls the process list, so nothing here enables system auditing or loads auditd.
 
-  touch "$CONF"
-  grep -v "^setenv DYLD_INSERT_LIBRARIES" "$CONF" > "$CONF.tf.new" 2>/dev/null || true
-  echo "setenv DYLD_INSERT_LIBRARIES $DYLIB" >> "$CONF.tf.new"
-  chown root:wheel "$CONF.tf.new"; chmod 0644 "$CONF.tf.new"
-  mv -f "$CONF.tf.new" "$CONF"
-  echo "  written. Takes effect on next boot."
+  # Install and start the LaunchDaemon. RunAtLoad + the plist in /Library/LaunchDaemons start
+  # aqwatch at every boot; KeepAlive restarts it if it exits.
+  cat > "$PLIST" <<PLIST_EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>$PLIST_LABEL</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>$DEST/aqwatch</string>
+    <string>$DYLIB</string>
+    <string>$DEST/aqinject</string>
+  </array>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><true/>
+</dict>
+</plist>
+PLIST_EOF
+  chown root:wheel "$PLIST"; chmod 0644 "$PLIST"
+  launchctl unload "$PLIST" 2>/dev/null || true
+  launchctl load "$PLIST"
+  echo "  aqwatch installed and running ($PLIST)."
+  echo "  It loads AquaTransport into each process as it starts, and restarts at every boot."
+  echo "  Processes already running are not covered by the watcher alone -- run 'inject' once"
+  echo "  to cover the current session."
 }
 
 do_uninstall() {
-  # Order matters: stop injecting before the file can disappear.
-  launchctl unsetenv DYLD_INSERT_LIBRARIES 2>/dev/null || true
-  gui=$(ps -axo pid,comm | awk '/\/Dock$|\/Finder$/{print $1; exit}')
-  [ -n "$gui" ] && launchctl bsexec "$gui" launchctl unsetenv DYLD_INSERT_LIBRARIES 2>/dev/null || true
-  if [ -f "$CONF" ]; then
-    grep -v "^setenv DYLD_INSERT_LIBRARIES" "$CONF" > "$CONF.tf.new" 2>/dev/null || true
-    if [ -s "$CONF.tf.new" ]; then mv -f "$CONF.tf.new" "$CONF"; else rm -f "$CONF.tf.new" "$CONF"; fi
-    echo "  removed injection from $CONF"
+  # Stop and remove the watcher daemon, so nothing keeps loading the dylib.
+  if [ -f "$PLIST" ]; then
+    launchctl unload "$PLIST" 2>/dev/null || true
+    rm -f "$PLIST"
+    echo "  removed watcher daemon ($PLIST)"
   fi
-  echo "  injection cleared. Rule files kept."
-  echo
-  echo "  Reboot now, THEN remove the files:"
+
+  # Processes that already loaded the dylib keep running with it until they exit; nothing new
+  # loads it once the daemon is gone. The files can be removed now -- a loaded library keeps
+  # working even after the file backing it is deleted.
+  echo "  watcher removed. Rule files kept under $DEST."
+  echo "  Remove everything with:"
   echo "    sudo rm -rf $DEST"
-  echo "  Removing them before rebooting would break every process still inheriting the variable."
 }
 
 case "$MODE" in
   stage)     need_root; do_stage ;;
-  session)   need_root; do_stage; do_session ;;
-  boot)      need_root; do_stage; do_boot ;;
+  inject)    need_root; do_stage; do_inject ;;
+  watch)     need_root; do_stage; do_watch ;;
   uninstall) need_root; do_uninstall ;;
-  *) sed -n '2,40p' "$0" | sed 's/^# \{0,1\}//'; exit 1 ;;
+  *) sed -n '2,7p' "$0" | sed 's/^# \{0,1\}//'; exit 1 ;;
 esac
