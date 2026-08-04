@@ -179,10 +179,36 @@ for h in wrong.host expired; do
   check "$h.badssl.com rejected on every connection (warm cache)" "^0$" "$ok"
 done
 
+echo "== verified-chain cache =="
+# The chain cache records successes keyed on (peer name, chain DER), so a chain already
+# verified in this process is not verified again. The property it must never break is the
+# same one resumption must not break: a host the system refuses has to be refused on every
+# connection, however warm the cache is. Four connections rather than three, so a rejection
+# has to survive past the point where a success would have been cached and reused.
+for h in expired untrusted-root; do
+  ok=$(AQUATRANSPORT_DIR="$T" DYLD_INSERT_LIBRARIES="$D" \
+       "$MULTIPROBE" "https://$h.badssl.com/" 4 2>&1 | grep -c 'rc=200')
+  check "$h.badssl.com rejected on every connection (warm chain cache)" "^0$" "$ok"
+done
+# And a cached success must not carry to a host it is not for: same CA, different name.
+ok=$(AQUATRANSPORT_DIR="$T" DYLD_INSERT_LIBRARIES="$D" "$MULTIPROBE" https://badssl.com/ 2 2>&1 | grep -c 'rc=200')
+check "valid badssl.com accepted on both connections" "^2$" "$ok"
+ok=$(AQUATRANSPORT_DIR="$T" DYLD_INSERT_LIBRARIES="$D" "$MULTIPROBE" https://wrong.host.badssl.com/ 2 2>&1 | grep -c 'rc=200')
+check "wrong.host rejected right after a valid host" "^0$" "$ok"
+
+# It must also actually fire, or the assertions above prove nothing about a cache that is
+# silently not caching. Six connections to one host: the first verifies, the rest hit.
+rm -f "$LOG"
+echo debug > "$T/flags.txt"
+AQUATRANSPORT_DIR="$T" DYLD_INSERT_LIBRARIES="$D" "$MULTIPROBE" https://en.wikipedia.org/ 6 >/dev/null 2>&1
+nhit=$(grep 'multiprobe\]' "$LOG" 2>/dev/null | grep -c 'verify_chain.*cached ok')
+check "chain cache hits after the first verification" "^[1-9]" "$nhit"
+: > "$T/flags.txt"; rm -f "$LOG"
+
 echo "== warm connections =="
 # Pooled requests reuse one connection, so the peer chain -- and therefore the trust decision --
-# cannot change between them. A SecTrustEvaluate costs ~335ms on 10.9 hardware, so it must
-# happen once per connection, not once per request.
+# cannot change between them. A SecTrustEvaluate is hundreds of milliseconds on an ECDSA chain
+# on 10.9 hardware, so it must happen once per connection, not once per request.
 rm -f "$LOG"
 echo debug > "$T/flags.txt"
 AQUATRANSPORT_DIR="$T" DYLD_INSERT_LIBRARIES="$D" "$POOLPROBE" https://www.cloudflare.com/robots.txt 6 >/dev/null 2>&1

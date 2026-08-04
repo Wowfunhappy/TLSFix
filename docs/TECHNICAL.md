@@ -336,35 +336,189 @@ Anything else misbehaving under injection is a bug in the engine to fix, not a n
 
 ## What a trust evaluation costs
 
-`SecTrustEvaluate` costs about **335 ms** on 10.9-era hardware, and a profile says exactly
-where it goes: `mulg`, `modg_via_recip`, `grammarSquare`, `gshiftright` — Security.framework's
-CryptKit "giants" bignum routines, verifying the chain's signatures in software. It is not
-revocation fetching (disabling network fetch changes nothing: 331 ms vs 340 ms), not a bloated
-trust store (211 roots), and not IPC (`securityd` and `ocspd` sit at 0% CPU while it runs). It
-is 335 ms of local arithmetic, and it reproduces in a clean process with no library loaded, on
-a leaf-only chain as readily as a full one.
+`SecTrustEvaluate` is the single most expensive thing on a connection. Where a chain's issuer
+CRL is already cached, a profile puts it in `mulg`, `modg_via_recip`, `grammarSquare`,
+`gshiftright` — Security.framework's CryptKit "giants" bignum routines, verifying the chain's
+signatures in software. That part is local arithmetic, not a bloated trust store (211 roots)
+and not IPC (`securityd` and `ocspd` sit at 0% CPU while it runs), and it reproduces in a
+clean process with no library loaded. Where the issuer CRL is *not* cached, a synchronous
+download dominates instead, and the profile moves to `tpFetchCrlFromNet`.
 
-It is a floor, not something this engine can optimise away. The OpenSSL linked into this
-library does the same arithmetic roughly two orders of magnitude faster, but CFNetwork
-evaluates the `SecTrustRef` handed back to it, so a real `SecTrustEvaluate` has to happen
-somewhere. What can be avoided is doing it more than once per connection, which is what the
-next section covers.
+Two things drive it. One is signature verification, which varies by chain: measured by
+`tools/trustbench.c`, an RSA-2048 chain (`www.gnu.org`) evaluates in 20 ms where an ECDSA one
+(`github.com`) takes 486 ms. The other is revocation checking, covered in the next section,
+which adds a fixed overhead to every evaluation and a large one-off cost per issuer. The
+multi-second stalls come from revocation rather than from the signature algorithm, so they
+happen on RSA hosts as readily as ECDSA ones.
+
+**Nothing about it is cached, anywhere.** `trustbench` re-evaluates the same `SecTrustRef` a
+second time and it costs the same as the first (461 ms vs 464 ms on Wikipedia's chain); a
+fresh object over identical certificates costs the same again. There is no warm-up to exploit
+and no result to reuse, so the only saving available is not asking twice — which is what
+*Trust evaluation, once per connection* and *The verified-chain cache* below do.
+
+Whatever remains is a floor, not something this engine can optimise away. The OpenSSL linked
+into this library does the same arithmetic roughly two orders of magnitude faster, but
+CFNetwork evaluates the `SecTrustRef` handed back to it, so a real `SecTrustEvaluate` has to
+happen somewhere.
+
+## Revocation checking
+
+Trust evaluation on 10.9 checks revocation by "best attempt", through Security's legacy CSSM
+path. The engine leaves it there: it builds each `SecTrustRef` with the SSL policy alone and
+sets no revocation policy of its own.
+
+That is a deliberate choice, because naming an explicit revocation policy turns the check off.
+`tools/crltest/` demonstrates it with a private CA, two leaves — one of them revoked — and a
+CRL published at the leaf's distribution point on localhost. Nothing is installed: the CA is
+made an anchor with `SecTrustSetAnchorCertificates` for one `SecTrustRef` in one process, so
+no keychain and no system trust store is involved.
+
+| certificate | policy | verdict |
+|---|---|---|
+| good | SSL policy alone | ACCEPTED |
+| **revoked** | **SSL policy alone** | **REJECTED**, and the CRL is fetched |
+| revoked | explicit `CRL` | ACCEPTED |
+| revoked | explicit `OCSP\|CRL` | ACCEPTED |
+| revoked | explicit `OCSP` | ACCEPTED |
+
+Reproduces 3/3 each way. CRL checking on this platform works: the legacy path fetches the CRL
+and rejects the revoked certificate, while every explicit revocation policy — including one
+naming `kSecRevocationCRLMethod` — skips the fetch and accepts it. There is no combination
+that keeps the check and avoids the cost.
+
+The cost is real, and it is the largest remaining one on a connection. Staying on the legacy
+path is about 1.7x slower per evaluation whether or not any revocation data exists:
+`github.com`'s issuer publishes no CRL distribution point at all, so no CRL work is possible
+there, and it still costs 540 ms against 320 ms under any explicit policy. On top of that, a
+CRL that is not yet cached is fetched synchronously inside `SecTrustEvaluate`, on whichever
+thread asked — a DigiCert chain costs **911 ms against 32 ms**, the whole difference being one
+download. A machine in ordinary use accumulates **81 MB across 66 issuers in `/var/db/crls`,
+one file of 46 MB with 987,186 entries**. A CRL already cached is cheap to consult (Amazon and
+GoDaddy chains evaluate in 7–8 ms), so the download is a per-issuer cost rather than a
+per-evaluation one.
+
+Where the asking thread is a browser's shared networking process main thread, one uncached CRL
+stalls every connection that process has at once. That is a property of the caller, not of the
+engine; see *Where the evaluation happens* below.
+
+### What revocation does not cover
+
+Revocation status is undetermined for a growing share of the web, and this is upstream of the
+OS rather than a property of the engine. **Let's Encrypt and Google Trust Services no longer
+publish OCSP**: their leaves carry a CA Issuers URI and no responder URI. The only
+channel left for those certificates is the CRL in their distribution point, and 10.9 does not
+fetch it — zero packets to the distribution point, and nothing from those issuers anywhere in
+`/var/db/crls`.
+
+`tools/revcheck.c` shows the consequence on `revoked.badssl.com`, a genuinely revoked,
+unexpired Let's Encrypt certificate: every policy 10.9 offers accepts it, including
+`kSecRevocationRequirePositiveResponse`, whose whole purpose is to turn "could not determine"
+into a rejection. Its CRL is current, 37 KB, lists the serial, and downloads in 55 ms; it is
+simply never requested.
+
+The two halves line up: every issuer whose CRL 10.9 fetches also publishes OCSP, and every
+issuer that has dropped OCSP is one whose CRL it does not fetch. So revocation is checked for
+traditional CAs and unchecked for the modern ones, and no configuration available at this
+layer changes that.
 
 ## Trust evaluation, once per connection
 
-`SecTrustEvaluate` costs about **335 ms** on 10.9-era hardware, and CFNetwork calls
-`SSLCopyPeerTrust` on *every request*, not once per connection. A fresh `SecTrustRef` built
-from freshly created `SecCertificateRef`s costs a full evaluation each time, because the
-system's own caching never sees the same object twice — so the evaluation has to be kept off
-the per-request path. This is the cost that matters most in practice: a browser loads dozens of
-small subresources over a handful of pooled connections, so nearly all of its requests are warm
-ones.
+CFNetwork calls `SSLCopyPeerTrust` on *every request*, not once per connection, and a fresh
+`SecTrustRef` built from freshly created `SecCertificateRef`s costs a full evaluation each
+time — the system's own caching never sees the same object twice. So the `SecTrustRef` has to
+be kept off the per-request path. This is the cost that matters most in practice: a browser
+loads dozens of small subresources over a handful of pooled connections, so nearly all of its
+requests are warm ones.
 
 The peer chain cannot change within a connection, so neither can the trust decision.
-`sh_build_trust` evaluates once and caches the result on the `Shadow` for the life of the
-connection, with each caller still getting its own reference (`SSLCopyPeerTrust` has copy
+`sh_build_trust` builds the `SecTrustRef` once and caches it on the `Shadow` for the life of
+the connection, with each caller still getting its own reference (`SSLCopyPeerTrust` has copy
 semantics). The cache is dropped whenever the `SSL` object is re-initialised — late SNI, or
 `SSLSetCertificate` — because that means a new handshake and a new chain.
+
+### The object is handed back unevaluated
+
+`sh_build_trust` returns the `SecTrustRef` without evaluating it. Exactly one evaluation of a
+chain then happens per connection: `verify_chain`'s on the plain path, or CFNetwork's own on
+the app-verified path, which is the one CFNetwork takes on nearly every connection.
+
+Evaluating here as well would be pure duplicated cost on the connection's critical path —
+hundreds of milliseconds for a chain whose issuer CRL is cached, and most of a second for one
+whose is not:
+
+- **The result would not be the security decision.** That belongs to `verify_chain` or to
+  CFNetwork's evaluation of the object; a result computed here is read by nothing.
+- **It could not be reused for CFNetwork's evaluation either.** CFNetwork calls
+  `SecTrustSetKeychains` on the object immediately before evaluating it, which invalidates any
+  result already recorded on it.
+- **Nothing needs the object pre-settled.** `tools/trustbench.c` calls
+  `SecTrustCopyExceptions` and `SecTrustGetCertificateCount` on a trust that has never been
+  evaluated: both succeed, because Security evaluates on demand underneath them.
+
+Measured on 10.9.5, x86_64, 12 parallel requests across 12 cold hosts (`tools/concprobe.m`),
+against the same engine evaluating in `sh_build_trust` as well, three runs each:
+
+| | first round, all connections cold |
+|---|---|
+| Two evaluations per connection | 7.50 s / 7.59 s / 7.33 s |
+| **One evaluation per connection** | **3.89 s / 3.90 s / 4.18 s** |
+
+and on 10 pooled warm requests over one connection (`tools/poolprobe.m`), where the single
+remaining evaluation is CFNetwork's own and the engine is at parity with the stock stack:
+
+| | wall | CPU |
+|---|---|---|
+| Native Secure Transport | 0.97 / 1.08 / 0.92 s | 0.51 s |
+| **AquaTransport** | **1.00 / 1.19 / 0.90 s** | **0.49 s** |
+
+### Where the evaluation happens
+
+The one remaining evaluation runs wherever the caller asks for it, and for a browser that
+placement dominates everything else. WebKit forwards each server-trust challenge to the UI
+process; encoding the `NSURLProtectionSpace` for that IPC archives the `SecTrustRef`, and
+archiving one evaluates it:
+
+```
+WKNetworkSessionDelegate URLSession:task:didReceiveChallenge:
+  -> NetworkLoad::didReceiveChallenge
+    -> AuthenticationManager::didReceiveAuthenticationChallenge
+      -> IPC encode of NSURLProtectionSpace
+        -> SerializableArchive::add(CFString, __SecTrust*)
+          -> SecTrustEvaluate
+```
+
+That path runs on the shared networking process's **main thread**, so every connection's
+evaluation serialises behind every other one, and an uncached CRL fetch inside one of them
+stalls the whole browser. Sampling `com.apple.WebKit.Networking` during a cold page load puts
+874 samples there. Nothing in this engine can move it; the placement belongs to the caller.
+
+## The verified-chain cache
+
+One evaluation per connection is what the stock stack costs too. What is avoidable beyond that
+is re-verifying a chain this process has *already* verified: a browser opens several
+connections to one host at once, and every one of them runs `verify_chain` over an identical
+chain.
+
+`aquatransport_engine.c` keeps a 32-entry cache keyed on the peer name and a SHA-256 over the
+chain's DER, with a 10-minute TTL. `verify_chain` consults it before calling
+`SecTrustEvaluate` and fills it after a success. Measured on `en.wikipedia.org`, six
+connections in one process: the first `verify_chain` costs 481 ms and the rest are free.
+
+Two properties keep it from becoming a way round a rejection:
+
+- **Only successes are cached.** A chain that fails evaluation is never recorded, so it is
+  re-examined at full price on every connection. Nothing an attacker presents can be answered
+  from this cache.
+- **The key covers everything the decision depends on** — the peer name the handshake is
+  bound to, and every certificate the server sent, in order. A different chain, or the same
+  chain for a different host, misses.
+
+The TTL bounds how long a newly-expired or newly-revoked certificate could ride a cached
+success, which is the same order of exposure a resumed TLS session already carries.
+`selftest.sh` asserts the security property directly: `expired` and `untrusted-root`
+`badssl.com` must be rejected on all four of four connections in one process, and a valid host
+immediately followed by `wrong.host.badssl.com` must not carry its success across.
 
 **Once per connection is what Secure Transport itself does**, measured rather than assumed.
 Native CPU, same host:
@@ -376,22 +530,15 @@ Native CPU, same host:
 | 6 connections × 1 request | 2.164 s |
 
 Doubling the *requests* on one connection costs nothing; going from one *connection* to six
-costs +1.57 s, about 314 ms each. The stock stack evaluates once per connection and does not
-carry the result between connections, and this matches it exactly. Caching across connections
-would beat it, but only by holding a security decision past the connection boundary that
-produced it, which is a policy the platform does not have.
+costs +1.57 s, about 314 ms each. The stock stack evaluates once per connection, and the engine
+matches it: one `SecTrustEvaluate` per connection, CFNetwork's own. The verified-chain cache
+above goes one step further within a process, for repeats of a chain already verified there.
 
-Measured on 10.9.5, x86_64, 10 pooled `NSURLConnection` requests (`tools/poolprobe.m`):
-
-| | wall | CPU | per warm request |
-|---|---|---|---|
-| Native Secure Transport | 1.58 s | 0.76 s | ~85 ms |
-| **AquaTransport** | **1.85 s** | **1.16 s** | **~80 ms** |
-
-Only `poolprobe` can see this. Every other harness here forces a new connection per request
-(`multiprobe` sends `Connection: close`, and `CFReadStream` does not pool at all), which buries
-a per-request evaluation under handshake and network time. `selftest.sh` asserts the evaluation
-count rather than timing it, so a regression shows up as a count rather than as noise.
+Only `poolprobe` can see the per-request half of this. Every other harness here forces a new
+connection per request (`multiprobe` sends `Connection: close`, and `CFReadStream` does not
+pool at all), which buries a per-request evaluation under handshake and network time.
+`selftest.sh` asserts the evaluation count rather than timing it, so a regression shows up as a
+count rather than as noise.
 
 ## Session resumption
 
@@ -515,6 +662,20 @@ tools/pssprobe.c        # drives the mtls signing callback against a transient k
                         # and verifies the result; needs the built OpenSSL, see its header
 tools/multiprobe.c      # N connections in one process, so cross-connection state (the session
                         # cache) can be tested at all; single-shot probes cannot reach it
+tools/trustbench.c      # what one SecTrustEvaluate costs for a given host's real chain, whether
+                        # a second one is any cheaper (it is not), and whether an unevaluated
+                        # SecTrustRef still answers -- the three facts the trust path rests on
+tools/concprobe.m       # a page load's shape: N hosts requested in PARALLEL, so the per-connection
+                        # trust cost stacks up instead of hiding behind one request's network time
+tools/revprobe.c        # what revocation checking costs an evaluation, per policy, and whether
+                        # the system CRL cache grows as a result
+tools/revcheck.c        # every revocation policy 10.9 offers, against one host, with the verdict
+                        # for each -- including require-positive-response
+tools/crlonly.c         # one policy per process, so a cold CRL is not warmed by an earlier run;
+                        # revprobe/revcheck cannot isolate that
+tools/crltest/          # a private CA, a revoked leaf and a CRL on localhost: does revocation
+                        # actually reject? Installs nothing -- the CA is an anchor for one
+                        # SecTrustRef via SecTrustSetAnchorCertificates, no keychain touched
 tools/poolprobe.m       # N POOLED requests over a reused connection -- the warm path a browser
                         # actually spends its time on, which every other probe here hides
                         # behind handshake and network time

@@ -5,11 +5,13 @@
 #include <openssl/rsa.h>
 #include <openssl/evp.h>
 #include <openssl/bn.h>
+#include <openssl/sha.h>
 #include <pthread.h>
 #include <string.h>
 #include <stdlib.h>
 #include <dlfcn.h>
 #include <sys/time.h>
+#include <time.h>
 
 extern void tf_log(const char *fmt, ...);
 extern int  tf_debug(void);
@@ -133,6 +135,78 @@ static int new_session_cb(SSL *ssl, SSL_SESSION *sess) {
     if (tf_debug()) tf_log("session cached  host=%s", s->host);
     sess_put(s->host, sess);
     return 1;
+}
+
+// ---- verified-chain cache --------------------------------------------------
+//
+// SecTrustEvaluate on this OS re-runs the whole evaluation on every call -- Security caches
+// nothing, not even a repeat call on the same object -- and on the ECDSA chains most of the
+// modern web now serves, one run is 200-700ms of CryptKit bignum arithmetic on 10.9-era
+// hardware. (RSA-2048 chains cost 10-30ms; the split is per signature algorithm, measured
+// with tools/trustbench.c.) That cost is the platform's, and the stock stack pays it too.
+//
+// What this cache removes is paying it *again* for a chain already verified. Keyed on the
+// peer name and a SHA-256 over the chain's DER, with a short TTL, it covers the parallel
+// connections a browser opens to one host and the reconnections that follow pool expiry.
+//
+// Only successes are cached. A chain that fails is re-examined at full price every time, so
+// nothing an attacker presents is ever answered from here; the TTL bounds how long a
+// newly-expired or newly-revoked certificate could ride a cached success, which is the same
+// order of exposure a resumed TLS session already carries.
+#define MAXCHOK 32
+#define CHAIN_OK_TTL 600
+typedef struct { unsigned char dg[SHA256_DIGEST_LENGTH]; time_t when; unsigned lastUse; int used; } ChainOkEnt;
+static ChainOkEnt gChainOk[MAXCHOK];
+static unsigned gChainOkClock = 0;
+static pthread_mutex_t gChainOkLock = PTHREAD_MUTEX_INITIALIZER;
+
+// Digest of what the trust decision depends on: the peer name the handshake was bound to
+// and every certificate the server sent, in order.
+static int chain_ok_digest(STACK_OF(X509) *chain, const char *host, unsigned char *out) {
+    if (!chain || sk_X509_num(chain) < 1) return 0;
+    SHA256_CTX c; SHA256_Init(&c);
+    SHA256_Update(&c, host, strlen(host) + 1);
+    for (int i = 0; i < sk_X509_num(chain); i++) {
+        unsigned char *der = NULL; int dl = i2d_X509(sk_X509_value(chain, i), &der);
+        if (dl <= 0 || !der) { if (der) OPENSSL_free(der); return 0; }
+        SHA256_Update(&c, der, (size_t)dl);
+        OPENSSL_free(der);
+    }
+    SHA256_Final(out, &c);
+    return 1;
+}
+
+static int chain_ok_get(const unsigned char *dg) {
+    time_t now = time(NULL);
+    int hit = 0;
+    pthread_mutex_lock(&gChainOkLock);
+    for (int i = 0; i < MAXCHOK; i++) {
+        if (gChainOk[i].used && !memcmp(gChainOk[i].dg, dg, SHA256_DIGEST_LENGTH)) {
+            if (now - gChainOk[i].when <= CHAIN_OK_TTL) { gChainOk[i].lastUse = ++gChainOkClock; hit = 1; }
+            else gChainOk[i].used = 0;               // expired: the next success re-fills it
+            break;
+        }
+    }
+    pthread_mutex_unlock(&gChainOkLock);
+    return hit;
+}
+
+static void chain_ok_put(const unsigned char *dg) {
+    pthread_mutex_lock(&gChainOkLock);
+    int slot = -1;
+    for (int i = 0; i < MAXCHOK; i++) {
+        if (gChainOk[i].used && !memcmp(gChainOk[i].dg, dg, SHA256_DIGEST_LENGTH)) { slot = i; break; }
+        if (!gChainOk[i].used && slot < 0) slot = i;
+    }
+    if (slot < 0) {
+        slot = 0;
+        for (int i = 1; i < MAXCHOK; i++) if (gChainOk[i].lastUse < gChainOk[slot].lastUse) slot = i;
+    }
+    memcpy(gChainOk[slot].dg, dg, SHA256_DIGEST_LENGTH);
+    gChainOk[slot].when = time(NULL);
+    gChainOk[slot].lastUse = ++gChainOkClock;
+    gChainOk[slot].used = 1;
+    pthread_mutex_unlock(&gChainOkLock);
 }
 
 static void sh_free_mem(Shadow *s) {
@@ -404,6 +478,12 @@ static int verify_chain(X509_STORE_CTX *sctx, void *arg) {
     if (s && s->breakAuth) return 1;
     STACK_OF(X509) *chain = X509_STORE_CTX_get0_untrusted(sctx);
     if (!chain || sk_X509_num(chain) < 1) return 0;
+    unsigned char dg[SHA256_DIGEST_LENGTH];
+    int haveDg = chain_ok_digest(chain, s && s->host[0] ? s->host : "", dg);
+    if (haveDg && chain_ok_get(dg)) {
+        if (tf_debug()) tf_log("verify_chain host=%s cached ok", s && s->host[0] ? s->host : "?");
+        return 1;
+    }
     double vt0 = tf_debug() ? tf_now_ms() : 0;
     CFMutableArrayRef arr = CFArrayCreateMutable(NULL, 0, cf_type_array_cb());
     for (int i = 0; i < sk_X509_num(chain); i++) {
@@ -428,6 +508,7 @@ static int verify_chain(X509_STORE_CTX *sctx, void *arg) {
     }
     if (pol) CFRelease(pol);
     tf_guard_leave();
+    if (ok && haveDg) chain_ok_put(dg);
     if (tf_debug()) tf_log("verify_chain host=%s took %.0f ms certs=%ld ok=%d",
                            s && s->host[0] ? s->host : "?", tf_now_ms() - vt0,
                            (long)CFArrayGetCount(arr), ok);
@@ -488,8 +569,19 @@ int sh_build_trust(Shadow *s, SecTrustRef *trust) {
     CFRelease(arr);
     if (r != errSecSuccess) { tf_guard_leave(); return 0; }
     long stapled = attach_stapled_ocsp(s, t);
-    SecTrustResultType rr = kSecTrustResultInvalid;
-    SecTrustEvaluate(t, &rr);   // populate internal chain, a native handshake returns an evaluated trust, and CFNetwork's SocketStream path derefs it (SecTrustCopyExceptions)
+    // Handed back unevaluated, deliberately, so a chain is evaluated exactly once per
+    // connection: by verify_chain on the plain path, or by CFNetwork itself on the
+    // app-verified path, which is the one CFNetwork takes on nearly every connection.
+    //
+    // Evaluating here as well would cost a second full evaluation of the same chain on the
+    // connection's critical path -- hundreds of milliseconds at best, seconds when it goes
+    // to the network -- and buy nothing. The result is not the security decision, so
+    // nothing reads it; and CFNetwork calls SecTrustSetKeychains on the object immediately
+    // before evaluating, which would discard any result recorded here anyway.
+    //
+    // Nothing needs the object pre-settled: Security evaluates on demand. Measured on
+    // 10.9.5 by tools/trustbench.c, SecTrustCopyExceptions and SecTrustGetCertificateCount
+    // both succeed on a trust that has never been evaluated.
     tf_guard_leave();
     if (tf_debug()) tf_log("build_trust host=%s took %.0f ms stapled=%ld certs=%ld resumed=%d", s->host, tf_now_ms() - t0, stapled, ncerts, SSL_session_reused(s->ssl));
     s->trust = t;                 // connection's copy, released with the Shadow

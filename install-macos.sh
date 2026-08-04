@@ -114,19 +114,24 @@ PLIST_EOF
 }
 
 do_uninstall() {
-  # Stop and remove the watcher daemon, so nothing keeps loading the dylib.
+  # Stop and remove the watcher daemon first, so nothing loads the dylib again while the
+  # files are going away.
   if [ -f "$PLIST" ]; then
     launchctl unload "$PLIST" 2>/dev/null || true
     rm -f "$PLIST"
     echo "  removed watcher daemon ($PLIST)"
   fi
+  # KeepAlive means launchd may have a copy running that outlives the unload.
+  pkill -f "$DEST/aqwatch" 2>/dev/null || true
 
-  # Processes that already loaded the dylib keep running with it until they exit; nothing new
-  # loads it once the daemon is gone. The files can be removed now -- a loaded library keeps
-  # working even after the file backing it is deleted.
-  echo "  watcher removed. Rule files kept under $DEST."
-  echo "  Remove everything with:"
-  echo "    sudo rm -rf $DEST"
+  rm -rf "$DEST"
+  echo "  removed $DEST"
+
+  # Deleting the dylib does not unload it. A process that already loaded it keeps running
+  # with it, because a mapped image survives the file being unlinked; nothing new picks it up
+  # once the watcher and the file are gone. Restarting a process is what frees it of the
+  # library, and a reboot clears every one.
+  echo "  uninstalled. Processes already running keep the library until they restart."
 }
 
 case "$MODE" in
