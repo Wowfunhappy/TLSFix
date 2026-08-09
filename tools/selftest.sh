@@ -10,7 +10,7 @@
 # negotiates TLS 1.3 fine.
 
 DIR="$(cd "$(dirname "$0")/.." && pwd)"
-T="$DIR/build/stage/Library/AquaTransport"
+T="$DIR/build/stage/usr/share/aquatransport"
 D="$T/aquatransport.dylib"
 PROBE="$DIR/build/httpsprobe"
 URLPROBE="$DIR/build/urlprobe"

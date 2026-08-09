@@ -1,6 +1,8 @@
 // Shared configuration for both AquaTransport subsystems on macOS.
 //
-// Files live in /Library/AquaTransport (override with AQUATRANSPORT_DIR for development).
+// Files live in /usr/share/aquatransport (override with AQUATRANSPORT_DIR for development).
+// Sandboxed targets read these files themselves, and system.sb confines them to a short list
+// of readable directories that /usr/share is on -- see the note in aquatransport_config.c.
 //
 // flags.txt holds one flag name per line. Recognised flags:
 //   debug           log handshakes to /tmp/aquatransport-<uid>.log

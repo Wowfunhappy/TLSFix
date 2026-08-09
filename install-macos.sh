@@ -1,7 +1,7 @@
 #!/bin/bash
 # Installs AquaTransport on Mac OS X 10.6 - 10.9.
 #
-#   sudo ./install-macos.sh stage      copy files into /Library/AquaTransport, load nothing
+#   sudo ./install-macos.sh stage      copy files into place, load nothing
 #   sudo ./install-macos.sh inject     load into every eligible process running right now
 #   sudo ./install-macos.sh watch      install a daemon that loads into each process as it starts
 #   sudo ./install-macos.sh uninstall  remove the daemon, then the files
@@ -21,16 +21,23 @@
 # so a user-writable path would be a privilege escalation. Updates use rename(2), never an
 # in-place write, so a partially written dylib is never visible to a load in progress.
 #
-# /Library/AquaTransport/flags.txt holds one flag name per line, read at runtime by every
+# /usr/share/aquatransport/flags.txt holds one flag name per line, read at runtime by every
 # loaded copy:
 #     debug           log handshakes to /tmp/aquatransport-<uid>.log
 #     disabled-mtls   hand client-certificate connections back to the system stack
 
 set -e
 DIR="$(cd "$(dirname "$0")" && pwd)"
-SRC="$DIR/build/stage/Library/AquaTransport"
+
+# The dylib and the rule files live under /usr/share, which is one of the few directories
+# system.sb lets a sandboxed process read; a target dlopens the dylib and reads the rule files
+# itself, under its own sandbox. aqinject and aqwatch live in /Library/AquaTransport, where
+# root runs them from outside any sandbox.
+SRC="$DIR/build/stage/usr/share/aquatransport"
+SRCTOOL="$DIR/build/stage/Library/AquaTransport"
+LIBDIR="/usr/share/aquatransport"
 DEST="/Library/AquaTransport"
-DYLIB="$DEST/aquatransport.dylib"
+DYLIB="$LIBDIR/aquatransport.dylib"
 PLIST_LABEL="org.aquatransport.watch"
 PLIST="/Library/LaunchDaemons/$PLIST_LABEL.plist"
 MODE="${1:-}"
@@ -59,20 +66,26 @@ stage_file() { # src dst mode
 
 do_stage() {
   verify_build
-  mkdir -p "$DEST"; chown root:wheel "$DEST"; chmod 0755 "$DEST"
+  # Both directories are 0755 and root-owned: a sandboxed target has to traverse $LIBDIR to
+  # reach the dylib, and a user-writable path holding a library that loads into root daemons
+  # would be a privilege escalation.
+  mkdir -p "$LIBDIR"; chown root:wheel "$LIBDIR"; chmod 0755 "$LIBDIR"
+  mkdir -p "$DEST";   chown root:wheel "$DEST";   chmod 0755 "$DEST"
 
   stage_file "$SRC/aquatransport.dylib" "$DYLIB"         0644
-  stage_file "$SRC/aqinject"            "$DEST/aqinject" 0755
-  stage_file "$SRC/aqwatch"             "$DEST/aqwatch"  0755
+  stage_file "$SRCTOOL/aqinject"        "$DEST/aqinject" 0755
+  stage_file "$SRCTOOL/aqwatch"         "$DEST/aqwatch"  0755
 
-  # Seed config files on a fresh install without clobbering existing edits.
+  # Seed config files on a fresh install without clobbering existing edits. 0644 is what makes
+  # them legible from a sandbox: system.sb's grant carries a (file-mode #o0004) requirement,
+  # so a stricter mode leaves them readable to root alone and every rule silently inert.
   for f in headers.txt redirects.txt flags.txt; do
-    [ -f "$DEST/$f" ] && continue
-    if [ -f "$DIR/examples/$f" ]; then cp "$DIR/examples/$f" "$DEST/$f"; else : > "$DEST/$f"; fi
-    chown root:wheel "$DEST/$f"; chmod 0644 "$DEST/$f"
+    [ -f "$LIBDIR/$f" ] && continue
+    if [ -f "$DIR/examples/$f" ]; then cp "$DIR/examples/$f" "$LIBDIR/$f"; else : > "$LIBDIR/$f"; fi
+    chown root:wheel "$LIBDIR/$f"; chmod 0644 "$LIBDIR/$f"
   done
 
-  echo "  installed to $DEST (nothing loaded yet)"
+  echo "  installed to $LIBDIR and $DEST (nothing loaded yet)"
   echo "  test on one process first:  DYLD_INSERT_LIBRARIES=$DYLIB curl -v https://api.twitter.com"
 }
 
@@ -124,8 +137,8 @@ do_uninstall() {
   # KeepAlive means launchd may have a copy running that outlives the unload.
   pkill -f "$DEST/aqwatch" 2>/dev/null || true
 
-  rm -rf "$DEST"
-  echo "  removed $DEST"
+  rm -rf "$DEST" "$LIBDIR"
+  echo "  removed $DEST and $LIBDIR"
 
   # Deleting the dylib does not unload it. A process that already loaded it keeps running
   # with it, because a mapped image survives the file being unlinked; nothing new picks it up

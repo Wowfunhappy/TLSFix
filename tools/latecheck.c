@@ -14,7 +14,7 @@
 // that the engine carried the connection.
 //
 //   clang -arch x86_64 -arch i386 -mmacosx-version-min=10.6 -o latecheck tools/latecheck.c
-//   ./latecheck /Library/AquaTransport/aquatransport.dylib
+//   ./latecheck /usr/share/aquatransport/aquatransport.dylib
 #include <dlfcn.h>
 #include <mach-o/dyld.h>
 #include <stdio.h>
@@ -37,7 +37,7 @@ static int loaded(const char *needle) {
 }
 
 int main(int argc, char **argv) {
-    const char *dylib = argc > 1 ? argv[1] : "/Library/AquaTransport/aquatransport.dylib";
+    const char *dylib = argc > 1 ? argv[1] : "/usr/share/aquatransport/aquatransport.dylib";
 
     printf("  phase 1 (before our dylib): CF=%d Security=%d\n",
            loaded("CoreFoundation.framework"), loaded("Security.framework"));

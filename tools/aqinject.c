@@ -14,11 +14,14 @@
 // dlopen, not arbitrary code.
 //
 //   sudo aqinject <pid> <dylib>            load into one process
+//   sudo aqinject -q <pid> <dylib>         the same, quiet about expected outcomes
 //   sudo aqinject --all <dylib>            load into every eligible running process
 //
 // aqwatch (tools/aqwatch.c) drives this tool: it watches the process list for launches and
-// calls `aqinject <pid> <dylib>` once for each new process, so processes started after aqwatch
-// begins running are covered as well.
+// calls `aqinject -q <pid> <dylib>` once for each new process, so processes started after
+// aqwatch begins running are covered as well. It runs the tool once per process and reports a
+// non-zero exit rather than trying again, so the exit status and stderr here are the whole
+// account of what happened to that process.
 //
 // MECHANISM. pthread_create_from_mach_thread does not exist until 10.7, so its equivalent is
 // built by hand and works identically on 10.6:
@@ -87,6 +90,10 @@
 
 extern char **environ;
 
+// Written into the pthread_create-return slot before the thread starts, so that slot reading
+// back as 0 means "returned success" rather than "nothing has been stored here yet".
+#define PCRET_UNSET 0xFFFFFFFFu
+
 #define PAYLOAD_SZ  0x1000
 #define OFF_ATTR    0x080
 #define OFF_PATH    0x100
@@ -113,6 +120,9 @@ typedef uint64_t word_t;
 #define C_DONE 56
 #define C_HAND 64
 #define C_GS 72
+#define C_PCRET 80
+#define C_DE 88
+#define C_ERR 96
 static const unsigned char STAGE1[] = {
     0x49,0x8B,0x7F,0x48,                      // mov rdi,[r15+72]  gsbase
     0xB8,0x03,0x00,0x00,0x03,                 // mov eax,0x03000003
@@ -123,6 +133,7 @@ static const unsigned char STAGE1[] = {
     0x4C,0x89,0xF9,                           // mov rcx,r15       &ctx
     0x49,0x8B,0x47,0x00,                      // mov rax,[r15+0]   pthread_create
     0xFF,0xD0,                                // call rax
+    0x41,0x89,0x47,0x50,                      // mov [r15+80],eax  pthread_create's return
     0xEB,0xFE                                 // 1: jmp 1b
 };
 static const unsigned char STAGE2[] = {
@@ -132,7 +143,12 @@ static const unsigned char STAGE2[] = {
     0x49,0x8B,0x47,0x08,                      // mov rax,[r15+8]   dlopen
     0xFF,0xD0,                                // call rax
     0x49,0x89,0x47,0x40,                      // mov [r15+64],rax  handle
-    0x49,0xC7,0x47,0x38,0x01,0x00,0x00,0x00,  // mov qword [r15+56],1  done
+    0x48,0x85,0xC0,                           // test rax,rax
+    0x75,0x0A,                                // jnz done
+    0x49,0x8B,0x47,0x58,                      // mov rax,[r15+88]  dlerror
+    0xFF,0xD0,                                // call rax
+    0x49,0x89,0x47,0x60,                      // mov [r15+96],rax  the reason, in the target
+    0x49,0xC7,0x47,0x38,0x01,0x00,0x00,0x00,  // done: mov qword [r15+56],1
     0x31,0xC0, 0xC9, 0xC3                     // xor eax,eax; leave; ret
 };
 #define MY_LP64 1
@@ -148,6 +164,9 @@ typedef uint32_t word_t;
 #define C_DONE 28
 #define C_HAND 32
 #define C_GS 36
+#define C_PCRET 40
+#define C_DE 44
+#define C_ERR 48
 static const unsigned char STAGE1[] = {
     0xFF,0x76,0x24,                           // push [esi+36]  gsbase (-> [esp+4])
     0x50,                                     // push eax       (dummy ret slot)
@@ -162,6 +181,7 @@ static const unsigned char STAGE1[] = {
     0x8B,0x06,                                // mov eax,[esi]            pthread_create
     0xFF,0xD0,                                // call eax
     0x83,0xC4,0x10,                           // add esp,16
+    0x89,0x46,0x28,                           // mov [esi+40],eax  pthread_create's return
     0xEB,0xFE                                 // 1: jmp 1b
 };
 static const unsigned char STAGE2[] = {
@@ -174,6 +194,13 @@ static const unsigned char STAGE2[] = {
     0x83,0xC4,0x08,                           // add esp,8
     0x8B,0x4D,0x08,                           // mov ecx,[ebp+8]   reload &ctx
     0x89,0x41,0x20,                           // mov [ecx+32],eax  handle
+    0x85,0xC0,                                // test eax,eax
+    0x75,0x0B,                                // jnz done
+    0x8B,0x41,0x2C,                           // mov eax,[ecx+44]  dlerror
+    0xFF,0xD0,                                // call eax
+    0x8B,0x4D,0x08,                           // mov ecx,[ebp+8]   reload (call clobbers ecx)
+    0x89,0x41,0x30,                           // mov [ecx+48],eax  the reason, in the target
+    0x8B,0x4D,0x08,                           // done: mov ecx,[ebp+8]
     0xC7,0x41,0x1C,0x01,0x00,0x00,0x00,       // mov dword [ecx+28],1  done
     0x31,0xC0, 0xC9, 0xC3                     // xor eax,eax; leave; ret
 };
@@ -202,19 +229,6 @@ static int verify_shared_cache(task_t task, void *localfn) {
     return memcmp(remote, local, sizeof local) == 0;
 }
 
-// Walks the target's dyld_all_image_infos. Returns the number of loaded images, or -1 if the
-// list cannot be read -- which is also the state of a process that has not finished exec'ing.
-// Structs are native to this slice, which matches the target's arch.
-static int target_image_count(task_t task) {
-    task_dyld_info_data_t di; mach_msg_type_number_t cnt = TASK_DYLD_INFO_COUNT;
-    if (task_info(task, TASK_DYLD_INFO, (task_info_t)&di, &cnt) != KERN_SUCCESS) return -1;
-    if (di.all_image_info_addr == 0) return -1;
-    struct dyld_all_image_infos aii; mach_vm_size_t n = 0;
-    if (mach_vm_read_overwrite(task, di.all_image_info_addr, sizeof aii,
-            (mach_vm_address_t)(uintptr_t)&aii, &n) != KERN_SUCCESS) return -1;
-    return (int)aii.infoArrayCount;
-}
-
 // True if an image whose path contains `needle` is loaded in the target.
 static int target_has_image(task_t task, const char *needle) {
     task_dyld_info_data_t di; mach_msg_type_number_t cnt = TASK_DYLD_INFO_COUNT;
@@ -238,7 +252,19 @@ static int target_has_image(task_t task, const char *needle) {
     return 0;
 }
 
-static int alive(pid_t pid) { return !(kill(pid, 0) != 0 && errno == ESRCH); }
+// Alive in the only sense that matters here: still able to receive a library. A zombie answers
+// kill(pid, 0) exactly as a running process does but has already torn down its task, so treating
+// it as alive turns every process that exits mid-injection into a task_for_pid failure reported
+// as a fault. p_stat is what separates the two.
+#ifndef SZOMB
+#define SZOMB 5
+#endif
+static int alive(pid_t pid) {
+    int mib[4] = { CTL_KERN, KERN_PROC, KERN_PROC_PID, (int)pid };
+    struct kinfo_proc kp; size_t len = sizeof kp;
+    if (sysctl(mib, 4, &kp, &len, NULL, 0) != 0 || len == 0) return 0;
+    return kp.kp_proc.p_stat != SZOMB;
+}
 
 // THE EXEC RACE. A pid appears in the kernel's process list as soon as the process exists,
 // which is before dyld has loaded the executable it is going to run. Anything injected in that
@@ -247,19 +273,57 @@ static int alive(pid_t pid) { return !(kill(pid, 0) != 0 && errno == ESRCH); }
 // there afterwards. aqwatch sees processes at exactly this moment, so this is the common case,
 // not an edge one.
 //
-// A fixed delay before injecting would only be a guess at how long exec takes. This waits for
-// an *observable* state instead -- dyld having published an image list, which happens only
-// once the new image is loaded and running -- and inject_native then verifies afterwards that
-// the library really is in the target. Both are checks on what happened, not predictions.
+// AN IMAGE LIST IS NOT THE CONDITION TO WAIT FOR. dyld publishes infoArray as it loads, so
+// infoArrayCount goes positive early in startup -- while dyld is still working and, crucially,
+// before libSystem's initializer has run. Injecting in that window asks a process whose pthread
+// subsystem is not yet initialized to run pthread_create off a bare mach thread with a
+// hand-built TSD. It fails, and it fails in the way that is hardest to see: stage 1 gets a
+// non-zero return from pthread_create, stage 2 never runs, no dlopen is ever attempted, and the
+// injector sits out its full wait and reports a timeout. On 10.9.5 a com.apple.WebKit.Networking
+// launch spends 14-51 ms with an image list published and libSystemInitialized still false, and
+// aqwatch fires the moment a pid appears, so that window is squarely in its path.
 //
-// Returns 0 once the target is running its own image, 1 if it exits or never gets there.
+// dyld sets libSystemInitialized once libSystem's initializer has returned, which is precisely
+// the condition the payload depends on, so that is what this waits for: an observation of the
+// target's own state rather than a delay guessed in advance. inject_native verifies afterwards
+// that the library really arrived.
+//
+// Returns 0 once the target is ready to be injected, 2 if it exited on the way there, and 1 if
+// it is still alive but never became ready. A target that simply exited is the ordinary end of
+// most injections -- every shell command is one -- and separating it from a real failure is
+// what keeps it out of the caller's log.
+static int target_ready(task_t task) {
+    task_dyld_info_data_t di; mach_msg_type_number_t cnt = TASK_DYLD_INFO_COUNT;
+    if (task_info(task, TASK_DYLD_INFO, (task_info_t)&di, &cnt) != KERN_SUCCESS) return 0;
+    if (di.all_image_info_addr == 0) return 0;
+    struct dyld_all_image_infos aii; mach_vm_size_t n = 0;
+    if (mach_vm_read_overwrite(task, di.all_image_info_addr, sizeof aii,
+            (mach_vm_address_t)(uintptr_t)&aii, &n) != KERN_SUCCESS) return 0;
+    if (aii.infoArrayCount == 0) return 0;
+    // libSystemInitialized exists from all_image_infos version 2 (10.5) on, so it is always
+    // present on 10.6-10.9; the guard is only so an unexpected layout degrades to the old
+    // behaviour rather than reading a garbage byte as "not ready" forever.
+    if (aii.version >= 2 && !aii.libSystemInitialized) return 0;
+    return 1;
+}
+
 static int wait_for_exec(task_t task, pid_t pid, int quiet) {
-    for (int i = 0; i < 200; i++) {              // generous; normally true on the first read
-        if (target_image_count(task) > 0) return 0;
-        if (!alive(pid)) { if (!quiet) fprintf(stderr, "  pid %d: exited before exec\n", pid); return 1; }
+    for (int i = 0; i < 500; i++) {              // 5s ceiling; normally a handful of iterations
+        if (target_ready(task)) return 0;
+        if (!alive(pid)) { if (!quiet) fprintf(stderr, "  pid %d: exited before exec\n", pid); return 2; }
         usleep(10000);
     }
-    if (!quiet) fprintf(stderr, "  pid %d: never published a dyld image list\n", pid);
+    fprintf(stderr, "  pid %d: never finished dyld startup\n", pid);
+    return alive(pid) ? 1 : 2;
+}
+
+// A mach call against the target failed. If the target is no longer there, that is why, and it
+// is the ordinary end of a short-lived process rather than something to report; otherwise the
+// call failed against a live task and the reason is worth printing. Returns the status
+// inject_native should hand back.
+static int mach_step_failed(pid_t pid, const char *what, kern_return_t kr) {
+    if (!alive(pid)) return 2;
+    fprintf(stderr, "  pid %d: %s failed: %s\n", pid, what, mach_error_string(kr));
     return 1;
 }
 
@@ -268,17 +332,33 @@ static int wait_for_exec(task_t task, pid_t pid, int quiet) {
 static int inject_native(pid_t pid, const char *path, int quiet) {
     void *p_dlopen = dlsym(RTLD_DEFAULT, "dlopen");
     void *p_pthread_create = dlsym(RTLD_DEFAULT, "pthread_create");
-    if (!p_dlopen || !p_pthread_create) { fprintf(stderr, "cannot resolve libSystem symbols\n"); return 1; }
+    void *p_dlerror = dlsym(RTLD_DEFAULT, "dlerror");
+    if (!p_dlopen || !p_pthread_create || !p_dlerror) {
+        fprintf(stderr, "cannot resolve libSystem symbols\n"); return 1;
+    }
 
+    // A process on its way out drops its task before it becomes a zombie, so a failure here is
+    // ambiguous the instant it happens: the target may be exiting, or it may be mid-exec, or it
+    // may be one this tool genuinely cannot open. Giving it a few tries and re-asking whether
+    // the target is still there resolves which, and keeps a process that was merely quitting
+    // from being reported as a fault.
     task_t task = MACH_PORT_NULL;
-    kern_return_t kr = task_for_pid(mach_task_self(), pid, &task);
+    kern_return_t kr = KERN_FAILURE;
+    for (int i = 0; i < 5; i++) {
+        kr = task_for_pid(mach_task_self(), pid, &task);
+        if (kr == KERN_SUCCESS) break;
+        if (!alive(pid)) return 2;
+        usleep(20000);
+    }
     if (kr != KERN_SUCCESS) {
-        if (!quiet) fprintf(stderr, "  pid %d: task_for_pid failed: %s\n", pid, mach_error_string(kr));
+        if (!alive(pid)) return 2;
+        fprintf(stderr, "  pid %d: task_for_pid failed: %s\n", pid, mach_error_string(kr));
         return 1;
     }
     // Before anything is written into the target: make sure it is running its own image and
     // not still on its way through exec. See the exec-race note above.
-    if (wait_for_exec(task, pid, quiet) != 0) return 1;
+    int w = wait_for_exec(task, pid, quiet);
+    if (w != 0) return w;
 
     if (!verify_shared_cache(task, p_dlopen)) {
         if (!quiet) fprintf(stderr, "  pid %d: shared-cache mismatch, skipping\n", pid);
@@ -291,7 +371,7 @@ static int inject_native(pid_t pid, const char *path, int quiet) {
     mach_vm_address_t payload = 0, stack = 0, tsd = 0;
     const mach_vm_size_t STACK_SZ = 0x100000, TSD_SZ = 0x8000;
 #define A(addr, sz, what) do { kr = mach_vm_allocate(task, &addr, sz, VM_FLAGS_ANYWHERE); \
-    if (kr != KERN_SUCCESS) { fprintf(stderr, "  pid %d: %s failed: %s\n", pid, what, mach_error_string(kr)); return 1; } } while (0)
+    if (kr != KERN_SUCCESS) return mach_step_failed(pid, what, kr); } while (0)
     A(payload, PAYLOAD_SZ, "vm_allocate payload");
     A(stack,   STACK_SZ,   "vm_allocate stack");
     A(tsd,     TSD_SZ,     "vm_allocate tsd");
@@ -306,6 +386,10 @@ static int inject_native(pid_t pid, const char *path, int quiet) {
     put_word(page, C_MO, (word_t)(RTLD_NOW | RTLD_GLOBAL));
     put_word(page, C_S2, (word_t)(payload + OFF_STAGE2));
     put_word(page, C_GS, (word_t)tsd);
+    put_word(page, C_DE, (word_t)(uintptr_t)p_dlerror);
+    // Sentinel, so "pthread_create has not returned yet" is distinguishable from the 0 it
+    // returns on success. Stage 1 overwrites the low 32 bits with the actual return.
+    put_word(page, C_PCRET, (word_t)PCRET_UNSET);
     memcpy(page + OFF_ATTR,   &attr, sizeof attr);
     memcpy(page + OFF_PATH,   path,  strlen(path) + 1);
     memcpy(page + OFF_STAGE1, STAGE1, sizeof STAGE1);
@@ -313,11 +397,11 @@ static int inject_native(pid_t pid, const char *path, int quiet) {
 
     if ((kr = mach_vm_write(task, payload, (vm_offset_t)(uintptr_t)page, PAYLOAD_SZ)) != KERN_SUCCESS ||
         (kr = mach_vm_protect(task, payload, PAYLOAD_SZ, 0, VM_PROT_READ | VM_PROT_WRITE | VM_PROT_EXECUTE)) != KERN_SUCCESS) {
-        fprintf(stderr, "  pid %d: writing payload failed: %s\n", pid, mach_error_string(kr)); return 1;
+        return mach_step_failed(pid, "writing payload", kr);
     }
     word_t self = (word_t)tsd;
     if ((kr = mach_vm_write(task, tsd, (vm_offset_t)(uintptr_t)&self, sizeof self)) != KERN_SUCCESS) {
-        fprintf(stderr, "  pid %d: writing tsd failed: %s\n", pid, mach_error_string(kr)); return 1;
+        return mach_step_failed(pid, "writing tsd", kr);
     }
 
     thread_act_t th = MACH_PORT_NULL;
@@ -335,7 +419,7 @@ static int inject_native(pid_t pid, const char *path, int quiet) {
     st.__esp = sp;
     kr = thread_create_running(task, x86_THREAD_STATE32, (thread_state_t)&st, x86_THREAD_STATE32_COUNT, &th);
 #endif
-    if (kr != KERN_SUCCESS) { fprintf(stderr, "  pid %d: thread_create_running failed: %s\n", pid, mach_error_string(kr)); return 1; }
+    if (kr != KERN_SUCCESS) return mach_step_failed(pid, "thread_create_running", kr);
 
     // Wait for stage 2 to report back, but stop the moment the target is unreadable. A
     // process that exits while we are injecting never sets the flag, and without this check
@@ -371,16 +455,61 @@ static int inject_native(pid_t pid, const char *path, int quiet) {
     }
     thread_terminate(th);
 
-    if (!done)   { fprintf(stderr, "  pid %d: timed out\n", pid); return alive(pid) ? 3 : 2; }
-    if (!handle) { fprintf(stderr, "  pid %d: dlopen returned NULL\n", pid); return 1; }
+    // Timing out is not the same as failing. Stage 2 runs on a real pthread of the target's own,
+    // which this tool does not own and does not stop -- terminating the bootstrap thread above
+    // leaves it running -- so a dlopen that has not reported back may still be in progress, and
+    // asking the image list is the difference between "not yet" and "no". Without this check a
+    // target that took the library is reported as a failure and injected again on top of a
+    // dlopen that is still running. wait_for_exec is what keeps this rare; this is the backstop
+    // for a target slow enough to reach it anyway.
+    const char *base = strrchr(path, '/');
+    const char *needle = base ? base + 1 : path;
+    if (!done) {
+        if (target_has_image(task, needle) == 1) {
+            printf("  pid %d (%s): injected (dlopen outran the wait)\n", pid, MY_LP64 ? "x86_64" : "i386");
+            return 0;
+        }
+        // Which of the two things that can stall here actually did. Stage 1 records what
+        // pthread_create returned, so a thread that was never created reads as its errno rather
+        // than as a bare wait that expired. The two call for opposite responses -- a target
+        // whose dlopen is merely slow wants to be left alone to finish, one whose stage 2 never
+        // started wants another attempt -- so they must not print the same line.
+        word_t pcret = 0; mach_vm_size_t rn = 0;
+        if (mach_vm_read_overwrite(task, payload + C_PCRET, sizeof pcret,
+                                   (mach_vm_address_t)(uintptr_t)&pcret, &rn) == KERN_SUCCESS &&
+            (uint32_t)pcret != PCRET_UNSET && (uint32_t)pcret != 0) {
+            fprintf(stderr, "  pid %d: pthread_create failed in target: %s (%u)\n",
+                    pid, strerror((int)(uint32_t)pcret), (unsigned)(uint32_t)pcret);
+            return alive(pid) ? 3 : 2;
+        }
+        fprintf(stderr, "  pid %d: timed out%s\n", pid,
+                (uint32_t)pcret == PCRET_UNSET ? " (stage 1 never returned from pthread_create)"
+                                               : " (stage 2 started; dlopen still running)");
+        return alive(pid) ? 3 : 2;
+    }
+    if (!handle) {
+        // dlerror(), read out of the target. "dlopen returned NULL" on its own names no cause
+        // and cannot be acted on; dyld's own message says whether the file could not be read,
+        // a symbol was missing, or the mapping failed.
+        word_t errp = 0; mach_vm_size_t rn = 0;
+        char reason[512]; reason[0] = 0;
+        if (mach_vm_read_overwrite(task, payload + C_ERR, sizeof errp,
+                                   (mach_vm_address_t)(uintptr_t)&errp, &rn) == KERN_SUCCESS && errp) {
+            if (mach_vm_read_overwrite(task, (mach_vm_address_t)errp, sizeof reason - 1,
+                                       (mach_vm_address_t)(uintptr_t)reason, &rn) != KERN_SUCCESS)
+                reason[0] = 0;
+            reason[sizeof reason - 1] = 0;
+        }
+        fprintf(stderr, "  pid %d: dlopen returned NULL%s%s\n", pid,
+                reason[0] ? ": " : " (dlerror gave no reason)", reason[0] ? reason : "");
+        return 1;
+    }
 
     // Confirm the library is actually in the target rather than trusting that it should be.
     // dlopen can report success into an address space that an exec is about to replace, in
-    // which case nothing above notices and the process runs on unpatched -- which is exactly
-    // how this failed for Safari's networking service. Checking the image list is the only
-    // statement about the outcome that is worth anything.
-    const char *base = strrchr(path, '/');
-    int present = target_has_image(task, base ? base + 1 : path);
+    // which case nothing above notices and the process runs on unpatched. Checking the image
+    // list is the only statement about the outcome that is worth anything.
+    int present = target_has_image(task, needle);
     if (present != 1) {
         if (!alive(pid)) { if (!quiet) fprintf(stderr, "  pid %d: exited during injection\n", pid); return 2; }
         if (!quiet) fprintf(stderr, "  pid %d: dlopen reported success but the image is absent, retrying\n", pid);
@@ -405,10 +534,13 @@ static int inject_native_retrying(pid_t pid, const char *path, int quiet) {
 }
 
 // Inject into any target, spawning the matching fat slice when the target is the other arch.
-static int inject_dispatch(pid_t pid, const char *path) {
+static int inject_dispatch(pid_t pid, const char *path, int quiet) {
     int lp64 = MY_LP64;
-    if (!proc_info(pid, &lp64, NULL, 0)) { fprintf(stderr, "  pid %d: gone\n", pid); return 1; }
-    if (lp64 == MY_LP64) return inject_native_retrying(pid, path, 0);
+    if (!proc_info(pid, &lp64, NULL, 0)) {
+        if (!quiet) fprintf(stderr, "  pid %d: gone\n", pid);
+        return 2;                               // the target exited; nothing to report
+    }
+    if (lp64 == MY_LP64) return inject_native_retrying(pid, path, quiet);
 
     if (getenv("AQINJECT_REEXEC")) { fprintf(stderr, "  pid %d: missing %s slice\n", pid, lp64 ? "x86_64" : "i386"); return 1; }
     char self[4096]; uint32_t sz = sizeof self;
@@ -416,6 +548,7 @@ static int inject_dispatch(pid_t pid, const char *path) {
     char pidstr[16]; snprintf(pidstr, sizeof pidstr, "%d", pid);
     char *av[8]; int ai = 0;
     av[ai++] = self;
+    if (quiet) av[ai++] = (char *)"-q";
     av[ai++] = pidstr; av[ai++] = (char *)path; av[ai] = NULL;
     posix_spawnattr_t a; posix_spawnattr_init(&a);
     cpu_type_t pref[1] = { lp64 ? CPU_TYPE_X86_64 : CPU_TYPE_X86 }; size_t oc = 0;
@@ -450,7 +583,7 @@ static int inject_all(const char *path) {
         const char *comm = procs[i].kp_proc.p_comm;
         if (pid <= 1 || pid == me) continue;
         if (is_denied(comm)) { skipped++; continue; }
-        int r = inject_dispatch(pid, path);
+        int r = inject_dispatch(pid, path, 0);
         if (r == 0) done++;
         else if (r == 2) skipped++;    // exited during injection
         else failed++;
@@ -461,9 +594,14 @@ static int inject_all(const char *path) {
 }
 
 int main(int argc, char **argv) {
-    int all = 0, ai = 1;
+    // -q suppresses the outcomes that are expected rather than wrong -- above all a short-lived
+    // target exiting part-way through, which is the ordinary end of most injections aqwatch
+    // starts. Real failures print either way, so a caller logging this tool's stderr gets the
+    // failures without the churn.
+    int all = 0, quiet = 0, ai = 1;
     for (; ai < argc; ai++) {
-        if (!strcmp(argv[ai], "--all")) all = 1;
+        if (!strcmp(argv[ai], "--all"))    all = 1;
+        else if (!strcmp(argv[ai], "-q"))  quiet = 1;
         else break;
     }
     if (all) {
@@ -471,12 +609,12 @@ int main(int argc, char **argv) {
         return inject_all(argv[ai]);
     }
     if (argc - ai != 2) {
-        fprintf(stderr, "usage: %s <pid> <dylib>\n"
+        fprintf(stderr, "usage: %s [-q] <pid> <dylib>\n"
                         "       %s --all <dylib>\n", argv[0], argv[0]);
         return 2;
     }
     pid_t pid = (pid_t)atoi(argv[ai]);
     const char *path = argv[ai + 1];
     if (strlen(path) >= (OFF_STAGE1 - OFF_PATH)) { fprintf(stderr, "path too long\n"); return 2; }
-    return inject_dispatch(pid, path);
+    return inject_dispatch(pid, path, quiet);
 }

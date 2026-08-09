@@ -9,6 +9,7 @@
 
 set -e
 DEST=/Library/AquaTransport
+LIBDIR=/usr/share/aquatransport
 PLIST_LABEL=org.aquatransport.watch
 PLIST="/Library/LaunchDaemons/$PLIST_LABEL.plist"
 
@@ -25,15 +26,22 @@ else
 fi
 
 # ---- remove the files, keeping the user's rules --------------------------------------
-if [ -d "$DEST" ]; then
-  if [ -f "$DEST/redirects.txt" ] || [ -f "$DEST/headers.txt" ]; then
+if [ -d "$LIBDIR" ]; then
+  if [ -f "$LIBDIR/redirects.txt" ] || [ -f "$LIBDIR/headers.txt" ]; then
     BACKUP="/Library/AquaTransport-rules-backup"
     mkdir -p "$BACKUP"
     for f in redirects.txt headers.txt; do
-      [ -f "$DEST/$f" ] && cp "$DEST/$f" "$BACKUP/$f"
+      [ -f "$LIBDIR/$f" ] && cp "$LIBDIR/$f" "$BACKUP/$f"
     done
     say "copied your rule files to $BACKUP"
   fi
+  rm -rf "$LIBDIR"
+  say "removed $LIBDIR"
+else
+  say "$LIBDIR is already gone"
+fi
+
+if [ -d "$DEST" ]; then
   rm -rf "$DEST"
   say "removed $DEST"
 else

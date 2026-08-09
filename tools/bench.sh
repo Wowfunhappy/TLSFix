@@ -11,7 +11,7 @@
 # Run from the repo root after ./build-macos.sh. Installs nothing.
 
 DIR="$(cd "$(dirname "$0")/.." && pwd)"
-T="$DIR/build/stage/Library/AquaTransport"
+T="$DIR/build/stage/usr/share/aquatransport"
 D="$T/aquatransport.dylib"
 N="${N:-40}"
 export AQUATRANSPORT_DIR="$T"

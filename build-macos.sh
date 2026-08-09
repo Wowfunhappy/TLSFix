@@ -4,8 +4,8 @@
 # Everything is built from sources in this repo: deps/openssl-*.tar.gz is the only
 # external dependency and it is vendored, so a build needs no network access.
 #
-# Output: build/stage/Library/AquaTransport/{aquatransport.dylib (fat i386 + x86_64),
-#         aqinject, aqwatch}
+# Output: build/stage/usr/share/aquatransport/aquatransport.dylib (fat i386 + x86_64)
+#         build/stage/Library/AquaTransport/{aqinject, aqwatch}
 #
 # aqinject/aqwatch load the dylib into other processes. Two requirements the build verifies
 # before finishing:
@@ -90,7 +90,7 @@ for a in "${ARCHS[@]}"; do
   done
   out="$OBJDIR/aquatransport-$a.dylib"
   clang -arch "$a" -mmacosx-version-min="$MIN" -dynamiclib -o "$out" \
-    -install_name /Library/AquaTransport/aquatransport.dylib \
+    -install_name /usr/share/aquatransport/aquatransport.dylib \
     "${objs[@]}" "$LS_OUT/lib/libssl.a" "$LS_OUT/lib/libcrypto.a" \
     -Wl,-lazy_framework,Security -Wl,-lazy_framework,CoreFoundation \
     -Wl,-exported_symbols_list,"$BUILD/nothing.exp"
@@ -98,8 +98,28 @@ for a in "${ARCHS[@]}"; do
   echo "    $a ok"
 done
 
-ST="$BUILD/stage/Library/AquaTransport"
-mkdir -p "$ST"
+# The stage mirrors the installed layout, so it doubles as a pkgbuild root.
+#
+#   usr/share/aquatransport/   the dylib and the rule files -- everything a target reads for
+#                              itself. /usr/share is one of the few directories a sandboxed
+#                              process may read; see src/mac/aquatransport_config.c.
+#   Library/AquaTransport/     aqinject and aqwatch, which root runs from outside any sandbox.
+ST="$BUILD/stage/usr/share/aquatransport"
+STOOL="$BUILD/stage/Library/AquaTransport"
+
+# Clear the build's own products from the whole stage tree first. Because the stage is a
+# pkgbuild root, a binary sitting at a path this build no longer writes is still packaged and
+# installed, so a copy at a retired path would ship alongside the real one. Matching by name
+# across the tree keeps that true for any path the layout leaves behind.
+#
+# The rule files are deliberately not touched: they are hand-maintained fixtures that
+# selftest.sh reads through AQUATRANSPORT_DIR, and nothing regenerates them.
+if [ -d "$BUILD/stage" ]; then
+  find "$BUILD/stage" -type f \
+    \( -name aquatransport.dylib -o -name aqinject -o -name aqwatch \) -delete
+fi
+
+mkdir -p "$ST" "$STOOL"
 
 lipo -create "${slices[@]}" -output "$ST/aquatransport.dylib"
 
@@ -138,7 +158,7 @@ echo "built: $ST/aquatransport.dylib"
 iargs=(); for a in "${ARCHS[@]}"; do iargs+=(-arch "$a"); done
 for t in aqinject aqwatch; do
   echo "==> building $t"
-  clang "${iargs[@]}" -mmacosx-version-min="$MIN" -O2 -Wall -o "$ST/$t" "$DIR/tools/$t.c"
-  echo "    architectures:$(lipo -info "$ST/$t" | sed 's/.*://')"
+  clang "${iargs[@]}" -mmacosx-version-min="$MIN" -O2 -Wall -o "$STOOL/$t" "$DIR/tools/$t.c"
+  echo "    architectures:$(lipo -info "$STOOL/$t" | sed 's/.*://')"
 done
-echo "built: $ST/aqinject, $ST/aqwatch"
+echo "built: $STOOL/aqinject, $STOOL/aqwatch"

@@ -41,11 +41,48 @@ The build enforces three invariants, each guarding a failure that is silent at l
 ## Install
 
 ```
-sudo ./install-macos.sh stage      # copy to /Library/AquaTransport, load nothing
+sudo ./install-macos.sh stage      # copy files into place, load nothing
 sudo ./install-macos.sh inject     # + load into every eligible running process now
 sudo ./install-macos.sh watch      # + a daemon that loads into each process as it launches
 sudo ./install-macos.sh uninstall  # remove the daemon, then the files
 ```
+
+The install spans two directories:
+
+| path | contents |
+| --- | --- |
+| `/usr/share/aquatransport/` | `aquatransport.dylib`, `flags.txt`, `headers.txt`, `redirects.txt` |
+| `/Library/AquaTransport/` | `aqinject`, `aqwatch`, `uninstall.sh` |
+
+The split follows from who reads what. A target `dlopen`s the dylib and reads the rule files
+itself, so those reads happen under the *target's* sandbox, and
+`/System/Library/Sandbox/Profiles/system.sb` — imported by every sandboxed process — grants
+`file-read*` only for world-readable files under `/System`, `/usr/lib`, `/usr/share`,
+`/private/var/db/dyld` and `/Library/Filesystems/NetFSPlugins`:
+
+```scheme
+(allow file-read*
+       (require-all (file-mode #o0004)
+                    (require-any ... (subpath "/usr/share") ...)))
+```
+
+A `deny default` daemon — WebKit's `webpushd` is one — reads nothing outside that set, and a
+`dlopen` it cannot satisfy leaves it running unpatched with a kernel log line as the only
+trace:
+
+```
+Sandbox: webpushd(715) deny file-read-data /usr/share/aquatransport/aquatransport.dylib
+```
+
+The `(file-mode #o0004)` clause is why the installers set 0644 on these files and 0755 on the
+directory: a stricter mode is readable to root alone, and every sandboxed target goes
+unpatched. `aqinject` and `aqwatch` face none of this — root runs them from outside any
+sandbox — so they live in `/Library/AquaTransport`.
+
+Not every sandboxed process is this restricted. `application.sb`, which backs the app sandbox,
+carries a blanket `(allow file-read* (subpath "/Library"))`, and WebKit's `WebProcess` and
+`NetworkProcess` profiles reach the dylib as well. `/usr/share` is what the whole range of
+them share.
 
 The library is loaded into a process by `aqinject` (`tools/aqinject.c`) — `task_for_pid`
 plus a hand-built `mach_inject` — using the target's own `dlopen`. It edits no system launch
@@ -131,10 +168,62 @@ kernel's process list (`proc_listpids`) every 100 ms and treats any pid it has n
 before as a launch, keeping the seen-set as a bitmap over the pid space so a pid that exits
 clears itself on the next sweep. For each new process that is not the daemon itself, one of
 its own children, pid 0/1, or a trust daemon, `aqwatch` runs
-`aqinject <pid> <dylib>` — once, with no waiting and no conditions. In-flight `aqinject`
+`aqinject <pid> <dylib>`. In-flight `aqinject`
 children are capped and reaped so an app-launch storm cannot fork-bomb the machine. The
 deny list is applied to `proc_pidpath` of the pid, so it matches what the process actually
 is rather than anything the daemon was told.
+
+**One injection per launch, and a failure is reported rather than worked around.** `aqinject`
+waits for the target to be ready and then confirms, by reading the target's own dyld image
+list, that the library actually arrived; it exits 0 only then. `aqwatch` acts on that status
+and does not try again.
+
+There is deliberately no retry loop and no periodic re-check. Either the injection lands, in
+which case repeating it buys nothing, or it does not, in which case the useful response is a
+log line naming the pid and the reason — not a schedule of further attempts that would hide
+how often the first one misses. Anything that leaves a live process without the library,
+including the one path where no injector runs at all (`MAX_INFLIGHT` exhausted), writes a
+`NOT PATCHED` line to `/var/log/aquatransport.log` (0600, bounded and truncated in place while
+running).
+
+That log is only worth reading if it is quiet when nothing is wrong, so the outcomes that are
+expected rather than wrong are classified as such and stay out of it. A target that exits
+part-way through is the ordinary end of most injections — every shell command is one — and it
+is distinguished from a fault at each point it can happen: no task port, no dyld startup, a
+failed `mach_vm_write`, a failed `thread_create_running`. A process that is merely quitting
+answers `kill(pid, 0)` exactly as a running one does, so the liveness test reads `p_stat` and
+treats a zombie as gone, and a failed `task_for_pid` is retried briefly before being believed.
+Measured over ~480 short-lived process launches plus eight forced relaunches of Safari's
+networking service: **zero bytes logged**.
+
+### Injecting before libSystem is initialized
+
+`aqinject` waits for the target to finish exec'ing before touching it, and the condition it
+waits for has to be the right one. dyld publishes `infoArray` *as it loads*, so
+`infoArrayCount` goes positive early — while dyld is still working, and **before libSystem's
+initializer has run**. Measured on 10.9.5, a `com.apple.WebKit.Networking` launch spends
+**14–51 ms** with an image list published (225 images) and `libSystemInitialized` still false.
+`aqwatch` fires the moment a pid appears in the process list, so it lands inside that window.
+
+Injecting there asks a process whose pthread subsystem is not yet initialized to run
+`pthread_create` off a bare mach thread with a hand-built TSD. It fails, and it fails
+invisibly: stage 1 gets a non-zero return, stage 2 never runs, no `dlopen` is ever attempted,
+and the injector sits out its entire wait and reports a timeout. Sampling a target caught in
+this state shows exactly that — the stage-1 bootstrap thread spinning at its `jmp`, no stage-2
+thread in existence, and the library unmapped, in a process that is otherwise completely idle.
+
+The condition the payload actually depends on is the one dyld already exposes, so
+`wait_for_exec` waits for `dyld_all_image_infos.libSystemInitialized` rather than for a
+non-empty image list. Measured over eight forced relaunches of Safari's networking process
+under the watcher, it is patched in **1–2 s every time**.
+
+"Timed out" and "dlopen returned NULL" are symptoms rather than causes, so the injector reports
+the cause underneath each:
+
+- Stage 1 stores `pthread_create`'s return value in the payload (sentinel-initialised, so
+  success is distinguishable from "not reached"), and the injector reports it as an errno.
+- Stage 2 calls `dlerror()` when `dlopen` returns NULL and stores the string pointer; the
+  injector reads the message out of the target and prints it.
 
 Injecting unconditionally means the library goes into every process, including ones that will
 never open a socket. That is deliberate: nothing can know in advance which processes will use
@@ -177,7 +266,7 @@ it depends on when the process gets round to loading `Security.framework`.
 
 ### Flags
 
-`flags.txt` in `/Library/AquaTransport/` holds one flag name per line, read at runtime by
+`flags.txt` in `/usr/share/aquatransport/` holds one flag name per line, read at runtime by
 every loaded copy of the library. Two flags are recognised:
 
 ```

@@ -6,7 +6,7 @@
 #
 # Or by hand:
 #   scp -O tools/probe-10.6.sh build/symprobe build/urlprobe \
-#          build/stage/Library/AquaTransport/aquatransport.dylib user@host:/tmp/probe/
+#          build/stage/usr/share/aquatransport/aquatransport.dylib user@host:/tmp/probe/
 #   ssh user@host 'cd /tmp/probe && ./probe-10.6.sh'
 #
 # Requires no compiler on the target and installs nothing. Two notes on why it works the

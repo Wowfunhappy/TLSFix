@@ -8,7 +8,7 @@ This package replaces my older Aqua Proxy package.
 
 ## Advanced Configuration
 
-Advanced users can edit configuration files in /Library/AquaTransport to change how apps talk to specific websites.
+Advanced users can edit configuration files in /usr/share/aquatransport to change how apps talk to specific websites.
 
 - redirects.txt — send traffic addressed to one URL to a different URL instead.
 - headers.txt — set custom headers on traffic addressed to a URL.

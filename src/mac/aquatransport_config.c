@@ -10,7 +10,19 @@
 #include <time.h>
 #include <mach-o/dyld.h>
 
-#define TF_DEFAULT_DIR "/Library/AquaTransport"
+// Config lives under /usr/share because sandboxed targets read these files themselves.
+// /System/Library/Sandbox/Profiles/system.sb, which every sandboxed process imports, grants
+// file-read* only for world-readable files under /System, /usr/lib, /usr/share,
+// /private/var/db/dyld and /Library/Filesystems/NetFSPlugins:
+//
+//   (allow file-read*
+//          (require-all (file-mode #o0004)
+//                       (require-any ... (subpath "/usr/share") ...)))
+//
+// A deny-default daemon such as WebKit's webpushd reads nothing outside that set, so the rule
+// files sit inside it to apply everywhere. The installers keep them 0644 to satisfy the
+// file-mode clause.
+#define TF_DEFAULT_DIR "/usr/share/aquatransport"
 
 static int stat_mtime(const char *name, time_t *t);
 

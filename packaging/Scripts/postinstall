@@ -1,18 +1,25 @@
 #!/bin/bash
 # AquaTransport postinstall.
 #
-# Runs after the payload (/Library/AquaTransport/{aquatransport.dylib,aqinject,aqwatch} plus
-# rule files) is on disk. It installs the aqwatch LaunchDaemon, which loads the library into
-# each process as the process launches, and loads it into everything already running. Nothing
-# is written to launchd's global environment, so a faulty library is confined to the process
-# it is loaded into and can never keep the machine from starting.
+# Runs after the payload (/usr/share/aquatransport/{aquatransport.dylib plus rule files} and
+# /Library/AquaTransport/{aqinject,aqwatch}) is on disk. It installs the aqwatch LaunchDaemon,
+# which loads the library into each process as the process launches, and loads it into
+# everything already running. Nothing is written to launchd's global environment, so a faulty
+# library is confined to the process it is loaded into and can never keep the machine from
+# starting.
+#
+# The dylib and the rule files sit under /usr/share, one of the few directories system.sb lets
+# a sandboxed process read; a target dlopens the dylib and reads the rule files itself, under
+# its own sandbox. aqinject and aqwatch sit in /Library/AquaTransport, where root runs them
+# from outside any sandbox.
 #
 # $3 is the target volume, which is not always "/".
 
 set -e
 TARGET="${3:-/}"
 DEST="$TARGET/Library/AquaTransport"
-DYLIB="$DEST/aquatransport.dylib"
+LIBDIR="$TARGET/usr/share/aquatransport"
+DYLIB="$LIBDIR/aquatransport.dylib"
 PLIST_LABEL="org.aquatransport.watch"
 PLIST="$TARGET/Library/LaunchDaemons/$PLIST_LABEL.plist"
 
@@ -38,17 +45,21 @@ done
 # ---- 2. ownership and permissions ----------------------------------------------------
 # The dylib is loaded into root daemons, so a user-writable path would be a privilege
 # escalation. Enforce regardless of how the payload was built.
-chown -R root:wheel "$DEST"
-chmod 0755 "$DEST"
-find "$DEST" -type f -exec chmod 0644 {} +
+#
+# 0644 on the files under $LIBDIR and 0755 on $LIBDIR itself are also what a sandboxed target
+# needs: system.sb's read grant carries a (file-mode #o0004) requirement, and the target has
+# to traverse the directory to reach the dylib.
+chown -R root:wheel "$DEST" "$LIBDIR"
+chmod 0755 "$DEST" "$LIBDIR"
+find "$DEST" "$LIBDIR" -type f -exec chmod 0644 {} +
 chmod 0755 "$DEST/aqinject" "$DEST/aqwatch"
 [ -f "$DEST/uninstall.sh" ] && chmod 0755 "$DEST/uninstall.sh"
 
 # ---- 3. seed config files without overwriting existing ones --------------------------
 for f in redirects.txt headers.txt flags.txt; do
-  if [ ! -f "$DEST/$f" ] && [ -f "$DEST/examples/$f" ]; then
-    cp "$DEST/examples/$f" "$DEST/$f"
-    chown root:wheel "$DEST/$f"; chmod 0644 "$DEST/$f"
+  if [ ! -f "$LIBDIR/$f" ] && [ -f "$LIBDIR/examples/$f" ]; then
+    cp "$LIBDIR/examples/$f" "$LIBDIR/$f"
+    chown root:wheel "$LIBDIR/$f"; chmod 0644 "$LIBDIR/$f"
     say "installed default $f"
   else
     say "kept existing $f"
@@ -66,7 +77,7 @@ cat > "$PLIST" <<PLIST_EOF
   <key>ProgramArguments</key>
   <array>
     <string>/Library/AquaTransport/aqwatch</string>
-    <string>/Library/AquaTransport/aquatransport.dylib</string>
+    <string>/usr/share/aquatransport/aquatransport.dylib</string>
     <string>/Library/AquaTransport/aqinject</string>
   </array>
   <key>RunAtLoad</key><true/>
@@ -91,6 +102,6 @@ else
 fi
 
 say "installed. No restart required."
-say "Optional flags (one per line) go in $DEST/flags.txt:  debug, disabled-mtls"
+say "Optional flags (one per line) go in $LIBDIR/flags.txt:  debug, disabled-mtls"
 say "To uninstall:  sudo $DEST/uninstall.sh"
 exit 0
