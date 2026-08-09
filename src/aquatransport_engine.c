@@ -9,6 +9,7 @@
 #include <pthread.h>
 #include <string.h>
 #include <stdlib.h>
+#include <unistd.h>
 #include <dlfcn.h>
 #include <sys/time.h>
 #include <time.h>
@@ -211,6 +212,7 @@ static void chain_ok_put(const unsigned char *dg) {
 
 static void sh_free_mem(Shadow *s) {
     if (!s) return;
+    if (s->wpend) free(s->wpend);
     if (s->ssl) SSL_free(s->ssl);
     if (s->clientX509) X509_free(s->clientX509);
     if (s->clientChain) sk_X509_pop_free(s->clientChain, X509_free);
@@ -270,15 +272,94 @@ void sh_free(SSLContextRef c) {
     if (dead) sh_free_mem(s);
 }
 
+// The caller's write callback is asked AT MOST ONCE per entry into the engine, which is what
+// Secure Transport does (sslIoWrite makes exactly one ioCtx.write call and returns whatever it
+// says). OpenSSL's record layer does not work that way: given a short write it loops, calling
+// the BIO again immediately with the remainder.
+//
+// Asking again inside the same entry is not free. CFNetwork's callback reports a short write
+// as errSSLWouldBlock having armed itself to be re-driven when the socket next becomes
+// writable; called again before its run loop has had any chance to observe that, it makes no
+// progress and the retries are pure cost against a socket that is known to be full.
+//
+// So a would-block latches, and every further write in the same entry answers "retry" without
+// touching the callback. sh_unblock_write clears the latch at each entry, which is the point
+// at which the caller has decided the socket is worth trying again.
 static int bio_bwrite(BIO *b, const char *buf, int len) {
     Shadow *s = (Shadow *)BIO_get_data(b);
+    BIO_clear_retry_flags(b);
+    if (s->wblocked) { BIO_set_retry_write(b); return -1; }
     size_t n = (size_t)len;
     OSStatus os = s->wf(s->conn, buf, &n);
-    BIO_clear_retry_flags(b);
+    if (os == errSSLWouldBlock) s->wblocked = 1;
     if (n > 0) return (int)n;
     if (os == errSSLWouldBlock || os == noErr) { BIO_set_retry_write(b); return -1; }
     return -1;
 }
+
+// Each entry from the caller means it has decided we are worth driving again -- for a write,
+// because the socket became writable. Drop the latch so the callback is asked once more.
+void sh_unblock_write(Shadow *s) { if (s) s->wblocked = 0; }
+
+// Everything the write side knows is about one SSL object and one socket state, so a
+// re-handshake invalidates all of it. Queued plaintext especially: written into the new
+// connection it would be a stray fragment of the old request.
+void sh_reset_write(Shadow *s) {
+    if (!s) return;
+    s->wblocked = 0;
+    if (s->wpend) { free(s->wpend); s->wpend = NULL; }
+    s->wpendLen = 0;
+}
+
+// ---- the write queue -------------------------------------------------------
+//
+// SSLWrite must never answer errSSLWouldBlock. CFNetwork fails the whole stream on one,
+// surfacing -9803 as the stream's error whatever *processed says, and it does so in both
+// stream modes -- blocking CFReadStreamRead and run-loop scheduled alike. Measured on 10.9.5
+// against postman-echo.com, a host the stock stack can also reach, so the two are directly
+// comparable: a POST is fine until the body outruns the socket send buffer, which puts the
+// boundary between a 10 KB request and a 200 KB one.
+//
+// Secure Transport does not answer would-block there. It encrypts the caller's plaintext into
+// a write queue of its own, reports it as written, and services that queue at the head of the
+// next call. This is the same thing: what SSL_write will not take is copied here, the caller
+// is told it was taken, and the next entry flushes it before anything else.
+//
+// The copy is also what makes the retry legal. OpenSSL requires a repeated SSL_write to
+// present at least what it did before, and the caller's buffer is not ours to keep;
+// SSL_MODE_ACCEPT_MOVING_WRITE_BUFFER on the context covers the change of address.
+//
+// The queue and the latch above are one mechanism, not two. The latch is what keeps a single
+// entry from asking a transport that has already said no; the queue is what gives the caller
+// something better than "I did nothing" to act on when it has.
+//
+// Returns 1 when the queue is empty, 0 when the socket still will not take it, -1 on a fatal
+// error.
+int sh_flush_write(Shadow *s) {
+    if (!s || !s->wpend) return 1;
+    int n = SSL_write(s->ssl, s->wpend, (int)s->wpendLen);
+    if (n > 0) { free(s->wpend); s->wpend = NULL; s->wpendLen = 0; return 1; }
+    int e = SSL_get_error(s->ssl, n);
+    if (e == SSL_ERROR_WANT_READ || e == SSL_ERROR_WANT_WRITE) return 0;
+    return -1;
+}
+
+// Appends to the queue. Returns 1 when the bytes were taken, 0 when they could not be, which
+// leaves the caller to report a would-block and hope.
+//
+// Growing the buffer keeps a pending retry legal: OpenSSL's rule is that a repeated SSL_write
+// may not present *less* than before, and the prefix it has already consumed is untouched
+// here -- only the tail is new.
+int sh_hold_write(Shadow *s, const void *data, size_t len) {
+    if (!s || !len) return 0;
+    unsigned char *p = (unsigned char *)realloc(s->wpend, s->wpendLen + len);
+    if (!p) return 0;
+    memcpy(p + s->wpendLen, data, len);
+    s->wpend = p;
+    s->wpendLen += len;
+    return 1;
+}
+
 static int bio_bread(BIO *b, char *buf, int len) {
     Shadow *s = (Shadow *)BIO_get_data(b);
     size_t n = (size_t)len;
@@ -619,7 +700,12 @@ static void do_ready(void) {
         // Frees the 34KB of read/write buffers an idle connection would otherwise hold. A
         // browser keeps many connections open and mostly idle, so this is the difference
         // between tens of KB and a megabyte or two of dirty pages per process.
-        SSL_CTX_set_mode(gCtx, SSL_MODE_RELEASE_BUFFERS);
+        //
+        // ACCEPT_MOVING_WRITE_BUFFER is required by sh_flush_write: a blocked SSL_write is
+        // retried from our own copy of the plaintext rather than from the caller's buffer,
+        // which OpenSSL otherwise refuses as SSL_R_BAD_WRITE_RETRY. Only the address moves --
+        // the length and the contents are identical, which is what the mode is for.
+        SSL_CTX_set_mode(gCtx, SSL_MODE_RELEASE_BUFFERS | SSL_MODE_ACCEPT_MOVING_WRITE_BUFFER);
         // Per-context rather than per-SSL. Harmless on connections without a client
         // identity: the callback returns 0 for "no cert".
         SSL_CTX_set_client_cert_cb(gCtx, client_cert_cb);

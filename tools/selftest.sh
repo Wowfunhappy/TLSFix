@@ -17,6 +17,10 @@ URLPROBE="$DIR/build/urlprobe"
 ASYNCPROBE="$DIR/build/asyncprobe"
 SESSIONPROBE="$DIR/build/sessionprobe"
 MULTIPROBE="$DIR/build/multiprobe"
+UPLOADPROBE="$DIR/build/uploadprobe"
+BIGBUFPROBE="$DIR/build/bigbufprobe"
+WRITECONTRACT="$DIR/build/writecontract"
+READCONTRACT="$DIR/build/readcontract"
 LATECHECK="$DIR/build/latecheck"
 POOLPROBE="$DIR/build/poolprobe"
 pass=0; fail=0
@@ -47,6 +51,15 @@ fi
     -framework Foundation -o "$POOLPROBE" "$DIR/tools/poolprobe.m"
 [ -x "$MULTIPROBE" ] || clang -arch x86_64 -arch i386 -mmacosx-version-min=10.6 -Wno-deprecated-declarations \
     -framework CoreFoundation -framework CFNetwork -o "$MULTIPROBE" "$DIR/tools/multiprobe.c"
+[ -x "$UPLOADPROBE" ] || clang -arch x86_64 -arch i386 -mmacosx-version-min=10.6 -Wno-deprecated-declarations \
+    -framework CoreFoundation -framework CFNetwork -o "$UPLOADPROBE" "$DIR/tools/uploadprobe.c"
+# x86_64 only: the >INT_MAX buffer it passes needs a 64-bit size_t to be a distinct case.
+[ -x "$BIGBUFPROBE" ] || clang -arch x86_64 -mmacosx-version-min=10.6 -Wno-deprecated-declarations \
+    -framework CoreFoundation -framework Security -o "$BIGBUFPROBE" "$DIR/tools/bigbufprobe.c"
+[ -x "$WRITECONTRACT" ] || clang -arch x86_64 -mmacosx-version-min=10.6 -Wno-deprecated-declarations \
+    -framework CoreFoundation -framework Security -o "$WRITECONTRACT" "$DIR/tools/writecontract.c"
+[ -x "$READCONTRACT" ] || clang -arch x86_64 -mmacosx-version-min=10.6 -Wno-deprecated-declarations \
+    -framework CoreFoundation -framework Security -o "$READCONTRACT" "$DIR/tools/readcontract.c"
 
 # Rules used only by the rewrite tests. example.invalid deliberately does not resolve:
 # if the redirect works, DNS is never consulted for it.
@@ -218,6 +231,50 @@ ntrust=$(grep 'poolprobe\]' "$LOG" 2>/dev/null | grep -c build_trust)
 nconn=$(grep 'poolprobe\]' "$LOG" 2>/dev/null | grep -c 'handshake ok')
 check "trust is evaluated per connection, not per request" "^[0-2] " "$ntrust ($nconn connections)"
 : > "$T/flags.txt"; rm -f "$LOG"
+
+echo "== uploads =="
+# A request body large enough to fill the socket send buffer, which is the only thing here
+# that exercises a blocked write. Every other case sends a request that fits in one record and
+# one socket write, so it never reaches the write queue at all.
+#
+# postman-echo.com is the target because the stock stack can also reach it, which makes the
+# stock result the reference: it answers 200 and echoes the body back at every size below.
+# Both stream modes are run -- CFNetwork drives writes differently when the stream is scheduled
+# on a run loop than when it is read from directly.
+for mode in sync async; do
+    for mb in 0.01 0.2 3; do
+        [ "$mode" = async ] && arg=async || arg=
+        check "POST ${mb} MB ($mode)" "^rc=200 " \
+              "$(run "$UPLOADPROBE" https://postman-echo.com/post "$mb" $arg | sed 's/.*-> //')"
+    done
+done
+
+# The sizes a direct Secure Transport caller may pass, which CFNetwork never produces: one
+# SSLWrite of a megabyte, and an SSLRead buffer whose length does not fit in an int.
+check "large SSLWrite, >INT_MAX SSLRead buffer" "^PASS" "$(run "$BIGBUFPROBE" postman-echo.com 3)"
+
+# What SSLWrite answers when the transport will not take everything. Compared against the
+# stock stack itself rather than against a fixture, so it stays a statement about matching
+# Secure Transport rather than about numbers someone wrote down once. The byte counts are
+# dropped from the comparison: they differ by record framing, which is not part of the
+# contract. Everything that is -- the status, *processed, and how many times the transport was
+# asked -- has to agree exactly.
+cw_stock=$("$WRITECONTRACT" postman-echo.com 2>&1 | grep -E '^  ' | sed 's/ cb_took=[0-9]*//')
+cw_eng=$(AQUATRANSPORT_DIR="$T" DYLD_INSERT_LIBRARIES="$D" "$WRITECONTRACT" postman-echo.com 2>&1 \
+         | grep -E '^  ' | sed 's/ cb_took=[0-9]*//')
+check "blocked-write contract matches stock" "^identical$" \
+  "$([ -n "$cw_stock" ] && [ "$cw_stock" = "$cw_eng" ] && echo identical || echo differs)"
+[ "$cw_stock" = "$cw_eng" ] || diff <(echo "$cw_stock") <(echo "$cw_eng") | sed 's/^/        /'
+
+# The same for SSLRead: whether a short read is noErr or a would-block, and whether what is
+# left over is advertised. How many transport reads it takes to assemble one record is framing
+# rather than contract, so cb_calls is dropped from the comparison the way cb_took is above.
+cr_stock=$("$READCONTRACT" postman-echo.com 2>&1 | grep -E '^  ' | sed 's/ cb_calls=[0-9]*//')
+cr_eng=$(AQUATRANSPORT_DIR="$T" DYLD_INSERT_LIBRARIES="$D" "$READCONTRACT" postman-echo.com 2>&1 \
+         | grep -E '^  ' | sed 's/ cb_calls=[0-9]*//')
+check "short-read contract matches stock" "^identical$" \
+  "$([ -n "$cr_stock" ] && [ "$cr_stock" = "$cr_eng" ] && echo identical || echo differs)"
+[ "$cr_stock" = "$cr_eng" ] || diff <(echo "$cr_stock") <(echo "$cr_eng") | sed 's/^/        /'
 
 echo "== deny list =="
 # The gate matches on process name, so a copy named ocspd must pass straight through.

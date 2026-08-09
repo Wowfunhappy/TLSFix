@@ -52,6 +52,14 @@ typedef struct {
     // Evaluated peer trust for this connection, built once. CFNetwork asks for it on every
     // request, so it is built per connection rather than per request. See sh_build_trust.
     SecTrustRef      trust;
+    // Set once the caller's write callback has reported would-block, and cleared each time
+    // the caller re-enters us. See bio_bwrite: the callback must be asked at most once per
+    // entry, the way Secure Transport asks it.
+    int              wblocked;
+    // Plaintext accepted from the caller that the socket has not taken yet -- Secure
+    // Transport's write queue. See sh_flush_write.
+    unsigned char   *wpend;
+    size_t           wpendLen;
 } Shadow;
 
 // Re-entrancy guard. Our verify path calls into Security, which may itself open a
@@ -72,5 +80,16 @@ int        ossl_init(Shadow *s);
 void       capture_identity(Shadow *s, CFArrayRef certRefs);
 int        sh_build_trust(Shadow *s, SecTrustRef *trust);
 CFArrayRef sh_cert_array(Shadow *s);
+void       sh_unblock_write(Shadow *s);
+void       sh_reset_write(Shadow *s);
+int        sh_flush_write(Shadow *s);
+int        sh_hold_write(Shadow *s, const void *data, size_t len);
+
+// The largest run of a caller's buffer handed to one SSL_read or SSL_write, whose lengths are
+// ints where SSLRead's and SSLWrite's dataLength is a size_t. Anything longer is transferred
+// in several runs, so a caller may pass a buffer of any size -- as it may to Secure Transport,
+// which fragments internally and documents no limit. Bounds the write queue too: a blocked run
+// adds at most this much to it.
+#define IO_RUN_MAX      ((size_t)65536)
 
 #endif

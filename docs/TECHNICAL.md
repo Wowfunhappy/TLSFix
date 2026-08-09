@@ -13,7 +13,7 @@ Two independent subsystems in one package:
 | TLS engine | Routes Secure Transport through OpenSSL: TLS 1.0–1.3, modern ciphers, OS-delegated trust | every process |
 | URL rewriter | Applies `redirects.txt` and `headers.txt` at the request layer | apps only (see gating) |
 
-Verified on 10.9.5 (37/37 local tests) and 10.6.8 (`NSURLSession` is 10.9+ and is
+Verified on 10.9.5 (51/51 local tests) and 10.6.8 (`NSURLSession` is 10.9+ and is
 skipped there), both `x86_64` and `i386`.
 
 ## Build
@@ -423,6 +423,117 @@ handles the same-thread case; these four are where the cycle crosses a process b
 
 Anything else misbehaving under injection is a bug in the engine to fix, not a name to add.
 
+## The I/O contract
+
+`SSLRead` and `SSLWrite` are replaced, so what they *answer* is part of the interface, not an
+implementation detail. CFNetwork's socket streams are written against Secure Transport's
+answers exactly, and a plausible-looking substitute is not good enough: a status that differs
+from what the stock stack returns in the same state fails the whole stream rather than
+degrading.
+
+The failure has a shape worth recognising, because it hides from ordinary use. A request whose
+body fits in the socket send buffer never blocks, so it never reaches the interesting states at
+all — every GET, and every small POST, behaves identically under any of these answers. Only a
+body large enough to fill the send buffer gets there, which puts the boundary between a 10 KB
+upload and a 200 KB one, and makes "browsing works" say nothing about whether the contract is
+right.
+
+So the contract is measured rather than reasoned about. `tools/writecontract.c` and
+`tools/readcontract.c` drive Secure Transport with I/O callbacks of their own that they can
+starve on demand, putting the transport in each state that matters and recording what comes
+back. Run against the stock stack they produce the reference answers below; run against the
+engine they must produce the same ones. `selftest.sh` runs both ways and diffs, so the
+assertion is "matches Secure Transport" rather than numbers someone once wrote down.
+
+### Writing
+
+| state | status | `*processed` |
+|---|---|---|
+| data offered, transport blocks | `errSSLWouldBlock` | **= `dataLength`** |
+| zero length, still blocked | `errSSLWouldBlock` | 0 |
+| zero length, transport free | `noErr` | 0, queue drained |
+| data offered, queue still full | `errSSLWouldBlock` | **0**, data refused |
+
+The first row carries the rest. A blocked write takes the caller's **whole buffer** into the
+context's own queue and says so, which makes `errSSLWouldBlock` mean *"I am holding it, come
+back"* rather than *"I did nothing"*. Reporting no progress on data the caller has not been
+relieved of is the one answer it cannot act on.
+
+Three consequences follow, and each is load-bearing:
+
+- **The retry is zero-length.** The caller advances by `*processed`, and `*processed` was the
+  whole buffer, so there is nothing left to re-present. Its next call is a pure flush — which
+  is why a zero length must never reach `SSL_write`, whose zero-length return reads as an
+  error and would abort a connection that is merely being flushed.
+- **Refusing new data while the queue is full is the backpressure**, and it is what bounds the
+  queue at one call's worth. Nothing more is accepted until it drains, so no amount of upload
+  becomes an in-memory copy of the body.
+- **The retry needs `SSL_MODE_ACCEPT_MOVING_WRITE_BUFFER`.** The queue is our copy, so a
+  resumed `SSL_write` presents the same bytes at a different address; the mode permits exactly
+  that, and the length only ever grows, which is the part no mode relaxes.
+
+`bio_bwrite` asks the caller's write callback **at most once per entry**, matching
+`sslIoWrite`, which makes exactly one `ioCtx.write` call and returns what it says. OpenSSL's
+record layer would otherwise loop against a transport that has already reported would-block.
+The latch clears on each entry — a write, a read, or a handshake — since that is the point at
+which the caller has decided the socket is worth trying again.
+
+Nothing here waits on the socket. The caller comes back on its own, exactly as it does with the
+stock stack, so a large upload costs the connections sharing its run loop nothing.
+
+### Reading
+
+| state | status | `*processed` |
+|---|---|---|
+| anything transferred | `noErr` | what was transferred, short or not |
+| nothing available | `errSSLWouldBlock` | 0 |
+| zero length asked | `noErr` | 0, transport not touched |
+
+The status reports **progress, not fullness**. A short read is `noErr`, and the bytes left over
+are not lost to the caller: they are held here and `SSLGetBufferedReadSize` reports them. Those
+two halves are one mechanism — a short `noErr` is only safe because that hook answers
+truthfully, and the hook is only worth answering because short reads are normal. `SSL_pending`
+alone would under-report it, since bytes pulled off the socket but not yet decrypted are
+invisible to it; `SSL_has_pending` covers both kinds, which is what the question is asking.
+
+One record per call is what comes back, which is both what the stock stack returns and what
+`SSL_read` yields. Filling the caller's buffer from further records would be legal, since the
+status says progress rather than fullness, but it would answer differently from the stack being
+replaced and buy nothing: the bytes it delivered early are reported by `SSLGetBufferedReadSize`
+and collected by the next call, which the caller makes either way.
+
+An end of stream or an error reached *after* some bytes is not allowed to swallow them: the
+data is handed over with `noErr` and the condition surfaces on the next call, once there is
+nothing left to deliver first.
+
+### The one thing that does not match, and why it cannot
+
+Every status and every `*processed` above matches the stock stack. What does not is how many
+times the transport is asked, in one case: reading a response, the engine calls the read
+callback four times where the stock stack calls it twice.
+
+That is not the read path. It is **TLS 1.3**. The stock stack cannot negotiate it and lands on
+1.2, where session tickets arrive inside the handshake; the engine negotiates 1.3, where the
+server sends `NewSessionTicket` as post-handshake records that are read on the application
+path. Two tickets, arriving inline, are the extra reads — visible in the debug log as two
+`session cached` lines during the first read.
+
+Capping the engine at `TLS1_2_VERSION` collapses the count to 2, matching stock exactly, which
+is what says the read logic is not responsible. Removing the difference means giving up TLS
+1.3, which is the reason this engine exists. So `selftest.sh` compares the statuses and
+`*processed` and drops the callback counts — and the byte totals with them, which differ by
+record overhead for the same reason.
+
+### Sizes
+
+`dataLength` is a `size_t` on both entry points and Secure Transport documents no limit on it,
+fragmenting into records internally. `SSL_read` and `SSL_write` take an `int`. So a caller's
+buffer is transferred in runs of `IO_RUN_MAX` rather than handed over whole, and any length
+works. CFNetwork never exposes this — it chunks at 32 KB whatever the body size — so only a
+direct Secure Transport caller reaches it, which mail clients and other socket-level code are.
+`tools/bigbufprobe.c` covers both directions: a megabyte through one `SSLWrite`, and an
+`SSLRead` buffer whose length does not fit in an `int`.
+
 ## What a trust evaluation costs
 
 `SecTrustEvaluate` is the single most expensive thing on a connection. Where a chain's issuer
@@ -773,6 +884,18 @@ tools/latecheck.c       # loads the dylib into a process with no CoreFoundation/
 tools/tlsprobe-loop.c   # long-lived cooperating harness: requests api.twitter.com every 2s,
                         # so you can load the library into it with aqinject and watch the
                         # same live process go from FAIL to HTTP 404 without restarting
+tools/writecontract.c   # what SSLWrite answers when the transport will not take everything, by
+tools/readcontract.c    # starving an IO callback of its own; run against the stock stack these
+                        # print the reference answers, and against the engine they must match.
+                        # Nothing else here reaches those states: a request small enough to fit
+                        # in the socket send buffer never blocks
+tools/uploadprobe.c     # a POST big enough to fill that buffer, in-memory body or streamed from
+                        # a file, blocking reads or run-loop scheduled -- CFNetwork drives writes
+                        # differently in each, and reports peak RSS so a write path that grew
+                        # with the body would show
+tools/bigbufprobe.c     # the sizes a direct Secure Transport caller may pass and CFNetwork never
+                        # does: a megabyte through one SSLWrite, and an SSLRead buffer whose
+                        # length does not fit in an int
 ```
 
 To demonstrate late loading end-to-end on the disposable test VM:

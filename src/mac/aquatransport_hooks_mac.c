@@ -131,8 +131,9 @@ static OSStatus my_SSLSetPeerDomainName(SSLContextRef c, const char *name, size_
         if (name && len) {
             size_t n = len < 255 ? len : 255; memcpy(s->host, name, n); s->host[n] = 0;
             // late SNI -> re-init; the cached trust goes too, since a new handshake means a
-            // new peer chain.
+            // new peer chain, and so does everything the write side was holding for the old one.
             if (s->inited && s->state != -1) { SSL_free(s->ssl); s->ssl = NULL; s->inited = 0; s->state = 0;
+                 sh_reset_write(s);
                  if (s->trust) { CFRelease(s->trust); s->trust = NULL; } }
         }
         sh_release(s);
@@ -154,6 +155,7 @@ static OSStatus my_SSLHandshake(SSLContextRef c) {
     if (!s) return o_SSLHandshake(c);
     OSStatus rv;
     if (!s->rf || !s->wf || !s->conn || s->clientBypass || s->state == -1) { rv = o_SSLHandshake(c); goto done; }
+    sh_unblock_write(s);   // an entry like any other; see bio_bwrite
     if (!s->inited) { if (ossl_init(s)) { s->state = -1; rv = o_SSLHandshake(c); goto done; } s->state = 1; }
     if (s->state == 3) s->approved = 1;   // app approved the server after the auth break, let it proceed
     int ret = SSL_do_handshake(s->ssl);
@@ -183,56 +185,109 @@ done:
     return rv;
 }
 
-// SSLRead's contract: transfer up to len bytes from whatever is available, and report
-// errSSLWouldBlock with *processed set when that is less than was asked for.
+// Secure Transport's read contract, measured on the stock stack by tools/readcontract.c with
+// a read callback it can starve:
 //
-// SSL_read returns at most one TLS record, so a single call satisfies neither half of that. A
-// short read reported as noErr tells the caller its request was satisfied, and any bytes still
-// buffered here are invisible to it: they are no longer on the socket, so waiting for the
-// socket to become readable waits for something that has already arrived. The connection then
-// sits idle until the peer sends more or a timeout fires -- for seconds, on any connection,
-// whatever the certificate.
+//   anything transferred          noErr, *processed = what was transferred, short or not
+//   nothing available             errSSLWouldBlock, *processed = 0
+//   zero length asked             noErr, *processed = 0, transport not touched
 //
-// So drain: keep reading while the caller has room and OpenSSL still holds decrypted data, and
-// only then report. Nothing is left behind that the caller had space for.
+// So the status says whether the call made progress, not whether it filled the buffer. A short
+// read is noErr, and bytes left over are not lost to the caller: they are held here and
+// SSLGetBufferedReadSize reports them, which is how the caller knows to come back rather than
+// wait on a socket that has already been drained. That hook answering correctly is what makes
+// a short noErr safe -- both halves are the same mechanism.
+//
+// One record per call, which is what the stock stack returns and what `SSL_read` yields anyway.
+// Filling the caller's buffer from further records would be legal -- the status says progress,
+// not fullness -- but it is not what a caller measuring this stack would see, and it buys
+// nothing: the bytes it would deliver early are reported by SSLGetBufferedReadSize and fetched
+// by the next call, which the caller makes either way.
 static OSStatus my_SSLRead(SSLContextRef c, void *data, size_t len, size_t *processed) {
     if (!tf_on()) return o_SSLRead(c, data, len, processed);
     Shadow *s = sh_get(c);
     if (!s || s->state != 2) { OSStatus r = o_SSLRead(c, data, len, processed); sh_release(s); return r; }
+    // A read is another entry, so it is another chance for the queue to go out. One attempt,
+    // never a wait: the caller's own flush is what this connection depends on, and a read must
+    // not hold the thread waiting on a socket in the other direction.
+    sh_unblock_write(s);
+    if (sh_flush_write(s) < 0) { *processed = 0; sh_release(s); return ST_ClosedAbort; }
     size_t total = 0;
     OSStatus rv = noErr;
-    while (total < len) {
-        int n = SSL_read(s->ssl, (unsigned char *)data + total, (int)(len - total));
-        if (n > 0) {
-            total += (size_t)n;
-            if (SSL_pending(s->ssl) <= 0) { rv = errSSLWouldBlock; break; }  // room left, nothing buffered
-            continue;
+    if (len) {
+        size_t want = len > IO_RUN_MAX ? IO_RUN_MAX : len;
+        int n = SSL_read(s->ssl, (unsigned char *)data, (int)want);
+        if (n > 0) total = (size_t)n;
+        else {
+            int e = SSL_get_error(s->ssl, n);
+            if (e == SSL_ERROR_WANT_READ || e == SSL_ERROR_WANT_WRITE) rv = errSSLWouldBlock;
+            else if (e == SSL_ERROR_ZERO_RETURN) rv = ST_ClosedGraceful;
+            else rv = ST_ClosedAbort;
         }
-        int e = SSL_get_error(s->ssl, n);
-        if (e == SSL_ERROR_WANT_READ || e == SSL_ERROR_WANT_WRITE) rv = errSSLWouldBlock;
-        else if (e == SSL_ERROR_ZERO_RETURN) rv = total ? errSSLWouldBlock : ST_ClosedGraceful;
-        else rv = total ? errSSLWouldBlock : ST_ClosedAbort;
-        break;
     }
-    if (total == len) rv = noErr;          // request satisfied in full
     *processed = total;
     sh_release(s);
     return rv;
 }
 
+// Never answers errSSLWouldBlock while it can avoid it: CFNetwork treats one as fatal to the
+// whole stream. What the socket will not take is queued in the shadow and reported as
+// written, as Secure Transport's own write queue does, and the next entry flushes it first.
+// See sh_flush_write in the engine for the measurements behind that, and bio_bwrite for the
+// other half -- why the caller's write callback is asked only once per entry.
+// Secure Transport's write contract, which tools/writecontract.c measures on the stock stack
+// by starving a write callback of its own. Four answers, and this reproduces each:
+//
+//   data offered, transport blocks    errSSLWouldBlock, *processed = dataLength
+//   zero length, still blocked        errSSLWouldBlock, *processed = 0
+//   zero length, transport free       noErr,            *processed = 0, queue drained
+//   data offered, queue still full    errSSLWouldBlock, *processed = 0, data refused
+//
+// The first is what makes the rest work. A blocked write takes the caller's whole buffer into
+// the context's own queue and says so, and errSSLWouldBlock then means "I am holding it, come
+// back" rather than "I did nothing". The caller advances by *processed, which leaves nothing
+// to re-present, so its retry is a zero-length call -- a pure flush. That is why a zero length
+// must never reach SSL_write, which reads a zero-length write as an error.
+//
+// Refusing new data while the queue is still full is the backpressure. It bounds the queue at
+// one call's worth, since nothing more is accepted until it has drained.
+//
+// dataLength is a size_t and Secure Transport documents no limit on it, so the buffer is
+// consumed in runs -- SSL_write's length is an int.
 static OSStatus my_SSLWrite(SSLContextRef c, const void *data, size_t len, size_t *processed) {
     if (!tf_on()) return o_SSLWrite(c, data, len, processed);
     Shadow *s = sh_get(c);
     if (!s || s->state != 2) { OSStatus r = o_SSLWrite(c, data, len, processed); sh_release(s); return r; }
     *processed = 0;
-    int n = SSL_write(s->ssl, data, (int)len);
+    sh_unblock_write(s);
+
     OSStatus rv;
-    if (n > 0) { *processed = (size_t)n; rv = noErr; }
-    else {
+    int f = sh_flush_write(s);
+    if (f < 0)  { rv = ST_ClosedAbort;    goto done; }
+    if (f == 0) { rv = errSSLWouldBlock;  goto done; }   // still holding: take nothing new
+    if (len == 0) { rv = noErr;           goto done; }   // pure flush, and it succeeded
+
+    for (size_t off = 0; off < len; ) {
+        size_t take = len - off;
+        if (take > IO_RUN_MAX) take = IO_RUN_MAX;
+        int n = SSL_write(s->ssl, (const unsigned char *)data + off, (int)take);
+        if (n > 0) { off += (size_t)n; continue; }
         int e = SSL_get_error(s->ssl, n);
-        if (e == SSL_ERROR_WANT_READ || e == SSL_ERROR_WANT_WRITE) rv = errSSLWouldBlock;
-        else rv = ST_ClosedAbort;
+        if (e != SSL_ERROR_WANT_READ && e != SSL_ERROR_WANT_WRITE) { rv = ST_ClosedAbort; goto done; }
+        // Blocked part-way: keep the rest, report the whole buffer as taken, and say we are
+        // holding it. Nothing more is accepted until the next entry drains this.
+        if (!sh_hold_write(s, (const unsigned char *)data + off, len - off)) {
+            *processed = off;                            // could not take a copy; the rest is the caller's
+            rv = errSSLWouldBlock;
+            goto done;
+        }
+        *processed = len;
+        rv = errSSLWouldBlock;
+        goto done;
     }
+    *processed = len;
+    rv = noErr;
+done:
     sh_release(s);
     return rv;
 }
@@ -240,7 +295,7 @@ static OSStatus my_SSLWrite(SSLContextRef c, const void *data, size_t len, size_
 static OSStatus my_SSLClose(SSLContextRef c) {
     if (!tf_on()) return o_SSLClose(c);
     Shadow *s = sh_get(c);
-    if (s && s->state == 2 && s->ssl) SSL_shutdown(s->ssl);
+    if (s && s->state == 2 && s->ssl) { sh_unblock_write(s); sh_flush_write(s); SSL_shutdown(s->ssl); }
     sh_release(s);
     OSStatus r = o_SSLClose(c);
     sh_free(c);
@@ -353,6 +408,7 @@ static OSStatus my_SSLSetCertificate(SSLContextRef c, CFArrayRef certRefs) {
         if (tf_flag("disabled-mtls")) s->clientBypass = 1;
         else capture_identity(s, certRefs);
         if (s->inited && s->state != -1) { SSL_free(s->ssl); s->ssl = NULL; s->inited = 0; s->state = 0;
+             sh_reset_write(s);
              if (s->trust) { CFRelease(s->trust); s->trust = NULL; } }   // new handshake -> new chain
         sh_release(s);
     }
