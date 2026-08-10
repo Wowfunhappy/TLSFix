@@ -87,6 +87,7 @@ static inline int tf_on(void) {
 static OSStatus (*o_SSLSetIOFuncs)(SSLContextRef, SSLReadFunc, SSLWriteFunc);
 static OSStatus (*o_SSLSetConnection)(SSLContextRef, SSLConnectionRef);
 static OSStatus (*o_SSLSetPeerDomainName)(SSLContextRef, const char *, size_t);
+static OSStatus (*o_SSLSetPeerID)(SSLContextRef, const void *, size_t);
 static OSStatus (*o_SSLSetSessionOption)(SSLContextRef, SSLSessionOption, Boolean);
 static OSStatus (*o_SSLHandshake)(SSLContextRef);
 static OSStatus (*o_SSLRead)(SSLContextRef, void *, size_t, size_t *);
@@ -136,6 +137,23 @@ static OSStatus my_SSLSetPeerDomainName(SSLContextRef c, const char *name, size_
                  sh_reset_write(s);
                  if (s->trust) { CFRelease(s->trust); s->trust = NULL; } }
         }
+        sh_release(s);
+    }
+    return r;
+}
+
+// The caller's identifier for the endpoint, and the session cache's key -- see the cache
+// comment in aquatransport_engine.c. Recorded rather than interpreted: the bytes are opaque
+// by contract, so all this side does is hold on to them.
+static OSStatus my_SSLSetPeerID(SSLContextRef c, const void *peerID, size_t len) {
+    if (!tf_on() || ensure_ready() != 1) return o_SSLSetPeerID(c, peerID, len);
+    OSStatus r = o_SSLSetPeerID(c, peerID, len);
+    Shadow *s = sh_create(c);
+    if (s) {
+        // A replacement id names a different endpoint, so an id that does not fit leaves none
+        // behind rather than the previous one.
+        s->peerIDLen = 0;
+        if (peerID && len && len <= sizeof s->peerID) { memcpy(s->peerID, peerID, len); s->peerIDLen = len; }
         sh_release(s);
     }
     return r;
@@ -425,6 +443,7 @@ static const struct {
     { "SSLSetIOFuncs",                   (void *)my_SSLSetIOFuncs,                   (void **)&o_SSLSetIOFuncs },
     { "SSLSetConnection",                (void *)my_SSLSetConnection,                (void **)&o_SSLSetConnection },
     { "SSLSetPeerDomainName",            (void *)my_SSLSetPeerDomainName,            (void **)&o_SSLSetPeerDomainName },
+    { "SSLSetPeerID",                    (void *)my_SSLSetPeerID,                    (void **)&o_SSLSetPeerID },
     { "SSLSetSessionOption",             (void *)my_SSLSetSessionOption,             (void **)&o_SSLSetSessionOption },
     { "SSLHandshake",                    (void *)my_SSLHandshake,                    (void **)&o_SSLHandshake },
     { "SSLRead",                         (void *)my_SSLRead,                         (void **)&o_SSLRead },

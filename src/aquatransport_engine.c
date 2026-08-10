@@ -70,8 +70,16 @@ int tf_reentrant(void) {
 // against a TLS 1.2 server plus the certificate chain and its signature checks. A browser
 // opens a lot of connections to the same host, so this is the difference that matters most.
 //
-// Keyed on the peer name, which is the name the handshake is bound to (SSL_set1_host) and
-// therefore the only thing a session may be reused for.
+// Keyed on the caller's SSLSetPeerID blob, which is what Secure Transport keys its own cache
+// on: "data, opaque to this library, which is sufficient to uniquely identify the peer of the
+// current session. An example would be IP address and port" (SecureTransport.h). CFNetwork
+// passes "{<address>:<port>}<hostname>", so the key separates two servers reached at the same
+// hostname on different ports -- a hostname alone does not, and offering one server's session
+// to the other risks resuming onto a configuration this connection never validated.
+//
+// A connection whose caller set no peer id is neither cached nor resumed, because the same
+// header calls SSLSetPeerID "mandatory if this session is to be resumable": with nothing to
+// identify the endpoint there is no key that can be trusted to name it.
 //
 // Connections carrying a client certificate are deliberately never cached or resumed: the
 // cache key does not include the identity, so a resumed session could otherwise carry an
@@ -84,17 +92,23 @@ int tf_reentrant(void) {
 // path either: the chain lives on in the SSL_SESSION, so SSLCopyPeerTrust still hands
 // CFNetwork the same certificates to evaluate, on a resumed connection as on a fresh one.
 #define MAXSESS 32
-typedef struct { char host[256]; SSL_SESSION *sess; unsigned lastUse; } SessEnt;
+typedef struct { unsigned char key[256]; size_t keyLen; SSL_SESSION *sess; unsigned lastUse; } SessEnt;
 static SessEnt gSess[MAXSESS];
 static unsigned gSessClock = 0;
 static pthread_mutex_t gSessLock = PTHREAD_MUTEX_INITIALIZER;
 
-static SSL_SESSION *sess_get(const char *host) {
-    if (!host || !host[0]) return NULL;
+// The peer id is arbitrary bytes rather than a string, so the whole blob and its length have
+// to match -- a prefix of another caller's id is a different endpoint.
+static int key_eq(const SessEnt *e, const unsigned char *key, size_t keyLen) {
+    return e->keyLen == keyLen && !memcmp(e->key, key, keyLen);
+}
+
+static SSL_SESSION *sess_get(const unsigned char *key, size_t keyLen) {
+    if (!key || !keyLen) return NULL;
     SSL_SESSION *r = NULL;
     pthread_mutex_lock(&gSessLock);
     for (int i = 0; i < MAXSESS; i++) {
-        if (gSess[i].sess && !strcmp(gSess[i].host, host)) {
+        if (gSess[i].sess && key_eq(&gSess[i], key, keyLen)) {
             gSess[i].lastUse = ++gSessClock;
             r = gSess[i].sess;
             SSL_SESSION_up_ref(r);
@@ -106,13 +120,13 @@ static SSL_SESSION *sess_get(const char *host) {
 }
 
 // Takes ownership of sess (the new_session_cb reference).
-static void sess_put(const char *host, SSL_SESSION *sess) {
-    if (!host || !host[0] || !sess) { if (sess) SSL_SESSION_free(sess); return; }
+static void sess_put(const unsigned char *key, size_t keyLen, SSL_SESSION *sess) {
+    if (!key || !keyLen || keyLen > sizeof gSess[0].key || !sess) { if (sess) SSL_SESSION_free(sess); return; }
     SSL_SESSION *drop = NULL;
     pthread_mutex_lock(&gSessLock);
     int slot = -1;
     for (int i = 0; i < MAXSESS; i++) {
-        if (gSess[i].sess && !strcmp(gSess[i].host, host)) { slot = i; break; }
+        if (gSess[i].sess && key_eq(&gSess[i], key, keyLen)) { slot = i; break; }
         if (!gSess[i].sess && slot < 0) slot = i;
     }
     if (slot < 0) {                                  // full: evict least recently used
@@ -120,7 +134,8 @@ static void sess_put(const char *host, SSL_SESSION *sess) {
         for (int i = 1; i < MAXSESS; i++) if (gSess[i].lastUse < gSess[slot].lastUse) slot = i;
     }
     drop = gSess[slot].sess;                         // replaced or evicted, freed below
-    snprintf(gSess[slot].host, sizeof gSess[slot].host, "%s", host);
+    memcpy(gSess[slot].key, key, keyLen);
+    gSess[slot].keyLen = keyLen;
     gSess[slot].sess = sess;
     gSess[slot].lastUse = ++gSessClock;
     pthread_mutex_unlock(&gSessLock);
@@ -132,9 +147,9 @@ static void sess_put(const char *host, SSL_SESSION *sess) {
 // handshake -- during an SSL_read -- so it must not assume it is running inside a handshake.
 static int new_session_cb(SSL *ssl, SSL_SESSION *sess) {
     Shadow *s = (Shadow *)SSL_get_ex_data(ssl, gSslExIdx);
-    if (!s || !s->host[0] || s->clientX509) return 0;
+    if (!s || !s->peerIDLen || s->clientX509) return 0;
     if (tf_debug()) tf_log("session cached  host=%s", s->host);
-    sess_put(s->host, sess);
+    sess_put(s->peerID, s->peerIDLen, sess);
     return 1;
 }
 
@@ -503,12 +518,12 @@ int ossl_init(Shadow *s) {
     // Ask the server to staple its OCSP response into the handshake. A server that does not
     // support this ignores the extension. See attach_stapled_ocsp for what the response saves.
     SSL_set_tlsext_status_type(s->ssl, TLSEXT_STATUSTYPE_ocsp);
-    // Offer a cached session for this host, if we have one and this connection is not
+    // Offer a cached session for this endpoint, if we have one and this connection is not
     // presenting a client certificate (see the cache comment). OpenSSL checks the session's
     // own validity and falls back to a full handshake if it has expired or the server
     // declines it, so nothing here has to reason about lifetime.
-    if (!s->clientX509) {
-        SSL_SESSION *cached = sess_get(s->host);
+    if (!s->clientX509 && s->peerIDLen) {
+        SSL_SESSION *cached = sess_get(s->peerID, s->peerIDLen);
         if (tf_debug()) tf_log("session %s   host=%s", cached ? "offered" : "MISS   ", s->host);
         if (cached) { SSL_set_session(s->ssl, cached); SSL_SESSION_free(cached); }
     }

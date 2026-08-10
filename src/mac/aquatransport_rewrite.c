@@ -17,14 +17,14 @@
 //
 // WHY fishhook RATHER THAN dyld INTERPOSING
 //
-// Interposing needs the target symbol's address at link time, which would mean linking
-// CFNetwork -- impossible across this version range, because the install name differs:
+// A __DATA,__interpose section only affects images bound after the interposing library is
+// registered, and dyld registers it only for libraries inserted at launch -- a dlopen'd one
+// changes nothing in an already-bound process, which is exactly what aqinject does.
 //
-//   10.9  /System/Library/Frameworks/CFNetwork.framework/Versions/A/CFNetwork
-//   10.6  /System/Library/Frameworks/CoreServices.framework/Versions/A/Frameworks/...
-//
-// A dylib linked against either path fails to load at all on the other OS. fishhook rebinds
-// by *name* at runtime, so nothing is linked and processes without CFNetwork are untouched.
+// Interposing also matches by address rather than by name, so a hook cannot be installed
+// until the target library is loaded and its symbols are addressable. Rebinding by name
+// needs nothing loaded, so the library sits inert in a process without CFNetwork and starts
+// working if and when CFNetwork arrives.
 //
 // THE HOOK POINTS come from experiment, not from headers. Sync and async funnel through
 // different entry points, and the request argument position is the one found by recording

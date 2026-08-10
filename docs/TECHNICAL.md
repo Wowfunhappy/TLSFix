@@ -392,12 +392,20 @@ Foundation's own URL loading sits on CFNetwork's C API (Foundation imports 69 of
 symbols on 10.9, 53 on 10.6.8), so working there covers `NSURLConnection`, `NSURLSession`
 and raw CFNetwork clients while touching no Objective-C, no libdispatch and no Foundation.
 
-**Rebinding rather than interposing** is forced by the install name differing across the
-range — `/System/Library/Frameworks/CFNetwork.framework/...` on 10.9 versus
-`/System/Library/Frameworks/CoreServices.framework/Versions/A/Frameworks/CFNetwork.framework/...`
-on 10.6. Interposing needs the symbol at link time, and a dylib linked against either path
-fails to load at all on the other OS. fishhook rebinds by *name*, so nothing is linked and
-processes without CFNetwork have nothing to rebind.
+**Rebinding rather than interposing.** A `__DATA,__interpose` section only takes effect on
+images bound after the interposing library is registered, and dyld registers it only for
+libraries inserted at launch. Measured on 10.9.5: the same dylib interposing `getppid`
+returns 4242 under `DYLD_INSERT_LIBRARIES`, and changes nothing when `dlopen`ed into a
+running process. That rules out static interposing for `aqinject`.
+
+Interposing is also address-based — a tuple names a definition, not a name — so a hook
+cannot be installed before the target library is loaded and its symbols are addressable.
+Rebinding by name needs nothing loaded, which is what lets the library sit inert in a
+process that never does TLS. Processes without CFNetwork have nothing to rebind.
+
+`dyld_dynamic_interpose` would sidestep the first point but not the second, and does not
+exist before 10.10: on 10.9.5 it is absent from `libdyld.dylib`, from dyld's
+`_dyld_func_lookup` table, and from `dlsym(RTLD_DEFAULT, ...)`.
 
 The hook points come from experiment, not from headers, because these are private API:
 
@@ -748,11 +756,26 @@ TLS 1.2 server, plus the certificate chain and its signature checks, on every co
 browser opens a lot of connections to the same host, so this dominates everything else in the
 engine.
 
-`aquatransport_engine.c` keeps a 32-entry LRU cache of `SSL_SESSION`s keyed on the peer name,
-filled from `new_session_cb` and offered by `ossl_init` through `SSL_set_session`. The key is
-the name the handshake is bound to (`SSL_set1_host`), which is the only thing a session may
-be reused for. OpenSSL checks the session's own validity and falls back to a full handshake
-if it has expired or the server declines it, so nothing here reasons about lifetime.
+`aquatransport_engine.c` keeps a 32-entry LRU cache of `SSL_SESSION`s, filled from
+`new_session_cb` and offered by `ossl_init` through `SSL_set_session`. OpenSSL checks the
+session's own validity and falls back to a full handshake if it has expired or the server
+declines it, so nothing here reasons about lifetime.
+
+The key is the caller's `SSLSetPeerID` blob, recorded by the hook of the same name — which is
+what Secure Transport keys its own cache on: "data, opaque to this library, which is sufficient
+to uniquely identify the peer of the current session. An example would be IP address and port"
+(`SecureTransport.h`). CFNetwork passes `{<address>:<port>}<hostname>`.
+
+A hostname on its own is not a safe key, because it does not separate two servers reached at
+the same name on different ports. `https://www.ssllabs.com/` and the 512-bit-DH server at
+`https://www.ssllabs.com:10445/` are one such pair: keyed on the name, the first server's
+session was offered to the second, which risks resuming onto a configuration that connection
+never validated. The peer id separates them, and the debug log shows the second connection as
+a `session MISS`.
+
+A connection whose caller set no peer id is neither cached nor resumed. The same header calls
+`SSLSetPeerID` "mandatory if this session is to be resumable", so this matches stock, and with
+nothing identifying the endpoint there is no key that can be trusted to name it.
 
 Measured on 10.9.5, x86_64, 40 sequential connections to `www.cloudflare.com` each forced onto
 a fresh connection (`tools/multiprobe.c`):

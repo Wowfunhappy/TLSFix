@@ -38,6 +38,12 @@ typedef struct {
     SSLWriteFunc     wf;
     SSLConnectionRef conn;
     char             host[256];
+    // The caller's SSLSetPeerID blob: opaque bytes that identify the endpoint, and the key
+    // the session cache runs on. See the cache comment in aquatransport_engine.c. A peer id
+    // longer than the buffer is recorded as absent (peerIDLen 0), which costs that connection
+    // resumption and nothing else; CFNetwork's is 36 bytes.
+    unsigned char    peerID[256];
+    size_t           peerIDLen;
     int              inited;
     int              state;
     int              breakAuth;
