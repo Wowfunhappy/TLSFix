@@ -46,6 +46,13 @@ typedef struct {
     size_t           peerIDLen;
     int              inited;
     int              state;
+    // Set when OUR TLS layer refused the handshake, as opposed to failing to start. The two
+    // must not be treated alike: a refusal is a security decision and has to be final, while a
+    // failure to initialise never engaged with the server at all. Without the distinction, a
+    // connection OpenSSL rejected gets retried on the system's Secure Transport and accepted
+    // there -- which turns every refusal this engine makes into an acceptance by the stack it
+    // was installed to replace.
+    int              refused;
     int              breakAuth;
     int              approved;
     int              clientBypass;

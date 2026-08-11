@@ -7,6 +7,7 @@
 #include <pthread.h>
 #include <sys/stat.h>
 #include <sys/time.h>
+#include <syslog.h>
 #include <time.h>
 #include <mach-o/dyld.h>
 
@@ -101,21 +102,32 @@ static int gDbg = 0;
 static void dbg_init(void) { gDbg = tf_flag("debug"); }
 int tf_debug(void) { pthread_once(&gDbgOnce, dbg_init); return gDbg; }
 
+// The system log, not a file of our own.
+//
+// This library runs inside whatever process it was loaded into, and a good many of those are
+// sandboxed. A file under /tmp is unreachable from most of them -- WebKit's networking process
+// answers a write there with
+//
+//   Sandbox: com.apple.WebKit(1731) deny file-write-create /private/tmp/aquatransport-501.log
+//
+// which is exactly backwards: the processes whose behaviour is hardest to observe from outside
+// are the ones a private log file cannot reach. syslog goes through ASL, which sandbox profiles
+// grant as a matter of course, so it works from a sandboxed target and an unsandboxed one
+// alike. It needs nothing beyond libSystem, so no framework is pulled into the host.
+//
+// ASL supplies the process name, pid and timestamp itself, so all that is added here is a tag
+// to filter on:
+//
+//   syslog -k Sender com.apple.WebKit.Networking    or    grep AquaTransport /var/log/system.log
+//
+// The unix socket ASL connects to is AF_UNIX, so logging can never trip the connection gate.
 void tf_log(const char *fmt, ...) {
     if (!tf_debug()) return;
-    // Per-uid path: a single shared file gets created root-owned 0644 by the first daemon
-    // that logs, after which no user process can append to it (and the user cannot even
-    // delete it).
-    char path[256];
-    snprintf(path, sizeof path, "/tmp/aquatransport-%u.log", (unsigned)getuid());
-    FILE *f = fopen(path, "a");
-    if (!f) return;
-    struct timeval tv; gettimeofday(&tv, NULL);
-    fprintf(f, "%ld.%03d [%d %s] ", (long)tv.tv_sec, (int)(tv.tv_usec / 1000),
-            (int)getpid(), getprogname() ? getprogname() : "?");
-    va_list ap; va_start(ap, fmt); vfprintf(f, fmt, ap); va_end(ap);
-    fputc('\n', f);
-    fclose(f);
+    char msg[1024];
+    va_list ap; va_start(ap, fmt);
+    vsnprintf(msg, sizeof msg, fmt, ap);
+    va_end(ap);
+    syslog(LOG_NOTICE, "AquaTransport %s", msg);
 }
 
 // '*' deliberately does not match '/'. Without that restriction it backtracks across the
@@ -340,24 +352,6 @@ int tf_headerrules(const tf_headerrule **out) {
     int n = gNHdr;
     pthread_mutex_unlock(&gLock);
     return n;
-}
-
-int tf_name_listed(const char *file, const char *name) {
-    if (!name || !*name) return 0;
-    char p[1024];
-    tf_path(file, p, sizeof p);
-    FILE *f = fopen(p, "r");
-    if (!f) return 0;
-    char buf[512];
-    int hit = 0;
-    while (fgets(buf, sizeof buf, f)) {
-        size_t l = strlen(buf);
-        while (l && (buf[l-1] == '\n' || buf[l-1] == '\r' || buf[l-1] == ' ' || buf[l-1] == '\t')) buf[--l] = 0;
-        if (l == 0) continue;
-        if (!strcmp(buf, name)) { hit = 1; break; }
-    }
-    fclose(f);
-    return hit;
 }
 
 char *tf_apply_redirect(const char *url) {

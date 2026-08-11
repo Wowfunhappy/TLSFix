@@ -16,6 +16,7 @@
 
 extern void tf_log(const char *fmt, ...);
 extern int  tf_debug(void);
+extern int  tf_flag(const char *name);
 
 // CoreFoundation and Security are linked lazily, so this library can be loaded into a process
 // that has not initialised them -- which is what lets it be loaded into any process at any
@@ -509,6 +510,23 @@ int ossl_init(Shadow *s) {
     s->ssl = SSL_new(gCtx);
     if (!s->ssl) return -1;
     SSL_set_ex_data(s->ssl, gSslExIdx, s);
+    // The escape hatch for a server this engine's defaults will not talk to: an appliance or an
+    // intranet host still on TLS 1.0, or one offering nothing but 3DES. Read per connection, so
+    // editing flags.txt applies to the next handshake rather than the next reboot -- and set on
+    // the SSL rather than the context, so turning it off again does not need a restart either.
+    //
+    // It restores exactly what the defaults above give up: the old protocol versions, the old
+    // suites, and the key-size floor that comes with security level 1. It also stops a refused
+    // handshake being final (see my_SSLHandshake), because that is the same decision seen from
+    // the other end -- there is no sense in declining to negotiate an obsolete protocol while
+    // allowing the system stack to negotiate it on the retry. Reaching a server that needs this
+    // is worth strictly less than not reaching it would cost, which is why it exists and why it
+    // is not the default.
+    if (tf_flag("allow-legacy-tls")) {
+        SSL_set_security_level(s->ssl, 0);
+        SSL_set_min_proto_version(s->ssl, TLS1_VERSION);
+        SSL_set_cipher_list(s->ssl, "ALL");
+    }
     BIO *bio = BIO_new(gBioMeth);
     if (!bio) { SSL_free(s->ssl); s->ssl = NULL; return -1; }
     BIO_set_data(bio, s);
@@ -687,6 +705,10 @@ int sh_build_trust(Shadow *s, SecTrustRef *trust) {
 }
 
 static int g_state = 0;                          // 0 unchecked, 1 active, -1 setup failed
+// TLS 1.2 and below. HIGH already drops the low and export grades; the exclusions name the
+// suites that are nominally strong enough to survive it and are broken or deprecated anyway.
+#define TF_STRONG_CIPHERS "HIGH:!aNULL:!eNULL:!EXPORT:!3DES:!RC4:!MD5:!PSK:!SRP:@STRENGTH"
+
 static pthread_once_t g_once = PTHREAD_ONCE_INIT;
 static void do_ready(void) {
     OPENSSL_init_ssl(0, NULL);
@@ -695,15 +717,28 @@ static void do_ready(void) {
     if (gRsaMeth) { RSA_meth_set1_name(gRsaMeth, "aquatransport-seckey"); RSA_meth_set_priv_enc(gRsaMeth, rsa_seckey_priv_enc); }
     gCtx = SSL_CTX_new(TLS_client_method());
     if (gCtx) {
-        SSL_CTX_set_security_level(gCtx, 0);                          // allow legacy crypto / 1024-bit identities
-        SSL_CTX_set_min_proto_version(gCtx, TLS1_VERSION);            // TLS 1.0 .. 1.3
+        // WHAT THIS ENGINE WILL NEGOTIATE, and it is deliberately narrower than what it can.
+        //
+        // The point of the package is that a 10.6-10.9 machine gets modern TLS, so the default
+        // is modern TLS and nothing else: TLS 1.2 and 1.3 only, and no cipher suite that is
+        // broken or on its way there. TLS 1.0 and 1.1 are retired protocols; 3DES, RC4, MD5,
+        // the export suites and the anonymous ones are not things to negotiate with a server
+        // that offers them, because a server that offers them will accept them.
+        //
+        // Security level 1 is what puts a floor under the key sizes rather than leaving it to
+        // the cipher list -- most concretely it refuses a Diffie-Hellman group below 1024 bits,
+        // which is the Logjam case. At level 0 that floor does not exist at all, which is how
+        // an engine advertising TLS 1.3 could still be talked into a 512-bit group.
+        //
+        // The legacy behaviour is a flag away, per connection, in ossl_init: allow-legacy-tls.
+        SSL_CTX_set_security_level(gCtx, 1);
+        SSL_CTX_set_min_proto_version(gCtx, TLS1_2_VERSION);
         SSL_CTX_set_max_proto_version(gCtx, TLS1_3_VERSION);
-        // Security level 0 permits the old suites but does not offer them: the default list
-        // still excludes them, so a TLS 1.0-only server sees nothing it can use and the
-        // handshake dies on cipher overlap rather than version. "ALL" restores the legacy
-        // suites; level 0 above is what makes them usable once selected. This pair is the
-        // whole reason a stock 10.6-era server stays reachable.
-        SSL_CTX_set_cipher_list(gCtx, "ALL");
+        // TLS 1.3 suites are chosen separately and OpenSSL's defaults there are all AEAD, so
+        // this list only governs 1.2. An unparseable list would leave NO ciphers enabled and
+        // every handshake would fail, so the result is checked rather than assumed.
+        if (!SSL_CTX_set_cipher_list(gCtx, TF_STRONG_CIPHERS))
+            tf_log("cipher list rejected by OpenSSL; falling back to its default list");
         SSL_CTX_set_verify(gCtx, SSL_VERIFY_PEER, NULL);
         gSslExIdx = SSL_get_ex_new_index(0, NULL, NULL, NULL, NULL);
         SSL_CTX_set_cert_verify_callback(gCtx, verify_chain, NULL);

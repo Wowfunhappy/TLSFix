@@ -4,10 +4,10 @@
 # Everything is built from sources in this repo: deps/openssl-*.tar.gz is the only
 # external dependency and it is vendored, so a build needs no network access.
 #
-# Output: build/stage/usr/share/aquatransport/aquatransport.dylib (fat i386 + x86_64)
-#         build/stage/Library/AquaTransport/{aqinject, aqwatch}
+# Output: build/stage/usr/share/aquatransport/{aquatransport.dylib (fat i386 + x86_64),
+#                                              aqwatch, aqinject}
 #
-# aqinject/aqwatch load the dylib into other processes. Two requirements the build verifies
+# aqwatch/aqinject load the dylib into other processes. Two requirements the build verifies
 # before finishing:
 #   * both architectures present -- so the library can load into i386 and x86_64 targets
 #   * no symbols exported -- OpenSSL defines the whole SSL_*/EVP_* namespace, which must
@@ -100,26 +100,29 @@ done
 
 # The stage mirrors the installed layout, so it doubles as a pkgbuild root.
 #
-#   usr/share/aquatransport/   the dylib and the rule files -- everything a target reads for
-#                              itself. /usr/share is one of the few directories a sandboxed
-#                              process may read; see src/mac/aquatransport_config.c.
-#   Library/AquaTransport/     aqinject and aqwatch, which root runs from outside any sandbox.
+#   usr/share/aquatransport/   everything: the dylib, the rule files, and the two tools. The
+#                              dylib and the rule files have to be here because /usr/share is
+#                              one of the few directories a sandboxed target may read (see
+#                              src/mac/aquatransport_config.c), and the tools cost nothing by
+#                              joining them -- the directory is root:wheel 0755, so it is not
+#                              user-writable, and aqinject needs task_for_pid, which a non-root
+#                              caller fails wherever the binary sits.
 ST="$BUILD/stage/usr/share/aquatransport"
-STOOL="$BUILD/stage/Library/AquaTransport"
 
 # Clear the build's own products from the whole stage tree first. Because the stage is a
-# pkgbuild root, a binary sitting at a path this build no longer writes is still packaged and
-# installed, so a copy at a retired path would ship alongside the real one. Matching by name
-# across the tree keeps that true for any path the layout leaves behind.
+# pkgbuild root, every binary anywhere under it gets packaged and installed, so a stray copy
+# left at some other path would ship alongside the real one. Matching by name across the whole
+# tree rather than by path is what keeps that true whatever the layout is.
 #
-# The rule files are deliberately not touched: they are hand-maintained fixtures that
-# selftest.sh reads through AQUATRANSPORT_DIR, and nothing regenerates them.
+# The rule files are matched by neither: they are hand-maintained fixtures that selftest.sh
+# reads through AQUATRANSPORT_DIR, and nothing regenerates them.
 if [ -d "$BUILD/stage" ]; then
   find "$BUILD/stage" -type f \
     \( -name aquatransport.dylib -o -name aqinject -o -name aqwatch \) -delete
+  find "$BUILD/stage" -type d -empty -delete 2>/dev/null || true
 fi
 
-mkdir -p "$ST" "$STOOL"
+mkdir -p "$ST"
 
 lipo -create "${slices[@]}" -output "$ST/aquatransport.dylib"
 
@@ -152,13 +155,40 @@ ls -lh "$ST/aquatransport.dylib" | awk '{print "    size: "$5}'
 echo "built: $ST/aquatransport.dylib"
 
 # ---- 4. the loader tools ---------------------------------------------------
-# aqinject loads the dylib into a running process (task_for_pid + a hand-built mach_inject);
-# aqwatch drives aqinject for each process as it launches, off the process list. Both are fat,
-# so a slice loads same-arch targets and re-execs the matching slice for the other architecture.
+# aqwatch is the daemon: it links libdtrace, holds a process at its first network syscall, and
+# loads the dylib before letting it go. aqinject is the same injection engine behind a CLI, plus
+# the helper mode aqwatch uses to reach a target of the other architecture.
+#
+# Both are fat. Resolved dyld-cache addresses and the pthread_attr_t layout are
+# architecture-specific, so a slice injects only same-arch targets and reaches the others
+# through the matching slice.
+#
+# libdtrace is a private interface. It ships on 10.6 onwards and is fat here, but DTRACE_VERSION
+# and this API shape are confirmed on 10.9.5 only -- see the "Verify before shipping" list in
+# docs/CONNECTION-GATE-PLAN.md. A missing header or library fails the build rather than
+# producing a daemon that cannot arm.
+[ -f /usr/include/dtrace.h ] || { echo "FATAL: /usr/include/dtrace.h missing; aqwatch needs libdtrace"; exit 1; }
+
 iargs=(); for a in "${ARCHS[@]}"; do iargs+=(-arch "$a"); done
-for t in aqinject aqwatch; do
-  echo "==> building $t"
-  clang "${iargs[@]}" -mmacosx-version-min="$MIN" -O2 -Wall -o "$STOOL/$t" "$DIR/tools/$t.c"
-  echo "    architectures:$(lipo -info "$STOOL/$t" | sed 's/.*://')"
-done
-echo "built: $STOOL/aqinject, $STOOL/aqwatch"
+echo "==> building aqinject"
+clang "${iargs[@]}" -mmacosx-version-min="$MIN" -O2 -Wall -o "$ST/aqinject" \
+  "$DIR/tools/aqinject.c" "$DIR/tools/aqinject_core.c"
+echo "    architectures:$(lipo -info "$ST/aqinject" | sed 's/.*://')"
+
+echo "==> building aqwatch"
+clang "${iargs[@]}" -mmacosx-version-min="$MIN" -O2 -Wall -o "$ST/aqwatch" \
+  "$DIR/tools/aqwatch.c" "$DIR/tools/aqguard.c" "$DIR/tools/aqinject_core.c" -ldtrace
+echo "    architectures:$(lipo -info "$ST/aqwatch" | sed 's/.*://')"
+
+# Whether the probes the gate needs exist at all. Listing them requires root, so this is a
+# courtesy when the build happens to have it and silent otherwise -- the assertion that matters
+# is aqwatch's own, which refuses to arm unless the enable matched at least one probe per
+# clause, and which runs on the machine that will actually be gated.
+if [ "$(id -u)" = 0 ]; then
+  for probe in 'syscall::connect:entry' 'syscall::accept*:return' 'proc:::exec-success'; do
+    n=$(dtrace -l -n "$probe" 2>/dev/null | grep -c '^[0-9]' || true)
+    [ "${n:-0}" -gt 0 ] || { echo "FATAL: DTrace reports no $probe; the gate could not arm"; exit 1; }
+  done
+  echo "    probes present: connect, accept, exec-success"
+fi
+echo "built: $ST/aqwatch, $ST/aqinject"

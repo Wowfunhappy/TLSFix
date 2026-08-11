@@ -40,25 +40,21 @@
 #include <stdio.h>
 #include <unistd.h>
 #include <dlfcn.h>
+#include <malloc/malloc.h>
+#include <openssl/err.h>
 #include <mach-o/dyld.h>
 #include <mach-o/loader.h>
-// The trust infrastructure itself. This is not a list of things that happen to break --
-// it is a circular dependency: our verify path calls SecTrustEvaluate, which these
-// processes implement. Routing their own traffic through that check would make trust
-// evaluation depend on trust evaluation. tf_reentrant() in the engine guards the
-// same-thread case; these are the processes where the cycle spans a process boundary.
-//
-// Nothing else is listed. If any other process misbehaves under injection, that is a bug
-// in the engine to fix, not a name to add here.
-static const char *kDeny[] = {
-    "ocspd", "securityd", "securityd_service", "trustd", 0
-};
+// The one list the whole package shares. tf_reentrant() in the engine guards the same-thread
+// case; the trust daemons on this list are where the cycle spans a process boundary.
+#include "../aquatransport_deny.h"
 
-// Whether this process may be touched at all: every process except the trust daemons on the
-// deny list, whose own traffic routing through our verify path would be a cycle.
+// Whether this process may be touched at all. This gate runs inside the target, so it is the
+// one that holds however the library arrived -- the injection-side list in aqwatch is defence
+// in depth, not the sole protection, and this is what covers a library that got in some other
+// way entirely.
 static int process_eligible(void) {
     const char *pn = getprogname();
-    if (pn) for (int i = 0; kDeny[i]; i++) if (!strcmp(pn, kDeny[i])) return 0;
+    if (pn) for (int i = 0; kAquaNeverTouch[i]; i++) if (!strcmp(pn, kAquaNeverTouch[i])) return 0;
     return 1;
 }
 
@@ -167,14 +163,255 @@ static OSStatus my_SSLSetSessionOption(SSLContextRef c, SSLSessionOption opt, Bo
     return o_SSLSetSessionOption(c, opt, val);
 }
 
+// ---- adopting a context configured before this library arrived ----------------------------
+//
+// WHY THIS EXISTS. The connection gate holds a process at its first network syscall and loads
+// this library before letting it go, which is in time for the handshake but NOT in time for the
+// setup: measured on 10.9.5, CFNetwork builds and configures its SSLContext about 5 ms BEFORE it
+// opens any socket, and roughly 80 ms before it calls SSLHandshake. So on the first TLS
+// connection of a CFNetwork process the hooks are installed between SSLSetIOFuncs and
+// SSLHandshake -- the context is fully configured, our hook for it never ran, and without this
+// the connection would fall through to the system's own Secure Transport. That is exactly the
+// old-TLS exposure this package exists to remove, and for a short-lived process it would be
+// every request it ever makes.
+//
+// WHAT HAS TO BE RECOVERED. Everything the hooks would have recorded on the way in. All of it
+// has a public getter except the two I/O callbacks:
+//
+//   connection      SSLGetConnection
+//   peer name       SSLGetPeerDomainNameLength + SSLGetPeerDomainName   (SNI and verification)
+//   peer id         SSLGetPeerID                                        (session cache key)
+//   break-on-auth   SSLGetSessionOption
+//   read/write      no getter -- see below
+//
+// The peer name is the one that would be a security regression if it were skipped rather than
+// recovered: without it there is no SNI and no name to verify the certificate against.
+//
+// HOW THE CALLBACKS ARE FOUND. There is no SSLGetIOFuncs, so the offsets are DISCOVERED at
+// runtime rather than written down: make a throwaway context, set sentinel callbacks through the
+// real SSLSetIOFuncs, and find where they landed, with malloc_size bounding the search to the
+// context's own allocation. Measured here: x86_64 {16, 24, 32}, i386 {8, 12, 16} -- but nothing
+// depends on those numbers being right, because they are re-derived in each process.
+//
+// THREE THINGS KEEP A WRONG LAYOUT FROM BEING A CRASH:
+//
+//   1. The calibration has to succeed twice, on two independently created contexts, or no
+//      adoption is attempted at all.
+//   2. Every context is checked individually before it is trusted: the connection read through
+//      the public SSLGetConnection must equal the word sitting at the calibrated offset. A
+//      layout that does not apply to this context is caught here, before anything is called.
+//   3. The recovered pointers must be non-null and resolve through dladdr to a loaded image.
+//
+// Any of those failing means the connection is handled by the system stack, which is what would
+// have happened anyway.
+//
+// THE ONE PIECE THAT CANNOT BE READ is a client certificate: SSLSetCertificate refuses a
+// sentinel array (-50), so its slot cannot be calibrated the way the callbacks are, and there is
+// no getter. A context that had an identity set before this library arrived is therefore adopted
+// without it, and if the server demands a client certificate that first connection fails. It is
+// confined to a process's very first TLS connection presenting a client certificate -- and
+// CFNetwork normally sets an identity only in response to a server's request, which is a later
+// connection, by which time the hooks are installed and the identity is captured properly.
+
+static long g_off_rf = -1, g_off_wf = -1, g_off_conn = -1;
+static int  g_layout_ok = 0;
+static pthread_once_t g_layout_once = PTHREAD_ONCE_INIT;
+static int  g_sentinel_conn;
+
+// Distinct bodies on purpose: identical ones can be folded to a single address by the linker,
+// and then the two offsets could not be told apart.
+static OSStatus probe_read(SSLConnectionRef c, void *d, size_t *l)        { (void)c; (void)d; (void)l; return errSSLWouldBlock; }
+static OSStatus probe_write(SSLConnectionRef c, const void *d, size_t *l) { (void)c; (void)d; (void)l; return errSSLClosedAbort; }
+
+// SSLCreateContext is 10.8+, SSLNewContext is what 10.6 and 10.7 have. Both are resolved rather
+// than linked, so neither a missing symbol nor a weak import decides anything at build time.
+static SSLContextRef probe_ctx_new(int *cf_owned) {
+    SSLContextRef (*create)(CFAllocatorRef, SSLProtocolSide, SSLConnectionType) =
+        (SSLContextRef (*)(CFAllocatorRef, SSLProtocolSide, SSLConnectionType))
+        dlsym(RTLD_DEFAULT, "SSLCreateContext");
+    if (create) { *cf_owned = 1; return create(NULL, kSSLClientSide, kSSLStreamType); }
+    OSStatus (*newctx)(Boolean, SSLContextRef *) =
+        (OSStatus (*)(Boolean, SSLContextRef *))dlsym(RTLD_DEFAULT, "SSLNewContext");
+    if (newctx) { SSLContextRef c = NULL; if (newctx(false, &c) == noErr && c) { *cf_owned = 0; return c; } }
+    return NULL;
+}
+
+static void probe_ctx_free(SSLContextRef c, int cf_owned) {
+    if (!c) return;
+    if (cf_owned) { CFRelease(c); return; }
+    OSStatus (*dispose)(SSLContextRef) = (OSStatus (*)(SSLContextRef))dlsym(RTLD_DEFAULT, "SSLDisposeContext");
+    if (dispose) dispose(c);
+}
+
+// Where do the callbacks land in a context of this OS version's layout? Returns 0 unless a
+// context can be built, the sentinels planted, and all three found at distinct offsets.
+static int probe_offsets(long *rf, long *wf, long *cn) {
+    int cf_owned = 0;
+    SSLContextRef p = probe_ctx_new(&cf_owned);
+    if (!p) return 0;
+    int ok = 0;
+    size_t n = malloc_size((void *)p);
+    SSLConnectionRef sconn = (SSLConnectionRef)&g_sentinel_conn;
+    // A context is a few hundred bytes; anything outside this is not a layout to go scanning.
+    if (n >= 64 && n <= 65536 &&
+        o_SSLSetIOFuncs(p, probe_read, probe_write) == noErr &&
+        o_SSLSetConnection(p, sconn) == noErr) {
+        void **w = (void **)p;
+        *rf = *wf = *cn = -1;
+        for (size_t i = 0; i < n / sizeof(void *); i++) {
+            if (w[i] == (void *)probe_read  && *rf < 0) *rf = (long)(i * sizeof(void *));
+            if (w[i] == (void *)probe_write && *wf < 0) *wf = (long)(i * sizeof(void *));
+            if (w[i] == (void *)sconn       && *cn < 0) *cn = (long)(i * sizeof(void *));
+        }
+        ok = (*rf >= 0 && *wf >= 0 && *cn >= 0 && *rf != *wf && *rf != *cn && *wf != *cn);
+    }
+    probe_ctx_free(p, cf_owned);
+    return ok;
+}
+
+static void layout_init(void) {
+    long rf1, wf1, cn1, rf2, wf2, cn2;
+    // Twice, on two independently built contexts. One agreeing run could be a coincidence of
+    // whatever happened to be in uninitialised memory; two cannot.
+    if (!probe_offsets(&rf1, &wf1, &cn1)) return;
+    if (!probe_offsets(&rf2, &wf2, &cn2)) return;
+    if (rf1 != rf2 || wf1 != wf2 || cn1 != cn2) return;
+    g_off_rf = rf1; g_off_wf = wf1; g_off_conn = cn1;
+    g_layout_ok = 1;
+    tf_log("adopt: context layout rf=%ld wf=%ld conn=%ld", rf1, wf1, cn1);
+}
+
+// Fill in what the setters that ran before we arrived would have recorded. Returns 1 when the
+// shadow ends up complete enough to drive the handshake.
+//
+// A shadow may well already EXIST at this point without being usable, which is the case that
+// matters: CFNetwork sets the I/O funcs and the connection up front, but sets the peer name and
+// peer id later -- after the gate has released the process and our hooks are installed. Those
+// later setters create a shadow with no callbacks in it, so "no shadow" is the wrong thing to
+// test for. What matters is whether the callbacks are there.
+static int sh_adopt_into(Shadow *s, SSLContextRef c) {
+    if (ensure_ready() != 1) return 0;
+    pthread_once(&g_layout_once, layout_init);
+    if (!g_layout_ok) return 0;
+
+    // NOTHING IS WRITTEN TO THE SHADOW UNTIL EVERY PIECE IS IN HAND. Committing as it goes and
+    // returning 0 on a later failure looks like a refusal and is not one: the caller's guard
+    // asks whether the callbacks are present, so a half-filled shadow satisfies it and the
+    // handshake proceeds -- with no peer name, which means no SNI and nothing to verify the
+    // certificate against. A takeover that verifies nothing is far worse than declining, so a
+    // partial takeover must not be reachable at all. tools/adoptprobe.c asserts this directly
+    // by reading the ClientHello off a plain listener.
+    SSLReadFunc      rf = s->rf;
+    SSLWriteFunc     wf = s->wf;
+    SSLConnectionRef cn = s->conn;
+    char             host[sizeof s->host];
+    unsigned char    pid_blob[sizeof s->peerID];
+    size_t           pid_len = 0;
+    int              breakAuth = s->breakAuth;
+
+    memcpy(host, s->host, sizeof host);
+
+    // The per-context proof, before anything else is believed. SSLGetConnection is public and is
+    // not one of ours, so what it returns is independent of anything calibrated -- and if the
+    // word at the calibrated offset is not that value, this context is not laid out the way the
+    // probe context was, and nothing else read from it may be trusted either.
+    SSLConnectionRef conn = NULL;
+    if (SSLGetConnection(c, &conn) != noErr || !conn) return 0;
+    if (*(SSLConnectionRef *)((char *)c + g_off_conn) != conn) return 0;
+    if (!cn) cn = conn;
+
+    if (!rf || !wf) {
+        SSLReadFunc  grf = *(SSLReadFunc  *)((char *)c + g_off_rf);
+        SSLWriteFunc gwf = *(SSLWriteFunc *)((char *)c + g_off_wf);
+        if (!grf || !gwf) return 0;
+        Dl_info di;
+        if (!dladdr((const void *)grf, &di) || !dladdr((const void *)gwf, &di)) return 0;
+        rf = grf; wf = gwf;
+    }
+
+    // The peer name carries SNI and is what the certificate is verified against, so a context
+    // whose name cannot be read is not one to take over. Security's own copy is authoritative
+    // whether or not our setter ran.
+    if (!host[0]) {
+        size_t need = 0;
+        if (SSLGetPeerDomainNameLength(c, &need) != noErr || need == 0 || need >= sizeof host) return 0;
+        size_t hn = sizeof host;
+        if (SSLGetPeerDomainName(c, host, &hn) != noErr) return 0;
+        if (hn >= sizeof host) hn = sizeof host - 1;
+        host[hn] = 0;                      // the getter does not promise a terminator
+        if (!host[0]) return 0;
+    }
+
+    if (!s->peerIDLen) {
+        const void *pv = NULL; size_t pl = 0;
+        if (SSLGetPeerID(c, &pv, &pl) == noErr && pv && pl && pl <= sizeof pid_blob) {
+            memcpy(pid_blob, pv, pl);
+            pid_len = pl;
+        }
+    }
+    {   // Read rather than assumed: Security holds the value whether or not our setter ran, and
+        // "off" and "never set" are the same thing to every caller.
+        Boolean ba = false;
+        if (SSLGetSessionOption(c, kSSLSessionOptionBreakOnServerAuth, &ba) == noErr) breakAuth = ba ? 1 : 0;
+    }
+
+    // Everything needed is in hand: commit.
+    s->rf = rf; s->wf = wf; s->conn = cn;
+    memcpy(s->host, host, sizeof s->host);
+    if (pid_len) { memcpy(s->peerID, pid_blob, pid_len); s->peerIDLen = pid_len; }
+    s->breakAuth = breakAuth;
+
+    tf_log("adopt %s: context configured before we loaded, taken over at handshake", s->host);
+    return 1;
+}
+
+// Every connection this engine does NOT carry goes to the system's own Secure Transport, which
+// is the stack this package exists to replace -- so a decision to decline one is exactly as
+// interesting as a handshake, and until it is logged it is invisible. A connection that quietly
+// falls through leaves no trace at all, which makes "the engine reported no failures" mean far
+// less than it looks like it means.
+//
+// tf_reentrant is the one expected case: our own trust evaluation can open a connection of its
+// own -- a revocation fetch -- and that one is deliberately handed to the system stack so it
+// cannot recurse into us. It is named rather than hidden, so the log distinguishes "by design"
+// from "could not".
+static void declined(SSLContextRef c, const Shadow *s, const char *why) {
+    if (!tf_debug()) return;
+    (void)c;
+    tf_log("DECLINED host=%s -- %s; this connection uses the system's Secure Transport",
+           (s && s->host[0]) ? s->host : "(unknown)", why);
+}
+
 static OSStatus my_SSLHandshake(SSLContextRef c) {
-    if (!tf_on()) return o_SSLHandshake(c);
+    if (!tf_on()) {
+        declined(c, NULL, tf_reentrant() ? "our own nested request, by design" : "hooks not ready");
+        return o_SSLHandshake(c);
+    }
     Shadow *s = sh_get(c);
-    if (!s) return o_SSLHandshake(c);
+    if (!s) s = sh_create(c);
+    if (!s) { declined(c, NULL, "no shadow could be allocated"); return o_SSLHandshake(c); }
+    // Missing callbacks mean SSLSetIOFuncs ran before this library was in the process. The gate
+    // makes that the normal case for the first TLS connection of a process rather than a rare
+    // one, so it is worth taking the context over instead of conceding it to the system stack.
+    // A failure here leaves the shadow incomplete, and the guard below hands it to stock.
+    if ((!s->rf || !s->wf || !s->conn) && !sh_adopt_into(s, c))
+        declined(c, s, "the context could not be taken over");
     OSStatus rv;
-    if (!s->rf || !s->wf || !s->conn || s->clientBypass || s->state == -1) { rv = o_SSLHandshake(c); goto done; }
+    // A refusal is final. CFNetwork retries a failed handshake, and answering that retry with
+    // the system stack would let a server this engine just rejected be accepted a moment later
+    // -- so the weakest stack on the machine would get the last word on every security
+    // decision. Fail closed instead: the caller sees the same error it saw the first time.
+    if (s->refused) { rv = ST_ClosedAbort; goto done; }
+    if (!s->rf || !s->wf || !s->conn || s->clientBypass || s->state == -1) {
+        declined(c, s,
+                 s->clientBypass  ? "client certificate, disabled-mtls" :
+                 s->state == -1   ? "the OpenSSL side failed to initialise earlier" :
+                 (!s->rf || !s->wf) ? "no I/O callbacks, and the context could not be taken over"
+                                    : "no connection recorded, and the context could not be taken over");
+        rv = o_SSLHandshake(c); goto done;
+    }
     sh_unblock_write(s);   // an entry like any other; see bio_bwrite
-    if (!s->inited) { if (ossl_init(s)) { s->state = -1; rv = o_SSLHandshake(c); goto done; } s->state = 1; }
+    if (!s->inited) { if (ossl_init(s)) { s->state = -1; declined(c, s, "the OpenSSL side would not initialise"); rv = o_SSLHandshake(c); goto done; } s->state = 1; }
     if (s->state == 3) s->approved = 1;   // app approved the server after the auth break, let it proceed
     int ret = SSL_do_handshake(s->ssl);
     if (ret == 1) {
@@ -195,8 +432,38 @@ static OSStatus my_SSLHandshake(SSLContextRef c) {
     if (e == SSL_ERROR_WANT_X509_LOOKUP) { s->state = 3; rv = ST_PeerAuth; goto done; }
     if (e == SSL_ERROR_WANT_READ || e == SSL_ERROR_WANT_WRITE) rv = errSSLWouldBlock;
     else {
-        tf_log("handshake FAILED host=%s ssl_err=%d", s->host[0] ? s->host : "(none)", e);
+        // "ssl_err=1" says only that OpenSSL objected, which is not enough to tell a server
+        // this engine SHOULD reject from one it merely cannot talk to -- and that difference
+        // decides whether a refusal is correct or a compatibility bug. So the reason goes in,
+        // along with the peer id, which is the only thing to hand that carries the PORT: a
+        // probe suite like SSL Labs' reaches one hostname on many ports, and without the port
+        // the log cannot say which probe was refused.
+        if (tf_debug()) {
+            char ebuf[256]; ebuf[0] = 0;
+            unsigned long oe = ERR_peek_last_error();
+            if (oe) ERR_error_string_n(oe, ebuf, sizeof ebuf);
+            char peer[96]; size_t pn = s->peerIDLen < sizeof peer - 1 ? s->peerIDLen : sizeof peer - 1;
+            memcpy(peer, s->peerID, pn); peer[pn] = 0;
+            for (size_t i = 0; i < pn; i++) if (peer[i] < 32 || peer[i] > 126) peer[i] = '.';
+            tf_log("handshake FAILED host=%s ssl_err=%d verify=%ld openssl=[%s] peer=[%s] (%s)",
+                   s->host[0] ? s->host : "(none)", e,
+                   (long)SSL_get_verify_result(s->ssl), ebuf[0] ? ebuf : "-", peer,
+                   tf_flag("allow-legacy-tls")
+                       ? "allow-legacy-tls: a retry on this context WILL be handed to the system stack"
+                       : "refused; a retry on this context stays refused");
+        }
         s->state = -1; rv = ST_ClosedAbort;
+        // A refusal is final. CFNetwork retries a failed handshake, and answering that retry
+        // with the system stack would let a server this engine just rejected be accepted a
+        // moment later -- so the weakest stack on the machine would get the last word on every
+        // security decision this one makes.
+        //
+        // allow-legacy-tls turns that off along with everything else it turns off, because it
+        // is the same question asked twice. Refusing to negotiate an obsolete protocol and
+        // refusing to let the system stack negotiate it instead are one decision: permitting
+        // the first while forbidding the second reaches the server anyway, on worse terms and
+        // without saying so. One flag, one meaning -- reach the server, or do not.
+        if (!tf_flag("allow-legacy-tls")) s->refused = 1;
     }
 done:
     sh_release(s);
@@ -224,6 +491,7 @@ done:
 static OSStatus my_SSLRead(SSLContextRef c, void *data, size_t len, size_t *processed) {
     if (!tf_on()) return o_SSLRead(c, data, len, processed);
     Shadow *s = sh_get(c);
+    if (s && s->refused) { sh_release(s); return ST_ClosedAbort; }
     if (!s || s->state != 2) { OSStatus r = o_SSLRead(c, data, len, processed); sh_release(s); return r; }
     // A read is another entry, so it is another chance for the queue to go out. One attempt,
     // never a wait: the caller's own flush is what this connection depends on, and a read must
@@ -275,6 +543,7 @@ static OSStatus my_SSLRead(SSLContextRef c, void *data, size_t len, size_t *proc
 static OSStatus my_SSLWrite(SSLContextRef c, const void *data, size_t len, size_t *processed) {
     if (!tf_on()) return o_SSLWrite(c, data, len, processed);
     Shadow *s = sh_get(c);
+    if (s && s->refused) { sh_release(s); return ST_ClosedAbort; }
     if (!s || s->state != 2) { OSStatus r = o_SSLWrite(c, data, len, processed); sh_release(s); return r; }
     *processed = 0;
     sh_unblock_write(s);

@@ -10,18 +10,31 @@ Two independent subsystems in one package:
 
 | Subsystem | What it does | Where it runs |
 |---|---|---|
-| TLS engine | Routes Secure Transport through OpenSSL: TLS 1.0–1.3, modern ciphers, OS-delegated trust | every process |
-| URL rewriter | Applies `redirects.txt` and `headers.txt` at the request layer | apps only (see gating) |
+| TLS engine | Routes Secure Transport through OpenSSL: TLS 1.0–1.3, modern ciphers, OS-delegated trust | every process carrying the library |
+| URL rewriter | Applies `redirects.txt` and `headers.txt` at the request layer | the same processes; each rule carries its own scope line |
 
-Verified on 10.9.5 (51/51 local tests) and 10.6.8 (`NSURLSession` is 10.9+ and is
-skipped there), both `x86_64` and `i386`.
+Neither is gated on what the process is. The rewriter's *rules* are scoped — every block begins
+with a scope line naming the apps it applies to, or `*` — but the hooks themselves go into every
+process the library reaches. See *How the rewriter works* below.
+
+Which processes the library reaches is a separate question, and the answer is: the ones that use
+the network, held at the moment they first do. See *The connection gate*.
+
+Verified on 10.9.5 (51/51 per-process tests, 39/39 gate tests), and on 10.6.8 for the engine
+(`NSURLSession` is 10.9+ and is skipped there), both `x86_64` and `i386`.
 
 ## Build
 
 ```
-./build-macos.sh          # OpenSSL + dylib + loader tools (aqinject, aqwatch)
+./build-macos.sh          # OpenSSL + dylib + the daemon and injector
 ./tools/selftest.sh       # per-process tests, installs nothing
+sudo ./tools/gatetest.sh  # the connection gate, end to end; needs root
 ```
+
+The two suites cannot share a process. `selftest.sh` asserts that *stock* Secure Transport fails
+`api.twitter.com`, which a running gate would turn into a pass by loading the library into the
+probe before it connected — so it refuses to run while `aqwatch` is up, and the gate is tested
+separately.
 
 Everything is vendored: `deps/openssl-3.5.7.tar.gz` (checksum matches upstream). No network
 needed to build.
@@ -41,21 +54,20 @@ The build enforces three invariants, each guarding a failure that is silent at l
 ## Install
 
 ```
-sudo ./install-macos.sh stage      # copy files into place, load nothing
-sudo ./install-macos.sh inject     # + load into every eligible running process now
-sudo ./install-macos.sh watch      # + a daemon that loads into each process as it launches
-sudo ./install-macos.sh uninstall  # remove the daemon, then the files
+sudo ./install-macos.sh stage      # copy files into place, start nothing
+sudo ./install-macos.sh watch      # + the connection-gate daemon, at boot and now
+sudo ./install-macos.sh uninstall  # stop the daemon, then remove the files
 ```
 
-The install spans two directories:
+Everything lives in one directory, plus one plist:
 
 | path | contents |
 | --- | --- |
-| `/usr/share/aquatransport/` | `aquatransport.dylib`, `flags.txt`, `headers.txt`, `redirects.txt` |
-| `/Library/AquaTransport/` | `aqinject`, `aqwatch`, `uninstall.sh` |
+| `/usr/share/aquatransport/` | `aquatransport.dylib`, `aqwatch`, `aqinject`, `flags.txt`, `headers.txt`, `redirects.txt`, and two runtime files (`held.journal`, `armed.stamp`) |
+| `/Library/LaunchDaemons/org.aquatransport.watch.plist` | starts the daemon at boot |
 
-The split follows from who reads what. A target `dlopen`s the dylib and reads the rule files
-itself, so those reads happen under the *target's* sandbox, and
+The directory is `/usr/share` because of who reads what. A target `dlopen`s the dylib and reads
+the rule files itself, so those reads happen under the *target's* sandbox, and
 `/System/Library/Sandbox/Profiles/system.sb` — imported by every sandboxed process — grants
 `file-read*` only for world-readable files under `/System`, `/usr/lib`, `/usr/share`,
 `/private/var/db/dyld` and `/Library/Filesystems/NetFSPlugins`:
@@ -76,30 +88,40 @@ Sandbox: webpushd(715) deny file-read-data /usr/share/aquatransport/aquatranspor
 
 The `(file-mode #o0004)` clause is why the installers set 0644 on these files and 0755 on the
 directory: a stricter mode is readable to root alone, and every sandboxed target goes
-unpatched. `aqinject` and `aqwatch` face none of this — root runs them from outside any
-sandbox — so they live in `/Library/AquaTransport`.
+unpatched.
 
 Not every sandboxed process is this restricted. `application.sb`, which backs the app sandbox,
 carries a blanket `(allow file-read* (subpath "/Library"))`, and WebKit's `WebProcess` and
 `NetworkProcess` profiles reach the dylib as well. `/usr/share` is what the whole range of
 them share.
 
-The library is loaded into a process by `aqinject` (`tools/aqinject.c`) — `task_for_pid`
-plus a hand-built `mach_inject` — using the target's own `dlopen`. It edits no system launch
-configuration, so a faulty library is confined to the process it is loaded into and can never
-keep the machine or another process from starting.
+**The tools sit in the same directory, and gain nothing from it.** They need no sandbox
+visibility — root runs them from outside any sandbox — but the directory stays `root:wheel`
+`0755`, so it is not user-writable, and injecting requires `task_for_pid`, which a non-root
+caller fails wherever the binary sits. Co-locating them is what lets `aqwatch` derive every
+path from its own location, which is why the plist carries a single argument.
 
-- **`inject`** loads the library into every eligible process running at the time. It reaches
-  GUI apps and daemons alike, and covers what is running when it runs.
-- **`watch`** installs `aqwatch` (`tools/aqwatch.c`) as a LaunchDaemon (started at each boot).
-  It loads the library into each process as the process launches, so it also covers processes
-  started later, with the same per-process confinement as `inject`. This is the recommended
-  path to full coverage; run `inject` once alongside it for the current session. See *A
-  launch-time watcher* below.
+The two runtime files are `0600`: they list pids, nothing sandboxed reads them, and they need
+no world visibility. They also have opposite lifetimes — `held.journal` must be ignored after a
+reboot, because its pids belong to other processes by then, while `armed.stamp` must survive
+one. Both carry a **boot session id** from `sysctl kern.boottime`, which is fixed for the life
+of a boot and changes across reboots, so each is read only when its id says it is still meant
+to apply. That is explicit and testable, and it does not depend on whether 10.9 clears any
+particular directory at boot.
 
-### Loading into a running process (aqinject)
+The library is loaded into a process by the injection engine in `tools/aqinject_core.c` —
+`task_for_pid` plus a hand-built `mach_inject` — using the target's own `dlopen`. It edits no
+system launch configuration, so a faulty library is confined to the process it is loaded into
+and can never keep the machine or another process from starting.
 
-`aqinject` loads the compatibility library into a cooperating process the administrator
+- **`stage`** puts the files in place and starts nothing.
+- **`watch`** installs `aqwatch` (`tools/aqwatch.c`) as a LaunchDaemon, started at each boot.
+  It holds each process at its first use of the network and loads the library before letting it
+  go. See *The connection gate* below.
+
+### Loading into a running process
+
+The engine loads the compatibility library into a cooperating process the administrator
 already runs on a machine they own; the payload is loaded by the target's own `dlopen`.
 `pthread_create_from_mach_thread` does not exist before 10.7, so its effect is rebuilt by
 hand — every step below is validated on 10.6.8, i386 and x86_64:
@@ -153,57 +175,342 @@ a request to `api.twitter.com` returns HTTP 404 — which stock Secure Transport
 do (-9824). The same holds when the injection comes from `aqwatch` rather than the process
 itself, for both `fork`+`execve` and `posix_spawn` launches.
 
-Injection is therefore unconditional: `--all` walks every process, skipping only pid 0/1 and
-the trust-daemon deny list. Verified on 10.6.8 under the older gated build: `--all` loaded into
-31 live processes (Dock, Finder, SystemUIServer, coreservicesd among them) with zero crashes.
+## The connection gate
 
-`inject`/`aqinject --all` cover processes running when they run. To cover processes started
-later, `watch` runs the launch-time watcher described next.
+Loading a library into a process that has already started leaves a window, and a process that
+issues a TLS request inside that window uses the system's own Secure Transport — so the request
+fails against a modern server, or succeeds against a weak one. **Either outcome is the bug this
+package exists to fix, so the window is a correctness defect, not a performance one.**
 
-### A launch-time watcher (aqwatch)
+Narrowing it does not close it, and a launch-list poller cannot even bound it. Cross-checked
+against `proc:::exec-success` over one workload, a 20 ms poller never observed nine processes at
+all — `git`, `perl`, `sh`, `date`, `env` — because they lived for less than one interval. `git`
+and `curl` fetching over HTTPS are exactly the short-lived, fast-connecting processes this
+affects.
 
-`aqwatch` loads the library into each process as it launches, giving coverage of
-later-started processes with the same per-process confinement `aqinject` has. It polls the
-kernel's process list (`proc_listpids`) every 100 ms and treats any pid it has not seen
-before as a launch, keeping the seen-set as a bitmap over the pid space so a pid that exits
-clears itself on the next sweep. For each new process that is not the daemon itself, one of
-its own children, pid 0/1, or a trust daemon, `aqwatch` runs
-`aqinject <pid> <dylib>`. In-flight `aqinject`
-children are capped and reaped so an app-launch storm cannot fork-bomb the machine. The
-deny list is applied to `proc_pidpath` of the pid, so it matches what the process actually
-is rather than anything the daemon was told.
+So the kernel freezes the process instead:
 
-**One injection per launch, and a failure is reported rather than worked around.** `aqinject`
-waits for the target to be ready and then confirms, by reading the target's own dyld image
-list, that the library actually arrived; it exits 0 only then. `aqwatch` acts on that status
-and does not try again.
+```
+kernel                          aqwatch (root, LaunchDaemon)
+------                          ---------------------------
+process calls connect()
+  -> probe fires, stop()        [process frozen, synchronously]
+  -> record buffered
+                                dtrace_work() drains the record
+                                thread_suspend(the offending thread)
+                                kill(pid, SIGCONT)     [clears the BSD stop]
+                                inject the library if absent
+                                thread_resume(the thread)
+process continues                                      [library present]
+```
 
-There is deliberately no retry loop and no periodic re-check. Either the injection lands, in
-which case repeating it buys nothing, or it does not, in which case the useful response is a
-log line naming the pid and the reason — not a schedule of further attempts that would hide
-how often the first one misses. Anything that leaves a live process without the library,
-including the one path where no injector runs at all (`MAX_INFLIGHT` exhausted), writes a
-`NOT PATCHED` line to `/var/log/aquatransport.log` (0600, bounded and truncated in place while
-running).
+Three probes, and each has a reason to be where it is:
+
+| gate | probe | why there |
+|---|---|---|
+| outbound | `syscall::connect:entry` | `AF_INET`/`AF_INET6` only, read from the `sockaddr`'s `sa_family` byte |
+| inbound | `syscall::accept*:return` | on **return**, so the descriptor exists — at entry the thread would sit in the gate while the process was merely idle waiting |
+| inherited socket | `syscall::read*:entry`, `write*:entry` | inetd-style jobs call neither `connect` nor `accept`; emitted only for executables that need it |
+
+The wildcards are not optional. stdio flushes through `write_nocancel` rather than `write`, so a
+predicate on `write` alone silently never fires, and `accept*` covers `accept_nocancel` too.
+
+**Injection happens only at a gate.** Nothing is injected at exec, and a process that never
+touches the network never receives the library — about **32 processes of ~270** rather than all
+of them, at a measured ~600 KB of private dirty memory each.
+
+**Processes already running when the daemon starts are deliberately not covered.** One that
+connected before the daemon came up is gated at its *next* connection, which for a process
+holding a long-lived one may be a long time. Restarting it, or rebooting, is the remedy. A bulk
+pass over existing processes would reintroduce the whole memory cost this architecture removes,
+to cover a case a reboot handles.
+
+### Why the process stop has to become a thread suspension
+
+A DTrace `stop()` is a **BSD process stop**, and it has two properties that together dictate the
+whole design.
+
+It freezes the process **before dyld runs**, so it cannot be used at exec: a process stopped
+there never initialises libSystem, and the injector waits for `libSystemInitialized` forever.
+
+And **under a BSD stop, `pthread_create`'d threads are never scheduled.** The injector's stage 1
+is a raw mach thread and runs fine; stage 2 is a real pthread and does not, so `dlopen` is never
+called. Sampling a process in that state shows it exactly — stage 1 spinning at its `jmp`, stage
+2 created and never run.
+
+The fix is to downgrade the process stop to a thread suspension before injecting: `thread_suspend`
+the offending thread, `SIGCONT` the process to clear the BSD stop, inject normally, then
+`thread_resume`. **Ordering matters** — suspend *before* the `SIGCONT`, so there is no instant in
+which the thread is runnable and unpatched. D's `tid` equals the Mach `thread_id` from
+`thread_info(THREAD_IDENTIFIER_INFO)`, which is how the thread is found.
+
+### What the daemon remembers, and why it cannot go stale
+
+Verifying patched-ness by walking a target's dyld image list costs 0.135 ms, so the daemon keeps
+a set of processes it has already patched. The key is **(pid, process start time, last exec
+timestamp)**, and all three are load-bearing:
+
+- a pid alone is reused;
+- the start time separates one use of a pid from the next;
+- the exec timestamp separates one *program* from the next within a single pid — which matters
+  because the library does not survive an exec, and because `xpcproxy` re-execs into the real
+  binary for every application and XPC service on 10.9.
+
+The exec timestamp rides in on the gate record itself, recorded by D at `proc:::exec-success`.
+That is what makes the set safe without any invalidation protocol: nothing has to be told that a
+process exec'd, and no event has to arrive in any particular order — a stale entry simply stops
+matching. An eviction costs one redundant injection, which `dlopen` makes idempotent anyway.
+
+A process already in the set takes the fast path: one `SIGCONT` and nothing else. It is not
+suspended at all, because a process that already carries the library wants to run.
+
+### Taking over a context configured before the library arrived
+
+The gate is in time for the handshake but **not** for the setup, and the difference is not
+academic. Measured with the pid provider on a fresh CFNetwork client, same process:
+
+```
+16506  SSLCreateContext
+16506  SSLSetIOFuncs        <- where the engine normally attaches
+16506  SSLSetConnection
+16510  socket / connect / connect_nocancel
+16511  connectx             <- where the gate fires
+16592  SSLHandshake
+```
+
+CFNetwork builds and configures its `SSLContext` **before it opens any socket at all** — about
+5 ms before, and before even the DNS lookup. So on the first TLS connection of a CFNetwork
+process the library is loaded between `SSLSetIOFuncs` and `SSLHandshake`: the context is fully
+configured and our setter for it never ran. Left alone, that connection falls through to the
+system's Secure Transport, which is precisely the old-TLS exposure this package exists to
+remove — and for a short-lived process it would be every request it ever makes.
+
+So the engine takes such a context over at `SSLHandshake` instead. Everything the setters would
+have recorded has a public getter except the two I/O callbacks:
+
+| state | recovered from | why it matters |
+|---|---|---|
+| connection | `SSLGetConnection` | the transport, and the per-context layout check |
+| peer name | `SSLGetPeerDomainNameLength` + `SSLGetPeerDomainName` | **SNI, and what the certificate is verified against** |
+| peer id | `SSLGetPeerID` | session cache key |
+| break-on-server-auth | `SSLGetSessionOption` | whether the app verifies the chain itself |
+| read/write callbacks | no getter — see below | |
+
+**"No shadow" is the wrong thing to test for.** CFNetwork sets the I/O funcs up front but sets
+the peer name and peer id *later*, after the gate has released the process and the hooks are
+installed — so those later setters create a shadow with no callbacks in it. What decides whether
+a context needs taking over is whether the callbacks are there, not whether a shadow exists.
+Testing the wrong one leaves the connection silently on the system stack.
+
+**The callbacks are found by discovery, not by a written-down offset.** There is no
+`SSLGetIOFuncs`, so the layout is derived at runtime in each process: build a throwaway context,
+set sentinel callbacks through the real `SSLSetIOFuncs`, and find where they landed, with
+`malloc_size` bounding the search to the context's own allocation. It comes out as
+`{16, 24, 32}` on x86_64 and `{8, 12, 16}` on i386 — but nothing depends on those numbers, and a
+future layout simply produces different ones.
+
+Three checks keep a wrong layout from being a crash rather than a decline:
+
+1. The calibration has to succeed **twice**, on two independently created contexts, or no
+   takeover is attempted at all.
+2. Every context is checked individually before it is trusted: the connection read through the
+   public `SSLGetConnection` must equal the word at the calibrated offset. A layout that does not
+   apply to this context is caught there, before anything is called.
+3. The recovered pointers must be non-null and resolve through `dladdr` to a loaded image.
+
+Any check failing leaves the shadow incomplete, and the existing guard hands the connection to
+the system stack — which is what would have happened anyway. **Nothing gets worse on failure.**
+
+A context whose peer name cannot be read is refused outright rather than taken over: without it
+there is no SNI and no name to verify against, and a takeover that skipped verification would be
+far worse than not taking over at all. `tools/gatetest.sh` asserts that directly — a fresh
+process's first request to `expired`, `wrong.host` and `untrusted-root` `badssl.com` must still
+be rejected, alongside the assertion that its first request to `api.twitter.com` succeeds and is
+carried at TLS 1.3.
+
+**The one piece that cannot be read is a client certificate.** `SSLSetCertificate` refuses a
+sentinel array (`-50`), so its slot cannot be calibrated the way the callbacks are, and there is
+no getter. A context that had an identity set before the library arrived is therefore taken over
+without it, and if the server demands a client certificate that first connection fails. It is
+confined to a process's very first TLS connection presenting a client certificate — and
+CFNetwork normally sets an identity only in response to a server's request, which is a later
+connection, by which time the hooks are installed and the identity is captured properly.
+
+### Recovery
+
+A `stop()` that is never released is the one failure this design can cause that a poller cannot.
+The mitigations are layered so that no single one has to be perfect (`tools/aqguard.c`):
+
+| layer | covers |
+|---|---|
+| **watchdog** | releases any hold older than `gate-hold-ms` (default 250) regardless of what the injection is doing. Its table is pre-allocated and its release path allocates nothing, so memory pressure cannot prevent a release. |
+| **journal** | every hold is written to `held.journal` before the process leaves its kernel stop and cleared after the thread resumes, so a daemon that dies mid-hold leaves an exact record. Replayed at startup, and only when its boot session id matches. |
+| **suspend-count scan** | a Mach hold outlives its suspender but is visible as `thread_basic_info.suspend_count > 0`. Reported always; acted on only when the journal could not do its job. |
+| **blind `SIGCONT` sweep** | a kernel stop whose record was never drained is *not* visible — such a process reports `p_stat == SRUN`, indistinguishable from a running one. So the sweep does not try to find it: it signals everything that is not genuinely `SIGSTOP`ped, which is a no-op on a running process. Measured at 0.45 ms over 271 processes. |
+| **armed stamp** | if the previous boot armed the gates and never reported healthy, the next start comes up gate-disabled. A gate-induced hang can happen at most once. |
+
+**Every exit path from the suspend onwards reaches the release.** Injection failure, target
+death, an unexpected `kern_return_t` — all release the thread and let the process run unpatched.
+Failing open is correct: a wedged process is worse than an unpatched one.
+
+**Force quit always works.** A process with a suspended thread dies to `SIGKILL` *and* to plain
+`SIGTERM`, so a wedged application behaves like any other beachball and the user's normal escape
+hatch is intact. `tools/gatetest.sh` asserts this directly.
+
+The one deliberately narrowed layer is the suspend-count scan. Measured on an untouched 10.9.5
+machine, `coresymbolicationd` and `xpcd` each park a thread with `thread_suspend` as a matter of
+course — so resuming every suspended thread on the system would set another program's thread
+running at a moment it deliberately chose to stop it, at every boot, to recover from something
+that has not happened. It therefore reports always and resumes only when the journal was
+unavailable, or when `gate-resume-suspended` asks it to.
+
+### The exclusion list
+
+Boot-hang exposure is handled by **never latching a set of named processes**, not by deferring
+when the gates arm. There is no time floor and no "wait until the system looks up" check: both
+are timing-dependent, and a race is exactly what must not sit underneath a mechanism that can
+freeze a process. A name comparison in a D predicate is deterministic, inspectable and testable.
+The gates are armed as soon as the daemon starts, and a daemon that fails to start at all is
+safe by construction — no probe is enabled, so nothing can freeze.
+
+**`execname` truncates to 15 characters**, and this is where the list can silently die. A process
+named `securityd_service` reports `execname` as `securityd_servi`. This is *not* the 16-character
+`MAXCOMLEN` truncation that applies to `kinfo_proc.kp_proc.p_comm` — it is a different code path,
+and a predicate written as `execname == "securityd_servic"` compiles, runs, and **matches
+nothing**, freezing and injecting the daemon it was written to skip, with no error anywhere.
+
+So no name is ever written out pre-truncated. The daemon **measures** the limit at startup — it
+execs a copy of a harmless binary under a deliberately over-long name and reads back what DTrace
+says `execname` was — and truncates the configured full names itself when generating the `BEGIN`
+block. If the limit cannot be established, the exclusion list cannot be trusted, so the daemon
+comes up **gate-disabled** rather than arming a predicate that may be dead. That also means the
+15 above is re-derived per machine and per OS version rather than assumed.
+
+`pid > 1` is in every predicate, so launchd is never frozen; the daemon and its own injection
+helper are in the deny list, because they would have nobody to release them.
+
+### The log
+
+`/var/log/aquatransport.log`, root-owned, `0600`, bounded and truncated in place while running.
+It carries one line per process that takes the library — about 32 over a session — plus the
+three signals that say whether the safety net is load-bearing: **every release the watchdog
+forced, every sweep that released anything, and every drop reported by libdtrace**. A drop is by
+definition a process frozen with nobody holding its pid, so it also triggers a sweep.
 
 That log is only worth reading if it is quiet when nothing is wrong, so the outcomes that are
-expected rather than wrong are classified as such and stay out of it. A target that exits
-part-way through is the ordinary end of most injections — every shell command is one — and it
-is distinguished from a fault at each point it can happen: no task port, no dyld startup, a
-failed `mach_vm_write`, a failed `thread_create_running`. A process that is merely quitting
-answers `kill(pid, 0)` exactly as a running one does, so the liveness test reads `p_stat` and
-treats a zombie as gone, and a failed `task_for_pid` is retried briefly before being believed.
-Measured over ~480 short-lived process launches plus eight forced relaunches of Safari's
-networking service: **zero bytes logged**.
+expected rather than wrong stay out of it. A target that exits part-way through is the ordinary
+end of many injections, and it is distinguished from a fault at each point it can happen: no task
+port, no dyld startup, a failed `mach_vm_write`, a failed `thread_create_running`. A process that
+is merely quitting answers `kill(pid, 0)` exactly as a running one does, so the liveness test
+reads `p_stat` and treats a zombie as gone, and a failed `task_for_pid` is retried briefly before
+being believed.
+
+### Cost
+
+Measured on 10.9.5, x86_64, against an installed daemon at the default 50 Hz:
+
+| | target | measured |
+|---|---|---|
+| daemon CPU, idle | ≤ 0.5% of one core | **0.2%** (0.06 s over 30 s) |
+| daemon RSS | ≤ 9 MB | **5.1 MB** |
+| find the thread + suspend | ≤ 0.1 ms | **0–1 ms** |
+| injection, cold | ≤ 8 ms | **1–10 ms**, median ~3 |
+| probe overhead per syscall, false predicate | ≤ 0.1 µs | 0.05–0.08 µs |
+| private memory per patched process | ~600 KB | 603 KB |
+
+**The stall a gated `connect` sees is dominated by one thing: waiting for DTrace's next buffer
+switch.** The daemon's own work is small and nearly constant; the wait for the record is neither.
+
+Decomposed inside the daemon, with the probe's own `timestamp` carried in the gate record and
+the D clock calibrated against `mach_absolute_time` in the same run (the two run ~300 ppm apart,
+so a calibration from minutes earlier is worthless), at 50 Hz:
+
+| stage | cost |
+|---|---|
+| probe fires → record drained | **2.1–13.1 ms** |
+| drained → picked up by a worker | 0.01–0.42 ms |
+| suspend + inject + resume | 1.7–2.3 ms |
+| **total, and the connect duration the process measures** | **3.9–15.1 ms** |
+
+A record becomes visible only at the next switch of the principal buffer, and a `connect` arrives
+at a uniformly random phase within that interval — so the wait is uniform over one period, and
+the whole stall tracks `switchrate` linearly. Measured end to end from inside the connecting
+process, 15 samples per rate, daemon settled:
+
+| `gate-rate` | switch period | median | range |
+|---|---|---|---|
+| 10 Hz | 100 ms | 66 ms | 16–101 ms |
+| 25 Hz | 40 ms | 25 ms | 6–43 ms |
+| **50 Hz** (default) | **20 ms** | **17 ms** | **6–31 ms** |
+| 100 Hz | 10 ms | 9 ms | 5–15 ms |
+| 250 Hz | 4 ms | 5 ms | 2–30 ms |
+
+Median ≈ half a period plus ~2 ms of work, worst case ≈ one period plus the same, which is what
+the mechanism predicts. So `gate-rate` is a direct latency/CPU dial: at the default the first
+connection of a process waits ~17 ms and the daemon costs 0.2% of a core; 100 Hz roughly halves
+the wait and roughly doubles the CPU.
+
+**Measure this with the daemon settled.** Taken in the first seconds after it starts, these
+numbers are two to four times worse and appear not to scale with the rate at all — the daemon is
+gating the launch storm that `launchctl load` itself produced, and the queue is what is being
+measured rather than the mechanism.
+
+It is a **one-off cost per process**, paid on its first network syscall and never again: every
+later connection in that process takes the fast path. And because the process is frozen for the
+whole delay, `switchrate` buys latency, not safety.
+
+### Why libdtrace rather than dtrace(1)
+
+The consumer is linked in, so no process named `dtrace` appears in the process list and an
+operator's own interactive DTrace sessions stay distinguishable. It costs what `dtrace(1)` costs,
+because that footprint is libdtrace's own.
+
+Three traps, each of which presents as a silently working consumer:
+
+1. **`dtrace_program_strcompile()` truncates.** With a probespec it compiles **one clause** the
+   way `dtrace -n` does, enables it, reports a plausible probe count and no error, and drops the
+   rest. The daemon uses `dtrace_program_fcompile()` — the `dtrace -s` path — and refuses to arm
+   unless `dpi_matches` is at least the number of clauses it generated.
+2. **`dtrace_handle_buffered()` yields wrong field values.** It does deliver each `printf()` as
+   text, but in testing the `pid` and `tid` fields were wrong — one pid/tid pair repeated across
+   three different processes while `execname` varied correctly. The `dtrace_work()` `FILE *` path
+   formats the same records correctly.
+3. **Output buffering.** The `FILE *` must be line-buffered, or gate records sit in stdio while
+   the processes that generated them stay frozen.
+
+`funopen()` is not a workaround for the second: libdtrace writes nothing to a `funopen`-backed
+`FILE *`, though records do arrive at the callbacks. The descriptor has to be real, so the daemon
+uses a `pipe()` back into itself, with a reader thread parsing records off the other end and a
+small pool of workers running the gate — an injection must never stall the drain, because a
+stalled drain becomes a dropped record, and a dropped record is a frozen process nobody knows
+about.
+
+### Why not the audit pipe
+
+The kernel's BSM audit pipe delivers a record per exec, but on 10.9.5 its subject token
+identifies the new process only for `fork`+`execve`. For `posix_spawn` the subject is the process
+that *called* `posix_spawn`, the child's pid appears in no token at all (`AUT_PROCESS` and the
+`AUT_ARG` pid token are both absent), and the path token is the *child's* executable — so a
+`posix_spawn` record pairs the parent's pid with the child's path. Anything driven off it would
+inject into the parent while believing it was the child, and would miss every `posix_spawn`
+launch, which on 10.9 is nearly every application and XPC service launchd starts.
+
+`proc:::exec-success` has neither problem, and it is the only exec probe that reports the *new*
+process: `proc:::exec` reports the **parent's** pid with the child's path on the `posix_spawn`
+path, a successful `execve` never returns, and `syscall::fork:return` fires in the parent — where
+a `fork` without `exec` needs no injection anyway, because the child inherits the patched address
+space.
 
 ### Injecting before libSystem is initialized
 
-`aqinject` waits for the target to finish exec'ing before touching it, and the condition it
-waits for has to be the right one. dyld publishes `infoArray` *as it loads*, so
-`infoArrayCount` goes positive early — while dyld is still working, and **before libSystem's
-initializer has run**. Measured on 10.9.5, a `com.apple.WebKit.Networking` launch spends
-**14–51 ms** with an image list published (225 images) and `libSystemInitialized` still false.
-`aqwatch` fires the moment a pid appears in the process list, so it lands inside that window.
+This is what the gate removes, and it is worth recording because the ordinary injection path
+still has to handle it — `gate-off` uses that path, and so does the `aqinject` CLI.
+
+The injector must not touch a target that is still exec'ing, and the condition it waits for has
+to be the right one. dyld publishes `infoArray` *as it loads*, so `infoArrayCount` goes positive
+early — while dyld is still working, and **before libSystem's initializer has run**. Measured on
+10.9.5, a `com.apple.WebKit.Networking` launch spends **14–51 ms** with an image list published
+(225 images) and `libSystemInitialized` still false.
 
 Injecting there asks a process whose pthread subsystem is not yet initialized to run
 `pthread_create` off a bare mach thread with a hand-built TSD. It fails, and it fails
@@ -212,10 +519,19 @@ and the injector sits out its entire wait and reports a timeout. Sampling a targ
 this state shows exactly that — the stage-1 bootstrap thread spinning at its `jmp`, no stage-2
 thread in existence, and the library unmapped, in a process that is otherwise completely idle.
 
-The condition the payload actually depends on is the one dyld already exposes, so
-`wait_for_exec` waits for `dyld_all_image_infos.libSystemInitialized` rather than for a
-non-empty image list. Measured over eight forced relaunches of Safari's networking process
-under the watcher, it is patched in **1–2 s every time**.
+The condition the payload actually depends on is the one dyld already exposes, so the injector
+waits for `dyld_all_image_infos.libSystemInitialized` rather than for a non-empty image list.
+
+**On the gate path that wait becomes a single assertion.** A process sitting in `connect`,
+`accept` or `read` finished dyld startup long ago, so a negative answer there is not a target to
+wait for — it is something unaccounted for, and the useful response is to say so and let the
+process run. The gate path also skips the closing image-list check, which exists to catch a
+`dlopen` into an address space an exec is about to replace: the gated thread is suspended, so no
+exec can race it, and the check costs 0.135 ms of a hold on a frozen process.
+
+The done flag is polled at **100 µs** on both paths rather than 100 ms, because the target is
+frozen for the whole wait; that alone takes a cold injection against a ready target from ~126 ms
+to ~18 ms of wall time.
 
 "Timed out" and "dlopen returned NULL" are symptoms rather than causes, so the injector reports
 the cause underneath each:
@@ -225,54 +541,97 @@ the cause underneath each:
 - Stage 2 calls `dlerror()` when `dlopen` returns NULL and stores the string pointer; the
   injector reads the message out of the target and prints it.
 
-Injecting unconditionally means the library goes into every process, including ones that will
-never open a socket. That is deliberate: nothing can know in advance which processes will use
-TLS, so any filter on that is a guess, and the guess is what left Safari's networking service
-permanently unpatched. Measured cost of not guessing, on 10.9.5: **1.65 ms** added to a process
-launch (60 launches, 131 ms → 230 ms) and **0.33 ms** per launch to a shell spawning processes
-back to back (200 launches, 254 ms → 320 ms, the injection being asynchronous).
+**Nothing waits for `Security.framework`, at any point.** The library sits inert in a process
+that never does TLS and starts working the moment one does, so there is no framework to gate on —
+which is what lets the gate be about the *network* rather than about what the process has loaded.
 
-The watcher runs from `/Library/LaunchDaemons/org.aquatransport.watch.plist` with
-`RunAtLoad`/`KeepAlive`, so it starts at boot and is restarted if it exits. It needs no
-system auditing and no auditd.
+### Reaching a target of the other architecture
 
-**Why not the audit pipe.** The kernel's BSM audit pipe delivers a record per exec, but on
-10.9.5 its subject token identifies the new process only for `fork`+`execve`. For
-`posix_spawn` the subject is the process that *called* `posix_spawn`, the child's pid appears
-in no token at all (`AUT_PROCESS` and the `AUT_ARG` pid token are both absent), and the path
-token is the *child's* executable — so a `posix_spawn` record pairs the parent's pid with the
-child's path.
+Resolved dyld-cache addresses and the `pthread_attr_t` layout are both architecture-specific, so
+a slice can only inject targets of its own kind. `aqwatch` is one slice, so for the others it
+keeps a single `aqinject --helper` running under the other architecture and hands it pids over a
+socketpair — one process spawn per boot rather than one per target, which matters because a
+`posix_spawn` per injection measured **1.7 ms**, a third of the budget for a whole gated
+injection, with the target frozen for every millisecond of it.
 
-Anything driven off it therefore injects into the parent while believing it is the child, and
-misses every `posix_spawn` launch — which on 10.9 is nearly every application and XPC service
-launchd starts. It also cannot see its own injector spawns for what they are, so a daemon that
-spawns `aqinject` reads the resulting record as naming itself.
-
-Polling the process list has neither problem: it sees a process however it was created, and
-depends on no privileged record format.
-
-Verified on 10.9.5, x86_64: a freshly launched process is loaded into within about 500 ms,
-whether it was started by `fork`+`execve` or by `posix_spawn`; at idle the daemon holds no
-injectors. Verified on 10.6.8, i386 and x86_64: a freshly launched process goes from
-`FAIL err=-9836` on its first request to `HTTP 404`, with no manual step. Across a reboot the
-LaunchDaemon starts the watcher early (observed as an init-time pid) and newly launched
-processes are loaded into the same way.
-
-There is an inherent window: a process that completes a TLS handshake within the first ~100 ms
-of starting can do so before the watcher loads the library into it. This is fundamental to
-loading a library into a process after it has already started, and it is the price of never
-touching the process's launch. The window is bounded by the poll interval alone; nothing about
-it depends on when the process gets round to loading `Security.framework`.
+It is started on first need rather than at startup: on a machine whose processes are all one
+architecture it is never wanted, and the socket carries a pid and a mode, never a path, so
+nothing on that channel can name a file to load.
 
 ### Flags
 
-`flags.txt` in `/usr/share/aquatransport/` holds one flag name per line, read at runtime by
-every loaded copy of the library. Two flags are recognised:
+`flags.txt` in `/usr/share/aquatransport/` holds one flag per line. The library reads its own
+at runtime, on every mtime change:
 
 ```
-disabled-mtls   # hand client-certificate connections back to the system stack
-debug           # log handshakes to /tmp/aquatransport-<uid>.log
+disabled-mtls      # hand client-certificate connections back to the system stack
+debug              # log handshakes to the system log, tagged AquaTransport
+allow-legacy-tls   # negotiate TLS 1.0/1.1 and the legacy suites, and let a refused
+                   # connection be retried on the system stack
 ```
+
+### What the engine will negotiate, and the one flag that changes it
+
+The package exists so that an old machine gets modern TLS, so the default is modern TLS and
+nothing else:
+
+| | default | with `allow-legacy-tls` |
+|---|---|---|
+| protocol | TLS 1.2, TLS 1.3 | TLS 1.0 – 1.3 |
+| cipher suites (≤1.2) | `HIGH:!aNULL:!eNULL:!EXPORT:!3DES:!RC4:!MD5:!PSK:!SRP` | `ALL` |
+| security level | 1 — a floor under key sizes, notably DH ≥ 1024 bits | 0 — no floor at all |
+
+Measured against `badssl.com` with the defaults: `tls-v1-0` and `tls-v1-1` refused, `tls-v1-2`
+accepted; `3des`, `rc4`, `null` and `dh512` refused; `dh1024` accepted, which is where security
+level 1 puts the line. Every ordinary host is unaffected.
+
+**Security level is what puts a floor under key sizes**, and it is the reason level 0 is not the
+default any more. A cipher list says which suites may be negotiated; it says nothing about the
+size of the Diffie-Hellman group the server picks. At level 0 there is no minimum, so an engine
+advertising TLS 1.3 could still be talked into a 512-bit group — the Logjam case. Level 1 sets
+that floor at 1024 bits.
+
+`allow-legacy-tls` is read **per connection**, so editing `flags.txt` applies to the next
+handshake rather than the next reboot, and it is set on the `SSL` rather than the `SSL_CTX` so
+turning it off again needs no restart either. It exists for a server the defaults will not talk
+to — an appliance or an intranet host still on TLS 1.0 — and it gives up exactly what the
+defaults buy.
+
+**The same flag also decides whether a refusal is final**, because that is the same question
+asked from the other end. By default it is: CFNetwork retries a failed handshake, and answering
+that retry with the system stack would let a server this engine just rejected be accepted a
+moment later, so the weakest stack on the machine would get the last word on every security
+decision this one makes. That is not theoretical — it is what made Qualys' client test report
+this machine as Logjam-vulnerable while simultaneously reporting TLS 1.3: the engine refused the
+512-bit-DH probe, and Secure Transport completed it on the retry.
+
+Splitting the two into separate flags was a mistake worth naming, because the combination that
+looks most cautious is the one that is not: refusing to negotiate an obsolete protocol while
+still permitting the system stack to negotiate it on the retry reaches the server anyway, on
+worse terms, and reports nothing. So there is one flag. Either an obsolete server is worth
+reaching or it is not.
+
+The fallback half is only observable when the caller retries **on the same `SSLContext`**.
+CFNetwork does that on some paths and not others, so a single synchronous request shows no
+difference either way; the debug log names which behaviour is in force on every refusal.
+
+and the daemon reads these **once, at startup** — the D program is compiled when it arms, so a
+changed rate or exclusion means `launchctl unload` and `load`, and pretending otherwise by
+re-reading the file would be worse than saying so:
+
+| flag | effect |
+|---|---|
+| `gate-off` | arm nothing; load the library at exec instead. The escape hatch — it reopens the window the gate closes, which is why it is not the default. |
+| `gate-rate=<n>hz` | how often gate records are collected (default `50hz`) |
+| `gate-hold-ms=<n>` | watchdog deadline for one hold (default 250) |
+| `gate-never=<name>` | never gate a process with this executable name |
+| `gate-inetd=<name>` | this executable is handed an already-connected socket |
+| `gate-resume-suspended` | let the suspend-count scan resume every suspended thread it finds, not only the ones it can attribute |
+| `gate-test-stall-ms=<n>` | stall the injection deliberately. Only `tools/gatetest.sh` sets it: a 2–6 ms window cannot be raced reliably, so the watchdog, journal and kill-safety cases arrange it instead. |
+
+`gate-never` and `gate-inetd` take **full** executable names. The daemon truncates them to what
+`execname` actually reports when it generates the `BEGIN` block; an operator must never have to
+count characters.
 
 `tf_flag()` (`aquatransport_config.c`) reports whether a name is a line in `flags.txt`;
 `selftest.sh` exercises the mechanism through `debug`. To stop the engine entirely, uninstall
@@ -371,8 +730,12 @@ DNS, SNI and certificate validation against the rewritten host, and `http://` ru
 
 ### How the rewriter works, and why it is pure C
 
-No process gating. Nothing is special-cased. The rewriter is compiled into the dylib and
-works by rebinding two CFNetwork functions at runtime.
+**The hooks are installed in every process the library reaches; the scoping is in the rules.**
+Nothing about a process decides whether the rewriter is active in it — it is compiled into the
+dylib and rebinds CFNetwork functions at runtime, in whatever process has them. What decides
+whether a *rule* fires is that rule's own scope line. There is no second, process-level deny
+mechanism anywhere in the rewriter, and the reason is the next few paragraphs: no property of a
+process is a safe thing to gate on here.
 
 It is pure C, not an Objective-C `NSURLProtocol` bundle, because loading Foundation and the
 ObjC runtime into a process that then forks without exec is fatal to the child:
@@ -423,11 +786,27 @@ uninitialised registers.
 
 ### The one list that remains, and why
 
-`ocspd`, `securityd`, `securityd_service`, `trustd` are excluded from the engine. That is
-not "things that happen to break" — it is a circular dependency: our verify path calls
-`SecTrustEvaluate`, which those processes *implement*. A re-entrancy guard
-(`tf_guard_enter`/`tf_reentrant`, pthread-specific rather than `__thread` for 10.6)
-handles the same-thread case; these four are where the cycle crosses a process boundary.
+`ocspd`, `securityd`, `securityd_service`, `trustd`. That is not "things that happen to break" —
+it is a circular dependency: our verify path calls `SecTrustEvaluate`, which those processes
+*implement*. A re-entrancy guard (`tf_guard_enter`/`tf_reentrant`, pthread-specific rather than
+`__thread` for 10.6) handles the same-thread case; these four are where the cycle crosses a
+process boundary.
+
+**One list, in `src/aquatransport_deny.h`, read by both subsystems that need it** — the
+library's own gate in `aquatransport_hooks_mac.c`, which matches `getprogname()` exactly, and
+`aqwatch`, which turns the same names into a D predicate against `execname`. They must match
+differently (the kernel truncates `execname`, `getprogname()` is not truncated), which is why
+the header carries **full** names and each consumer derives its own form. A name written out
+pre-truncated in one place and not the other is precisely the silent failure the header exists
+to prevent.
+
+**The library's gate is the real backstop.** `process_eligible()` runs *inside* the target: loaded
+into a trust daemon by any means, the library installs no hooks at all. The daemon's predicate is
+defence in depth — what it actually buys is not freezing and injecting a critical daemon for no
+benefit.
+
+Processes an operator wants kept away from the *gate* for their own reasons are a different
+mechanism with a different meaning: `gate-never=<name>` in `flags.txt`.
 
 Anything else misbehaving under injection is a bug in the engine to fix, not a name to add.
 
@@ -919,6 +1298,10 @@ tools/uploadprobe.c     # a POST big enough to fill that buffer, in-memory body 
 tools/bigbufprobe.c     # the sizes a direct Secure Transport caller may pass and CFNetwork never
                         # does: a megabyte through one SSLWrite, and an SSLRead buffer whose
                         # length does not fit in an int
+tools/gatetest/         # the gate's own subjects. Each prints its patched state immediately
+                        # before and after the syscall it is meant to be held at, which is the
+                        # assertion tools/gatetest.sh automates: patched=0 before, patched=1
+                        # after, the syscall successful, no EINTR, payload intact
 ```
 
 To demonstrate late loading end-to-end on the disposable test VM:
@@ -928,10 +1311,14 @@ To demonstrate late loading end-to-end on the disposable test VM:
 ./tlsprobe-loop &                       # prints FAIL err=-9836 every 2s
 sudo ./aqinject $! aquatransport.dylib  # same pid starts printing HTTP 404
 
-# into processes as they launch
-sudo ./aqwatch aquatransport.dylib ./aqinject &   # watcher
-./tlsprobe-loop                                   # a NEW process: FAIL, then HTTP 404, unaided
+# and through the gate, with nothing done by hand
+sudo ./install-macos.sh watch
+./tlsprobe-loop                         # a NEW process: HTTP 404 on its FIRST request
 ```
+
+The difference between those two is the whole point. Under the gate the first line is already
+`HTTP 404`: the process was frozen at its `connect` and the library was in place before the
+handshake could start.
 
 ## Coverage
 
@@ -940,7 +1327,26 @@ and Electron, Go, current bundled OpenSSL) are unreachable — but they also shi
 already, so they are not broken. The real gap is software linking the system's OpenSSL
 0.9.8, notably Python 2.7's `ssl` module: broken *and* unreachable by this design.
 
+Within that, coverage is "processes that use the network, from their first use of it". A
+process that never opens a socket never receives the library, and one that was already running
+when the daemon started is covered at its next connection — for something holding a long-lived
+one, that may be a long time, and restarting it or rebooting is the remedy.
+
 Re-loading is idempotent — `dlopen` of an already-loaded image returns the existing handle
-without re-running the constructor — so `aqinject --all` and the `aqwatch` per-launch load
-compose safely: running `inject` once to cover the current session and `watch` for everything
-launched afterward leaves no process loaded into twice in any harmful way.
+without re-running the constructor — so a redundant injection, which an eviction from the
+confirmed-patched set can cause, costs time and nothing else.
+
+### Known gaps
+
+Both are narrower than the gap the gate closes, and both are documented rather than papered
+over.
+
+**Descriptor passing over a unix socket (`SCM_RIGHTS`).** A process handed an already-connected
+socket at runtime rather than at spawn is caught by none of the three gates.
+`syscall::recvmsg:return`, latched once per thread, is the natural fourth; `recvmsg` is cold
+enough that its cost should resemble `connect` rather than `read`. Unlike the inetd case, which
+ships with 18 concrete plists, this one is speculative — worth measuring before adding, and only
+after finding a case where it matters on 10.9.
+
+**UDP / DTLS.** An unconnected UDP socket uses `sendto`/`recvfrom` with no `connect`. Gating
+`sendto` would be expensive and DTLS is close to nonexistent on this platform.

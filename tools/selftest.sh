@@ -27,16 +27,22 @@ pass=0; fail=0
 
 [ -f "$D" ] || { echo "no build -- run ./build-macos.sh"; exit 1; }
 
-# The "stock fails" cases launch a probe with no library inserted and require it to fail.
-# An installed aqwatch patches every process as it launches, this one included, so those
-# cases turn into passes-that-report-as-failures -- the suite ends up measuring the watcher
-# rather than the build. Refuse to run rather than report a confusing result.
-if ps ax -o command= 2>/dev/null | grep -q '[a]qwatch'; then
-    echo "aqwatch is running: it would inject into the 'stock' probes and make them succeed."
+# The "stock fails" cases launch a probe with no library inserted and require it to fail. An
+# installed aqwatch holds each of those probes at its first connect and loads the library
+# before letting it go, so those cases turn into passes-that-report-as-failures -- the suite
+# ends up measuring the daemon rather than the build. Refuse to run rather than report a
+# confusing result.
+#
+# Matched on the process name rather than on command lines, which any shell that happens to
+# mention the daemon would satisfy.
+if pgrep -x aqwatch >/dev/null 2>&1; then
+    echo "aqwatch is running: it would load the library into the 'stock' probes and make them succeed."
     echo "stop it first, then re-run:"
     echo "    sudo launchctl unload /Library/LaunchDaemons/org.aquatransport.watch.plist"
     echo "    ./tools/selftest.sh"
     echo "    sudo launchctl load -w /Library/LaunchDaemons/org.aquatransport.watch.plist"
+    echo
+    echo "The gate itself is tested separately, by tools/gatetest.sh, which needs the daemon."
     exit 1
 fi
 [ -x "$PROBE" ] || clang -arch x86_64 -arch i386 -mmacosx-version-min=10.6 -Wno-deprecated-declarations \
@@ -155,12 +161,17 @@ check "and it does fire for that other app" "scoped=wrongapp" \
 echo "== flags.txt =="
 # A flag is on when its name is a line in flags.txt. Exercise it through "debug", which makes
 # the engine log each handshake -- so a log line proves flags.txt is read and honoured.
-LOG="/tmp/aquatransport-$(id -u).log"
-rm -f "$LOG"
+#
+# The engine logs through ASL rather than to a file of its own, because a file under /tmp is
+# unreachable from a sandboxed target (see tf_log). That means the suite cannot clear the log
+# between cases, so each case scopes its read by sender and by the time it started. syslog(1)
+# reads ASL without root.
+since() { syslog -k Sender "$1" -k Time ge "$2" 2>/dev/null | grep AquaTransport; }
+t0=$(date +%s); sleep 1
 echo debug > "$T/flags.txt"
 run "$PROBE" https://api.twitter.com/ >/dev/null
-check "debug flag in flags.txt enables logging" "handshake" "$(grep 'httpsprobe\]' "$LOG" 2>/dev/null)"
-: > "$T/flags.txt"; rm -f "$LOG"
+check "debug flag in flags.txt enables logging" "handshake" "$(since httpsprobe $t0)"
+: > "$T/flags.txt"
 
 echo "== loading with no gate =="
 # The property the loader design rests on: loaded into a process with no CoreFoundation and no
@@ -175,13 +186,13 @@ done
 echo "== session resumption =="
 # Connection 1 is a full handshake; the rest should resume it. Asserted through the debug log
 # rather than by timing, so the result does not depend on how fast the network happens to be.
-rm -f "$LOG"
+t0=$(date +%s); sleep 1
 echo debug > "$T/flags.txt"
 AQUATRANSPORT_DIR="$T" DYLD_INSERT_LIBRARIES="$D" "$MULTIPROBE" https://www.cloudflare.com/robots.txt 3 >/dev/null 2>&1
-# Only this probe's lines: the log is shared per-uid with every other patched process.
-check "first connection is a full handshake" "full"    "$(grep 'multiprobe\]' "$LOG" 2>/dev/null | grep handshake | head -1)"
-check "later connections resume it"          "resumed" "$(grep 'multiprobe\]' "$LOG" 2>/dev/null | grep handshake | sed -n '2,3p')"
-: > "$T/flags.txt"; rm -f "$LOG"
+# Only this probe's own lines: the system log carries every patched process on the machine.
+check "first connection is a full handshake" "full"    "$(since multiprobe $t0 | grep handshake | head -1)"
+check "later connections resume it"          "resumed" "$(since multiprobe $t0 | grep handshake | sed -n '2,3p')"
+: > "$T/flags.txt"
 
 # The security property the cache must not break. Resumption skips the certificate message,
 # so a resumed session must never become a way round a rejection: every connection to a host
@@ -211,26 +222,24 @@ check "wrong.host rejected right after a valid host" "^0$" "$ok"
 
 # It must also actually fire, or the assertions above prove nothing about a cache that is
 # silently not caching. Six connections to one host: the first verifies, the rest hit.
-rm -f "$LOG"
+t0=$(date +%s); sleep 1
 echo debug > "$T/flags.txt"
 AQUATRANSPORT_DIR="$T" DYLD_INSERT_LIBRARIES="$D" "$MULTIPROBE" https://en.wikipedia.org/ 6 >/dev/null 2>&1
-nhit=$(grep 'multiprobe\]' "$LOG" 2>/dev/null | grep -c 'verify_chain.*cached ok')
+nhit=$(since multiprobe $t0 | grep -c 'verify_chain.*cached ok')
 check "chain cache hits after the first verification" "^[1-9]" "$nhit"
-: > "$T/flags.txt"; rm -f "$LOG"
+: > "$T/flags.txt"
 
 echo "== warm connections =="
 # Pooled requests reuse one connection, so the peer chain -- and therefore the trust decision --
 # cannot change between them. A SecTrustEvaluate is hundreds of milliseconds on an ECDSA chain
 # on 10.9 hardware, so it must happen once per connection, not once per request.
-rm -f "$LOG"
+t0=$(date +%s); sleep 1
 echo debug > "$T/flags.txt"
 AQUATRANSPORT_DIR="$T" DYLD_INSERT_LIBRARIES="$D" "$POOLPROBE" https://www.cloudflare.com/robots.txt 6 >/dev/null 2>&1
-# Count only this probe's lines: the log is shared per-uid, so any other patched process on
-# the machine writes into it too.
-ntrust=$(grep 'poolprobe\]' "$LOG" 2>/dev/null | grep -c build_trust)
-nconn=$(grep 'poolprobe\]' "$LOG" 2>/dev/null | grep -c 'handshake ok')
+ntrust=$(since poolprobe $t0 | grep -c build_trust)
+nconn=$(since poolprobe $t0 | grep -c 'handshake ok')
 check "trust is evaluated per connection, not per request" "^[0-2] " "$ntrust ($nconn connections)"
-: > "$T/flags.txt"; rm -f "$LOG"
+: > "$T/flags.txt"
 
 echo "== uploads =="
 # A request body large enough to fill the socket send buffer, which is the only thing here
@@ -275,6 +284,19 @@ cr_eng=$(AQUATRANSPORT_DIR="$T" DYLD_INSERT_LIBRARIES="$D" "$READCONTRACT" postm
 check "short-read contract matches stock" "^identical$" \
   "$([ -n "$cr_stock" ] && [ "$cr_stock" = "$cr_eng" ] && echo identical || echo differs)"
 [ "$cr_stock" = "$cr_eng" ] || diff <(echo "$cr_stock") <(echo "$cr_eng") | sed 's/^/        /'
+
+echo "== context adoption =="
+# The refusal half of taking over a context that was configured before the library loaded. The
+# working half is covered by tools/gatetest.sh against real hosts; this is the case that must NOT
+# work, and it belongs here rather than there because it depends on the library being ABSENT
+# while the setters run -- which a running gate would defeat by patching the subject at its
+# connect(), before it ever configures a context.
+ADOPTPROBE="$DIR/build/adoptprobe"
+[ -x "$ADOPTPROBE" ] || clang -arch x86_64 -mmacosx-version-min=10.6 -Wno-deprecated-declarations \
+    -framework Security -framework CoreFoundation -o "$ADOPTPROBE" "$DIR/tools/adoptprobe.c"
+ap_out=$("$ADOPTPROBE" "$D" 2>&1)
+check "a context configured before we loaded is adopted" "adopted \(SNI sent\)" "$ap_out"
+check "a context with no peer name is refused, not carried" "no peer name is refused" "$ap_out"
 
 echo "== deny list =="
 # The gate matches on process name, so a copy named ocspd must pass straight through.

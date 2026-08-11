@@ -5,8 +5,10 @@
 // of readable directories that /usr/share is on -- see the note in aquatransport_config.c.
 //
 // flags.txt holds one flag name per line. Recognised flags:
-//   debug           log handshakes to /tmp/aquatransport-<uid>.log
-//   disabled-mtls   hand client-certificate connections back to the system stack
+//   debug             log handshakes to the system log, tagged AquaTransport
+//   disabled-mtls     hand client-certificate connections back to the system stack
+//   allow-legacy-tls  negotiate TLS 1.0/1.1 and the legacy cipher suites, and let a refused
+//                     connection be retried on the system stack
 
 #ifndef AQUATRANSPORT_CONFIG_H
 #define AQUATRANSPORT_CONFIG_H
@@ -15,8 +17,8 @@ const char *tf_dir(void);
 int         tf_flag(const char *name);   // is <name> a line in flags.txt?
 
 // Diagnostics. tf_debug() is a no-op unless "debug" is in flags.txt; it reads the flag once
-// per process, so the check costs a branch in hot paths. tf_log appends to
-// /tmp/aquatransport-<uid>.log.
+// per process, so the check costs a branch in hot paths. tf_log goes to the system log, which
+// unlike a file of our own is reachable from a sandboxed target -- see tf_log for why.
 void tf_log(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
 int  tf_debug(void);
 
@@ -47,10 +49,5 @@ int tf_headerrules(const tf_headerrule **out);
 // Returns a newly allocated URL with `from` replaced by `to` when `url` starts
 // with a redirect rule's `from`, else NULL. Caller frees.
 char *tf_apply_redirect(const char *url);
-
-// Is `name` listed (one entry per line) in the given config file? Used for the
-// user-editable rewriter deny list, so a process that misbehaves can be excluded
-// without rebuilding. Missing file means "no".
-int tf_name_listed(const char *file, const char *name);
 
 #endif

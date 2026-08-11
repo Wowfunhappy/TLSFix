@@ -44,12 +44,25 @@ Accept-Encoding:
 
 ### flags.txt
 
-Each line names one optional behavior to turn on. Two are recognized:
+Each line names one optional behavior to turn on:
 
 ```
 debug
 disabled-mtls
+allow-legacy-tls
 ```
 
-- debug — log each secure connection to /tmp/aquatransport-<your-user-id>.log.
+- debug — log each secure connection to the system log (Console.app, or `syslog -k Sender <app>`). Look for lines tagged AquaTransport.
 - disabled-mtls — for apps that sign in with a client certificate. These normally work through AquaTransport; turn this on to hand them back to the system, the way they worked before, if one of them doesn't.
+- allow-legacy-tls — AquaTransport normally refuses the old, broken parts of TLS: versions 1.0 and 1.1, and cipher suites like 3DES and RC4. It also keeps that refusal final, rather than letting your Mac's own older software quietly complete the connection instead. Turn this on if some site or device on your network still needs the old way — it lifts both at once, because allowing one without the other would reach the server anyway and just not tell you. It applies from the next connection, with no restart.
+
+Changes to these take effect straight away, on the next connection.
+
+There is also a set of `gate-` flags that control the background daemon, which is what gets AquaTransport into an app before that app's first connection. The only one worth knowing about is `gate-off`, which turns that off — apps then get AquaTransport shortly after they launch instead of exactly when they need it, so a request made in the first moments of an app's life can slip through unfixed. It is there in case the daemon ever causes trouble. These are read when the daemon starts, so run:
+
+```
+sudo launchctl unload /Library/LaunchDaemons/org.aquatransport.watch.plist
+sudo launchctl load /Library/LaunchDaemons/org.aquatransport.watch.plist
+```
+
+after changing one. The rest are documented in docs/TECHNICAL.md.
