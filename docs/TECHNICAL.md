@@ -43,10 +43,7 @@ The build enforces three invariants, each guarding a failure that is silent at l
 ## Install
 
 ```
-./install-macos.sh check           # report whether the load command fits, change nothing
-sudo ./install-macos.sh stage      # copy files into place, patch nothing
-sudo ./install-macos.sh install    # stage, then patch Security.framework
-sudo ./install-macos.sh status     # what is installed, and what a process started now loads
+sudo ./install-macos.sh install    # place the files, then patch Security.framework
 sudo ./install-macos.sh uninstall  # restore Security.framework, then remove the files
 ```
 
@@ -146,44 +143,29 @@ the original inode puts it back at `0x7fff94de9000`. So restoring a *copy* leave
 loading Security from disk forever after an uninstall. Verified: after `uninstall`, inode, mtime
 and bytes all match the original.
 
-### One slice at a time
+### Every slice, including ppc
 
-Only the architectures the dylib itself has are patched. On 10.6 Security also carries a `ppc`
-slice for Rosetta, which is left untouched — a `ppc` process could not load an x86-only library,
-so a load command there would buy nothing.
+10.6's Security carries a `ppc` slice for Rosetta alongside `x86_64` and `i386`, and all three
+are patched. The `ppc` one gains a load command naming a library with no `ppc` slice, which dyld
+weakly skips: a few dozen bytes, no runtime effect, and less machinery than separating it out.
 
-Each slice is separated with `lipo`, patched on its own, and put back. When every patched slice
-comes back the same length, each is written into the exact bytes it came from and the fat
-container is never rebuilt — the result is byte-identical to patching the whole file at once,
-which is checked on 10.9.5. When a slice grows, because `insert_dylib` had to make room in a
-header with no padding to spare, the container is rebuilt with `lipo -create`, carrying each
-slice's original alignment through `-segalign`.
+`insert_dylib` takes the whole fat file in one pass, byte-swapping every field it writes against
+each slice's own magic, keeping each slice's alignment, and shifting later slices when one
+grows. A slice it cannot patch is counted and stepped over; only a file where *every* slice
+failed is an error. Growth is why it is handed the container rather than one slice at a time:
+10.6's Security has no header padding to spare, so the command cannot be placed without moving
+what follows it.
 
-Header padding is reported by `check` and gates nothing:
+The finished file is renamed over the original, so no launch ever sees a half-written framework.
 
-```
-x86_64: 712 bytes free (header 32 + commands 2808, first section at 3552) -- fits in the padding
-i386: 2328 bytes free (header 28 + commands 2508, first section at 4864) -- fits in the padding
-```
+`insert_dylib` is the only tool the installer needs. That matters more than it sounds: a stock
+10.6 has no `otool` and no `nm`, since they are Xcode tools and these are not development
+machines. Worth knowing before adding a check that reads a Mach-O — a tool that is absent
+returns nothing, nothing is indistinguishable from a real answer, and a missing `otool`
+reporting "no load command" blames the binary for the toolchain.
 
-### Reading Mach-O without Xcode
 
-A stock 10.6 has no `otool`: it is an Xcode tool, and the systems this targets are not
-development machines. Every check that reads a Mach-O therefore has a fallback, because a tool
-that is absent returns nothing, and nothing is indistinguishable from a real answer — an
-unreadable header reported as "0 bytes of padding" or "no load command" blames the binary for a
-missing tool. `lc_dump()` falls back to separating the slice with `lipo`, and the question that
-actually matters — is the load command there — falls back to searching the file's bytes for the
-path, which a load command stores as a literal string. `nm` gets the same treatment: it lists
-undefined symbols too, so no output at all means the tool did not run rather than the dylib
-exports nothing.
-
-### Verification, rollback and recovery
-
-After patching, the installer asks a process started *after* the patch what it loaded
-(`security list-keychains` under `DYLD_PRINT_LIBRARIES`) and re-links the original if the answer
-is no. That check depends on no Mach-O tooling and is the one that matters: it is the same
-question a user is asking.
+### Recovery
 
 If a patched Security ever stops the machine from booting, the original is a hard link beside
 it. From another volume or single-user mode:
@@ -193,9 +175,19 @@ ln -f /System/Library/Frameworks/Security.framework/Versions/A/Security.aquatran
       /System/Library/Frameworks/Security.framework/Versions/A/Security
 ```
 
-Patching invalidates the framework's code signature. Nothing on 10.6–10.9 validates it at load
-— there is no library validation on these systems — but `codesign -v` on Security.framework
-fails while the patch is installed.
+### The signature has to be removed, not left invalid
+
+Patching invalidates Security's code signature, and the installer passes `--strip-codesig` so
+that nothing is left to validate. A stale signature is the more dangerous of the two: the kernel
+validates the pages of a signed library as a signed process maps them, and kills the process
+when they do not match. Every signed application then dies before `main()`, while unsigned
+command-line binaries carry on unaffected — the whole failure presents as "applications will not
+open", with TLS probes still passing.
+
+Reproduced on 10.9.5 against a patched copy through `DYLD_FRAMEWORK_PATH`, with the system
+framework untouched: TextEdit is `Killed: 9` with the signature left in place and launches
+normally with it stripped. A test that exercises only unsigned binaries misses this entirely.
+
 
 ### What a patch does not reach
 
@@ -211,7 +203,27 @@ every loaded copy of the library. Two flags are recognised:
 ```
 disabled-mtls   # hand client-certificate connections back to the system stack
 debug           # log handshakes to /tmp/aquatransport-<uid>.log
+allow-legacy-tls # allow TLS 1.0/1.1 and their cipher suites
 ```
+
+`allow-legacy-tls` is read per connection rather than once per process, so it applies to connections
+opened after the file changes without restarting the application holding them. It lifts the pair
+set in `ossl_init`: the minimum protocol version drops from TLS 1.2 to TLS 1.0, and the cipher
+list widens from OpenSSL's default to `ALL` at security level 0. Both are needed together — the
+level decides whether a suite may be used once selected, the list decides what is offered, and
+either alone leaves the handshake failing.
+
+Anonymous suites are excluded in both modes (`!aNULL:!eNULL`). They carry no certificate, so a
+server answering with `AECDH-AES256-SHA` gets an encrypted connection that authenticates nobody
+and leaves the trust evaluation no chain to reject. Measured against `null.badssl.com`: it
+connects when they are offered and fails when they are not.
+
+Measured on 10.9.5 with default settings, `tls-v1-0.badssl.com:1010` and
+`tls-v1-1.badssl.com:1011` fail with `-9806` while `tls-v1-2.badssl.com:1012` and ordinary sites
+connect; with `allow-legacy-tls` the 1.0 and 1.1 endpoints connect (`TLSv1`,
+`ECDHE-RSA-AES256-SHA`). RC4 and 3DES stay unreachable either way, because the build is
+configured `no-legacy` and those algorithms are absent from the library rather than merely
+unlisted.
 
 `tf_flag()` (`aquatransport_config.c`) reports whether a name is a line in `flags.txt`;
 `selftest.sh` exercises the mechanism through `debug`. To stop the engine entirely, uninstall
@@ -352,6 +364,26 @@ The hook points come from experiment, not from headers, because these are privat
 |---|---|---|
 | synchronous | `CFURLConnectionSendSynchronousRequest` | arg 0 |
 | asynchronous | `CFURLConnectionCreateWithProperties` | arg 1 |
+| every CFURLRequest path | `CFURLRequestCreateMutableCopy` | arg 1 |
+| raw stream | `CFHTTPMessageCreateRequest` | arg 2, the URL |
+| raw stream | `CFHTTPMessageSetHeaderFieldValue` | arg 0 |
+
+The last two carry the raw-stream path: a client that builds a `CFHTTPMessage` and opens a
+stream on it reaches none of the `CFURLRequest` entry points. Such a message also carries only
+the headers its author set, so the request can go out with no `User-Agent`, which Wikipedia
+answers with an error rather than results.
+
+The message is taken at creation rather than at `CFReadStreamCreateForHTTPRequest`, because
+that function is one applications replace for themselves: Dictionary bundles a `ProxyFix.dylib`
+that interposes it to route requests through the system proxy. Two hooks on one symbol each
+call what they take to be the original, which is the other, and the pair recurses until the
+stack is gone. Creation is uncontended.
+
+The setter is hooked because a caller may set headers after the message exists:
+DictionaryServices stamps `User-Agent: AppleDictionaryService/208` over whatever is there. A
+write to a header a rule owns is dropped, leaving the rule's value in place; every other header
+is set as the caller asked. A rule therefore beats the application, which is what lets
+`headers.txt` replace a `User-Agent` an application insists on.
 
 The argument positions are the ones found by recording pointers returned from the
 request-creating functions and testing the funnel arguments for pointer **equality** — no

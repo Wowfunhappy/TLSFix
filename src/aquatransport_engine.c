@@ -16,6 +16,7 @@
 
 extern void tf_log(const char *fmt, ...);
 extern int  tf_debug(void);
+extern int  tf_flag(const char *name);
 
 // CoreFoundation and Security are linked lazily, so this library can be loaded into a process
 // that has not initialised them -- which is what lets it be loaded into any process at any
@@ -508,6 +509,21 @@ static int client_cert_cb(SSL *ssl, X509 **px509, EVP_PKEY **ppkey) {
 int ossl_init(Shadow *s) {
     s->ssl = SSL_new(gCtx);
     if (!s->ssl) return -1;
+    // "allow-legacy-tls" reaches back to what a 10.6-era server can speak: TLS 1.0 and 1.1, and the
+    // old cipher suites. Security level 0 is required alongside the list, because the level is
+    // what decides whether a suite may be *used* once selected, while the list decides what is
+    // offered; either alone leaves the handshake failing, on cipher overlap or on the crypto.
+    //
+    // Set on the connection rather than the context so the flag applies to connections opened
+    // after the file changes, without restarting the application holding them.
+    if (tf_flag("allow-legacy-tls")) {
+        SSL_set_security_level(s->ssl, 0);
+        SSL_set_min_proto_version(s->ssl, TLS1_VERSION);
+        // "ALL" would also offer the anonymous suites, which carry no certificate: a server
+        // answering with AECDH gets an encrypted connection that authenticates nobody, and
+        // there is no chain for the trust evaluation to reject. Excluded in every mode.
+        SSL_set_cipher_list(s->ssl, "ALL:!aNULL:!eNULL");
+    }
     SSL_set_ex_data(s->ssl, gSslExIdx, s);
     BIO *bio = BIO_new(gBioMeth);
     if (!bio) { SSL_free(s->ssl); s->ssl = NULL; return -1; }
@@ -695,15 +711,13 @@ static void do_ready(void) {
     if (gRsaMeth) { RSA_meth_set1_name(gRsaMeth, "aquatransport-seckey"); RSA_meth_set_priv_enc(gRsaMeth, rsa_seckey_priv_enc); }
     gCtx = SSL_CTX_new(TLS_client_method());
     if (gCtx) {
-        SSL_CTX_set_security_level(gCtx, 0);                          // allow legacy crypto / 1024-bit identities
-        SSL_CTX_set_min_proto_version(gCtx, TLS1_VERSION);            // TLS 1.0 .. 1.3
+        // TLS 1.2 and 1.3 only, at OpenSSL's own default security level and cipher list. That
+        // list excludes the legacy suites -- RC4, export grades, single DES -- so nothing weak
+        // is offered and a server cannot select one.
+        //
+        // The "allow-legacy-tls" flag lifts both, per connection, in ossl_init below.
+        SSL_CTX_set_min_proto_version(gCtx, TLS1_2_VERSION);
         SSL_CTX_set_max_proto_version(gCtx, TLS1_3_VERSION);
-        // Security level 0 permits the old suites but does not offer them: the default list
-        // still excludes them, so a TLS 1.0-only server sees nothing it can use and the
-        // handshake dies on cipher overlap rather than version. "ALL" restores the legacy
-        // suites; level 0 above is what makes them usable once selected. This pair is the
-        // whole reason a stock 10.6-era server stays reachable.
-        SSL_CTX_set_cipher_list(gCtx, "ALL");
         SSL_CTX_set_verify(gCtx, SSL_VERIFY_PEER, NULL);
         gSslExIdx = SSL_get_ex_new_index(0, NULL, NULL, NULL, NULL);
         SSL_CTX_set_cert_verify_callback(gCtx, verify_chain, NULL);

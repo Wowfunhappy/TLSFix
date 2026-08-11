@@ -34,6 +34,24 @@
 //
 //   CFURLConnectionSendSynchronousRequest   arg0 = CFURLRequestRef   (sync)
 //   CFURLConnectionCreateWithProperties     arg1 = CFURLRequestRef   (async)
+//   CFHTTPMessageCreateRequest              arg2 = CFURLRef          (raw stream)
+//   CFHTTPMessageSetHeaderFieldValue        arg0 = CFHTTPMessageRef  (raw stream)
+//
+// A client that builds a CFHTTPMessage and opens a stream on it reaches none of the
+// CFURLRequest entry points. Such a message also carries only the headers its author set, so
+// the request can go out with no User-Agent at all, which some servers answer with an error
+// instead of results.
+//
+// The message is taken at creation rather than at CFReadStreamCreateForHTTPRequest because that
+// function is one applications replace for themselves: Dictionary bundles a ProxyFix.dylib that
+// interposes it to route requests through the system proxy. Two hooks on one symbol each call
+// what they take to be the original, which is the other, and the pair recurses until the stack
+// is gone. Creation is uncontended.
+//
+// The setter is hooked because a caller may set headers after creating the message --
+// DictionaryServices stamps User-Agent: AppleDictionaryService/208 over whatever is there. A
+// write to a header a rule owns is dropped, leaving the rule's value; every other header is set
+// as the caller asked.
 
 #include "aquatransport_config.h"
 #include "../../deps/fishhook/fishhook.h"
@@ -63,6 +81,25 @@ static void resolve_once(void) {
 }
 static int resolved(void) { pthread_once(&g_resolve_once, resolve_once); return g_resolved; }
 
+// The CFHTTPMessage side, resolved the same way and for the same reason: a direct call would
+// make CFNetwork a load-time dependency of this library. Nothing else interposes these, so the
+// first definition in load order is CFNetwork's own.
+static void *(*p_MsgCreate)(CFAllocatorRef, CFStringRef, CFURLRef, CFStringRef);
+static void  (*p_MsgSetHeader)(void *, CFStringRef, CFStringRef);
+static CFURLRef (*p_MsgURL)(void *);
+static int g_msg_resolved;
+static pthread_once_t g_msg_once = PTHREAD_ONCE_INIT;
+
+static void resolve_msg_once(void) {
+    p_MsgCreate    = (void *(*)(CFAllocatorRef, CFStringRef, CFURLRef, CFStringRef))
+                     dlsym(RTLD_DEFAULT, "CFHTTPMessageCreateRequest");
+    p_MsgSetHeader = (void (*)(void *, CFStringRef, CFStringRef))
+                     dlsym(RTLD_DEFAULT, "CFHTTPMessageSetHeaderFieldValue");
+    p_MsgURL       = (CFURLRef (*)(void *))dlsym(RTLD_DEFAULT, "CFHTTPMessageCopyRequestURL");
+    g_msg_resolved = (p_MsgCreate && p_MsgSetHeader && p_MsgURL);
+}
+static int msg_resolved(void) { pthread_once(&g_msg_once, resolve_msg_once); return g_msg_resolved; }
+
 static char *cf_to_c(CFStringRef s) {
     if (!s) return NULL;
     CFIndex max = CFStringGetMaximumSizeForEncoding(CFStringGetLength(s), kCFStringEncodingUTF8) + 1;
@@ -79,6 +116,30 @@ static const tf_headerrule *match_headers(const char *url) {
         if (tf_scope_matches(rules[i].scope) && tf_glob_prefix(rules[i].pattern, url))
             return &rules[i];
     return NULL;
+}
+
+// Both request objects take their headers through a setter of the same shape, so the rule is
+// walked once here. A line with nothing after the colon removes the header: the setters take a
+// NULL value as removal, where an empty string would send the header with an empty value.
+typedef void (*hdr_set)(void *, CFStringRef, CFStringRef);
+
+static void apply_header_rule(const tf_headerrule *hr, void *target, hdr_set set) {
+    for (int i = 0; i < hr->nlines; i++) {
+        const char *line = hr->lines[i];
+        const char *colon = strchr(line, ':');
+        if (!colon || colon == line) continue;
+        char name[128];
+        size_t nl = (size_t)(colon - line);
+        if (nl >= sizeof name) continue;
+        memcpy(name, line, nl); name[nl] = 0;
+        const char *val = colon + 1;
+        while (*val == ' ' || *val == '\t') val++;
+        CFStringRef cn = CFStringCreateWithCString(NULL, name, kCFStringEncodingUTF8);
+        CFStringRef cv = *val ? CFStringCreateWithCString(NULL, val, kCFStringEncodingUTF8) : NULL;
+        if (cn) { set(target, cn, cv); tf_log("header %s: %s", name, val); }
+        if (cn) CFRelease(cn);
+        if (cv) CFRelease(cv);
+    }
 }
 
 // Applies the rules to an already-mutable request, in place. Returns 1 if anything
@@ -117,24 +178,7 @@ static int apply_rules(void *m) {
         if (s) CFRelease(s);
         tf_log("rewrite %s -> %s", before, after);
     }
-    if (hr) {
-        for (int i = 0; i < hr->nlines; i++) {
-            const char *line = hr->lines[i];
-            const char *colon = strchr(line, ':');
-            if (!colon || colon == line) continue;
-            char name[128];
-            size_t nl = (size_t)(colon - line);
-            if (nl >= sizeof name) continue;
-            memcpy(name, line, nl); name[nl] = 0;
-            const char *val = colon + 1;
-            while (*val == ' ' || *val == '\t') val++;
-            CFStringRef cn = CFStringCreateWithCString(NULL, name, kCFStringEncodingUTF8);
-            CFStringRef cv = CFStringCreateWithCString(NULL, val, kCFStringEncodingUTF8);
-            if (cn && cv) { p_SetHeader(m, cn, cv); tf_log("header %s: %s", name, val); }
-            if (cn) CFRelease(cn);
-            if (cv) CFRelease(cv);
-        }
-    }
+    if (hr) apply_header_rule(hr, m, (hdr_set)p_SetHeader);
     free(before); free(after);
     return 1;
 }
@@ -154,7 +198,7 @@ static void *rewritten(void *req) {
 
 // Hooks call through to the ORIGINAL captured by fishhook, so a request we rewrote is
 // never re-entered through the same hook.
-static fn6 o_SendSync, o_CreateWithProps, o_MutableCopy;
+static fn6 o_SendSync, o_CreateWithProps, o_MutableCopy, o_MsgCreate, o_MsgSetHeader;
 
 static void *my_SendSync(void *a, void *b, void *c, void *d, void *e, void *f) {
     void *m = rewritten(a);
@@ -168,6 +212,77 @@ static void *my_CreateWithProps(void *a, void *b, void *c, void *d, void *e, voi
     void *r = o_CreateWithProps(a, m ? m : b, c, d, e, f);
     if (m) CFRelease(m);
     return r;
+}
+
+// The raw-stream path: rules applied to the URL the message is built around, and to the message
+// once it exists.
+static void *my_MsgCreate(void *alloc, void *method, void *url, void *version, void *e, void *f) {
+    (void)e; (void)f;
+    if (!msg_resolved() || !url) return o_MsgCreate(alloc, method, url, version, e, f);
+
+    char *before = cf_to_c(CFURLGetString((CFURLRef)url));
+    if (!before) return p_MsgCreate((CFAllocatorRef)alloc, (CFStringRef)method,
+                                    (CFURLRef)url, (CFStringRef)version);
+
+    char *after = tf_apply_redirect(before);
+    const tf_headerrule *hr = match_headers(after ? after : before);
+
+    CFURLRef use = (CFURLRef)url;
+    CFStringRef ns = NULL;
+    CFURLRef nu = NULL;
+    if (after) {
+        ns = CFStringCreateWithCString(NULL, after, kCFStringEncodingUTF8);
+        nu = ns ? CFURLCreateWithString(NULL, ns, NULL) : NULL;
+        if (nu) { use = nu; tf_log("rewrite %s -> %s", before, after); }
+    }
+
+    void *msg = p_MsgCreate((CFAllocatorRef)alloc, (CFStringRef)method, use, (CFStringRef)version);
+    if (msg && hr) apply_header_rule(hr, msg, (hdr_set)p_MsgSetHeader);
+
+    if (nu) CFRelease(nu);
+    if (ns) CFRelease(ns);
+    free(before); free(after);
+    return msg;
+}
+
+// Does this rule set a header of this name? Compared case-insensitively, as header names are.
+static int rule_sets_header(const tf_headerrule *hr, const char *name) {
+    size_t n = strlen(name);
+    for (int i = 0; i < hr->nlines; i++) {
+        const char *colon = strchr(hr->lines[i], ':');
+        if (!colon) continue;
+        if ((size_t)(colon - hr->lines[i]) == n && strncasecmp(hr->lines[i], name, n) == 0) return 1;
+    }
+    return 0;
+}
+
+// A rule beats the application's own header.
+//
+// Setting headers when the message is created is not enough on its own: the caller sets its
+// own afterwards and overwrites them. DictionaryServices does exactly that, stamping
+// User-Agent: AppleDictionaryService/208 over the rule -- and that User-Agent is the whole
+// reason the request needs rewriting. Dropping the caller's value for a header the rule
+// controls leaves the rule's value, set at creation, in place.
+//
+// This is the setter, not the stream, deliberately: hooking CFReadStreamCreateForHTTPRequest
+// would be the natural place to have the last word, and it is the one function another library
+// here already interposes. Nothing contends for this one.
+static void my_MsgSetHeader(void *msg, void *name, void *value, void *d, void *e, void *f) {
+    if (!msg_resolved() || !msg || !name) { o_MsgSetHeader(msg, name, value, d, e, f); return; }
+
+    char *hn = cf_to_c((CFStringRef)name);
+    CFURLRef url = p_MsgURL(msg);
+    char *before = url ? cf_to_c(CFURLGetString(url)) : NULL;
+    if (url) CFRelease(url);
+    if (!hn || !before) { free(hn); free(before); p_MsgSetHeader(msg, (CFStringRef)name, (CFStringRef)value); return; }
+
+    char *after = tf_apply_redirect(before);
+    const tf_headerrule *hr = match_headers(after ? after : before);
+    int ours = (hr && rule_sets_header(hr, hn));
+    if (ours) tf_log("header %s kept from rule, caller overruled", hn);
+    free(hn); free(before); free(after);
+
+    if (!ours) p_MsgSetHeader(msg, (CFStringRef)name, (CFStringRef)value);
 }
 
 // The universal funnel. Measured on 10.9: every path makes a mutable copy of the request
@@ -190,7 +305,9 @@ void tf_rewrite_install(void) {
         { "CFURLRequestCreateMutableCopy",         (void *)my_MutableCopy,     (void **)&o_MutableCopy },
         { "CFURLConnectionSendSynchronousRequest", (void *)my_SendSync,        (void **)&o_SendSync },
         { "CFURLConnectionCreateWithProperties",   (void *)my_CreateWithProps, (void **)&o_CreateWithProps },
+        { "CFHTTPMessageCreateRequest",            (void *)my_MsgCreate,       (void **)&o_MsgCreate },
+        { "CFHTTPMessageSetHeaderFieldValue",      (void *)my_MsgSetHeader,    (void **)&o_MsgSetHeader },
     };
     // Also arms a dyld add-image callback, so CFNetwork loaded later still gets rebound.
-    rebind_symbols(r, 3);
+    rebind_symbols(r, 5);
 }
