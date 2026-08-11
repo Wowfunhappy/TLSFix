@@ -10,7 +10,7 @@ Two independent subsystems in one package:
 
 | Subsystem | What it does | Where it runs |
 |---|---|---|
-| TLS engine | Routes Secure Transport through OpenSSL: TLS 1.0–1.3, modern ciphers, OS-delegated trust | every process |
+| TLS engine | Routes Secure Transport through OpenSSL: TLS 1.0–1.3, modern ciphers, OS-delegated trust | every process that loads Security |
 | URL rewriter | Applies `redirects.txt` and `headers.txt` at the request layer | apps only (see gating) |
 
 Verified on 10.9.5 (51/51 local tests) and 10.6.8 (`NSURLSession` is 10.9+ and is
@@ -19,7 +19,7 @@ skipped there), both `x86_64` and `i386`.
 ## Build
 
 ```
-./build-macos.sh          # OpenSSL + dylib + loader tools (aqinject, aqwatch)
+./build-macos.sh          # OpenSSL + dylib, and the package root's root-only tools
 ./tools/selftest.sh       # per-process tests, installs nothing
 ```
 
@@ -28,8 +28,10 @@ needed to build.
 
 The build enforces three invariants, each guarding a failure that is silent at link time:
 
-1. **Both slices present.** The library needs an `i386` and an `x86_64` slice so aqinject can
-   load it into targets of either architecture; the build refuses without both.
+1. **Both slices present.** The library needs an `i386` and an `x86_64` slice to load in
+   processes of either architecture; the build refuses without both. A weak load command naming
+   a library with no slice for the process is skipped in silence, so a build missing one would
+   leave that architecture unpatched and say nothing.
 2. **Zero exported symbols.** Loaded into another process by any mechanism, the library must
    export nothing: a naive link exports 9252 symbols, the whole `SSL_*`/`EVP_*` namespace
    among them, which would interpose those names in the host.
@@ -41,24 +43,23 @@ The build enforces three invariants, each guarding a failure that is silent at l
 ## Install
 
 ```
-sudo ./install-macos.sh stage      # copy files into place, load nothing
-sudo ./install-macos.sh inject     # + load into every eligible running process now
-sudo ./install-macos.sh watch      # + a daemon that loads into each process as it launches
-sudo ./install-macos.sh uninstall  # remove the daemon, then the files
+./install-macos.sh check           # report whether the load command fits, change nothing
+sudo ./install-macos.sh stage      # copy files into place, patch nothing
+sudo ./install-macos.sh install    # stage, then patch Security.framework
+sudo ./install-macos.sh status     # what is installed, and what a process started now loads
+sudo ./install-macos.sh uninstall  # restore Security.framework, then remove the files
 ```
-
-The install spans two directories:
 
 | path | contents |
 | --- | --- |
 | `/usr/share/aquatransport/` | `aquatransport.dylib`, `flags.txt`, `headers.txt`, `redirects.txt` |
-| `/Library/AquaTransport/` | `aqinject`, `aqwatch`, `uninstall.sh` |
+| `/Library/AquaTransport/` | `insert_dylib`, `aquatransport.sh`, `uninstall.sh` — placed by the installer package, run by root |
 
-The split follows from who reads what. A target `dlopen`s the dylib and reads the rule files
-itself, so those reads happen under the *target's* sandbox, and
-`/System/Library/Sandbox/Profiles/system.sb` — imported by every sandboxed process — grants
-`file-read*` only for world-readable files under `/System`, `/usr/lib`, `/usr/share`,
-`/private/var/db/dyld` and `/Library/Filesystems/NetFSPlugins`:
+The split follows from who reads what. A patched process makes both of its reads itself — dyld
+maps the dylib at launch, and the library reads the rule files at runtime — so both happen under
+*that process's* sandbox, and `/System/Library/Sandbox/Profiles/system.sb`, imported by every
+sandboxed process, grants `file-read*` only for world-readable files under `/System`,
+`/usr/lib`, `/usr/share`, `/private/var/db/dyld` and `/Library/Filesystems/NetFSPlugins`:
 
 ```scheme
 (allow file-read*
@@ -66,203 +67,141 @@ itself, so those reads happen under the *target's* sandbox, and
                     (require-any ... (subpath "/usr/share") ...)))
 ```
 
-A `deny default` daemon — WebKit's `webpushd` is one — reads nothing outside that set, and a
-`dlopen` it cannot satisfy leaves it running unpatched with a kernel log line as the only
-trace:
+A `deny default` daemon — WebKit's `webpushd` is one — reads nothing outside that set. The load
+command is weak, so a read the sandbox denies is not an error: the process starts normally and
+runs unpatched, with a kernel log line as the only trace.
 
 ```
 Sandbox: webpushd(715) deny file-read-data /usr/share/aquatransport/aquatransport.dylib
 ```
 
-The `(file-mode #o0004)` clause is why the installers set 0644 on these files and 0755 on the
-directory: a stricter mode is readable to root alone, and every sandboxed target goes
-unpatched. `aqinject` and `aqwatch` face none of this — root runs them from outside any
-sandbox — so they live in `/Library/AquaTransport`.
+That silence is what makes the location load-bearing rather than a matter of taste: a path
+outside the grant leaves every sandboxed application unfixed and says nothing. `/Library`
+carries no grant at all, which is why nothing a sandboxed process needs is kept there —
+`insert_dylib` and the installer script go there because only root ever runs them.
 
-Not every sandboxed process is this restricted. `application.sb`, which backs the app sandbox,
-carries a blanket `(allow file-read* (subpath "/Library"))`, and WebKit's `WebProcess` and
-`NetworkProcess` profiles reach the dylib as well. `/usr/share` is what the whole range of
-them share.
+The `(file-mode #o0004)` clause is why the installer sets 0644 on these files and 0755 on the
+directory: a stricter mode is readable to root alone, and every sandboxed process goes
+unpatched. Not every sandboxed process is this restricted — `application.sb`, which backs the
+app sandbox, carries a blanket `(allow file-read* (subpath "/Library"))` — but `/usr/share` is
+what the whole range of them share.
 
-The library is loaded into a process by `aqinject` (`tools/aqinject.c`) — `task_for_pid`
-plus a hand-built `mach_inject` — using the target's own `dlopen`. It edits no system launch
-configuration, so a faulty library is confined to the process it is loaded into and can never
-keep the machine or another process from starting.
+### The load command
 
-- **`inject`** loads the library into every eligible process running at the time. It reaches
-  GUI apps and daemons alike, and covers what is running when it runs.
-- **`watch`** installs `aqwatch` (`tools/aqwatch.c`) as a LaunchDaemon (started at each boot).
-  It loads the library into each process as the process launches, so it also covers processes
-  started later, with the same per-process confinement as `inject`. This is the recommended
-  path to full coverage; run `inject` once alongside it for the current session. See *A
-  launch-time watcher* below.
+`Security.framework` names the dylib in an `LC_LOAD_WEAK_DYLIB`, so every process that loads
+Security loads the library too, as a dependency, before it runs a line of its own code. Nothing
+is injected, no daemon runs, and there is no window between a process starting and being
+covered.
 
-### Loading into a running process (aqinject)
+Security is not one choice among several. `SSLHandshake`, `SSLRead` and the rest of Secure
+Transport *are* Security.framework exports, so the set of processes that load Security is
+exactly the set that could call them. CFNetwork sits above Security and would miss direct
+Secure Transport clients; anything below it — CoreFoundation, libSystem — is loaded by
+processes that will never open a socket. Measured on 10.9.5, 46 of 60 sampled running processes
+load Security, so this is not much narrower than "everything" in practice; what it buys is
+exactness and timing, not a smaller number.
 
-`aqinject` loads the compatibility library into a cooperating process the administrator
-already runs on a machine they own; the payload is loaded by the target's own `dlopen`.
-`pthread_create_from_mach_thread` does not exist before 10.7, so its effect is rebuilt by
-hand — every step below is validated on 10.6.8, i386 and x86_64:
+Three details make the difference between a load command that works and one that appears to:
 
-1. `task_for_pid` for the target task port (root only).
-2. Allocate in the target a payload page (context + a detached `pthread_attr_t` + the path +
-   two shellcode blobs), a bootstrap stack, and a TSD page.
-3. `thread_create_running` a **bare** mach thread. A bare mach thread has no thread-local
-   storage, and almost all libc — `errno`, `malloc`, dyld — faults without it. So stage 1
-   first sets the `%gs` base with the `thread_fast_set_cthread_self` machdep trap (call #3:
-   x86_64 `syscall` `rax=0x03000003`; i386 `int $0x82` `eax=3`), pointing it at a
-   self-referential TSD page. That is the minimum to make one further libc call safe.
-4. That one call is `pthread_create(&tid, detached_attr, stage2, &ctx)`. The kernel builds a
-   real pthread — its stack and struct come from the kernel, not `malloc` — so stage 2 runs
-   with complete TLS.
-5. Stage 2 calls `dlopen(path, RTLD_NOW|RTLD_GLOBAL)`; our constructor installs the hooks via
-   fishhook, then records the handle and a done flag the injector polls.
+- **The compatibility version must be 0.** dyld refuses a dependency whose compatibility
+  version is lower than the one the load command demands, and a *weak* dependency it refuses is
+  mapped but never initialised — the library shows up in `DYLD_PRINT_LIBRARIES` and does
+  nothing at all. `insert_dylib` writes 0, which is why the installer uses it rather than
+  editing the header itself.
+- **Weak, not strong.** A missing dylib is then skipped and every process still starts. That
+  covers deletion and a sandbox denial; it does not cover a library that crashes in its
+  constructor, which takes down everything that loads Security.
+- **The dependency is circular** — the library links Security, and Security now names the
+  library — and dyld handles it. Loading does not recurse, because an image is registered
+  before its own dependencies are walked; binding happens for the whole launch batch before any
+  initialiser runs, and needs Security mapped rather than initialised. Initialisation is where a
+  cycle could bite, since dyld returns on re-entering an in-progress image, and here it cannot:
+  Security has no initialiser at all on 10.9.5 (no `__mod_init_func`, no `LC_ROUTINES`, in
+  either slice), and the library's constructor calls nothing in Security. It rebinds by name,
+  and resolves the original entry points lazily on the first hooked call — see *How the hooks
+  are installed*.
 
-Two facts make it reliable. **The dyld shared cache is at the same fixed address in every
-process of a given arch on 10.6–10.9**, so `dlopen`/`pthread_create` resolved in the injector
-are valid in the target; it is verified byte-for-byte before use, and refused on mismatch.
-**Each fat slice loads only same-arch targets** and spawns the matching slice for a target of
-the other arch, so resolved addresses and the `pthread_attr_t` layout are always arch-correct.
+### Loading from disk instead of the shared cache
 
-**No safety gate.** Injection is unconditional: `aqinject` does not require the target to have
-loaded `Security.framework`, and nothing waits for a framework to appear.
+Security.framework lives in the dyld shared cache, and dyld uses the cached copy only while the
+file on disk still matches the inode and mtime the cache recorded. Patching the file breaks
+that match, so every process loads Security from disk instead. Demonstrated by touching the
+mtime alone, with no edit: the image moves from `0x7fff94de9000`, inside the shared region, to
+`0x10bb92000`.
 
-That is safe because the library links CoreFoundation and Security *lazily* (`-lazy_framework`,
-see `build-macos.sh`), so loading it into a process pulls in neither — no framework initializer
-runs, and `CFInitialize`, which traps when first run late on a secondary thread, is never
-reached. Its hooks are rebound by name, which requires nothing to be loaded, and fishhook
-rebinds the call sites if and when Secure Transport arrives. The library therefore sits inert
-in a process that never does TLS and starts working the moment one does. The trigger is an
-event, not a timeout.
+That is the standing cost of this approach. Measured on 10.9.5 over 40 launches of a program
+linking Security and CoreFoundation and nothing else: **+0.8 ms per launch**. Treat that as a
+floor rather than the figure for a real application — an image outside the cache loses the
+prebound cross-image pointers dyld ships in it, and that loss grows with the number of loaded
+images importing Security, which was two here.
 
-A gate on `Security.framework` would have to predict *when* a process loads it, which is
-unanswerable: a process loads Security when it first needs TLS, and for Safari's shared WebKit
-networking service that is when the user first navigates — arbitrarily long after launch. A
-freshly launched `com.apple.WebKit.Networking` on 10.9.5 still has no `Security.framework`
-1500 ms in. No timeout is long enough, because there is no deadline to be right about.
+It is also why the installer preserves the original as a **hard link** beside it rather than a
+copy. A hard link keeps the original inode and mtime, so re-linking it at the framework's path
+puts Security back on the shared cache exactly as it was.
 
-Lazy linking forbids *data* references to those frameworks — the linker rejects them outright
-("illegal data reference to `_kCFTypeArrayCallBacks` in lazy loaded dylib"). There are exactly
-two in this code, both avoided: `kCFTypeArrayCallBacks` is looked up by name, and the constant
-CFString behind `CFSTR("Host")` (a reference to `___CFConstantStringClassReference`) is built
-at runtime. A new one fails the build rather than silently restoring eager loading.
+Both halves of that matter, and the inode is the one worth demonstrating, since a restore that
+gets the content right is easy to assume is complete. A byte-identical copy carrying the
+original's exact mtime, differing only in inode, loads from disk at `0x103acb000`; re-linking
+the original inode puts it back at `0x7fff94de9000`. So restoring a *copy* leaves every process
+loading Security from disk forever after an uninstall. Verified: after `uninstall`, inode, mtime
+and bytes all match the original.
 
-Verified on 10.9.5, x86_64, by `tools/latecheck.c`: loaded into a process with **no
-CoreFoundation and no Security**, both stay absent; CFNetwork is then brought in afterwards and
-a request to `api.twitter.com` returns HTTP 404 — which stock Secure Transport on 10.9 cannot
-do (-9824). The same holds when the injection comes from `aqwatch` rather than the process
-itself, for both `fork`+`execve` and `posix_spawn` launches.
+### One slice at a time
 
-Injection is therefore unconditional: `--all` walks every process, skipping only pid 0/1 and
-the trust-daemon deny list. Verified on 10.6.8 under the older gated build: `--all` loaded into
-31 live processes (Dock, Finder, SystemUIServer, coreservicesd among them) with zero crashes.
+Only the architectures the dylib itself has are patched. On 10.6 Security also carries a `ppc`
+slice for Rosetta, which is left untouched — a `ppc` process could not load an x86-only library,
+so a load command there would buy nothing.
 
-`inject`/`aqinject --all` cover processes running when they run. To cover processes started
-later, `watch` runs the launch-time watcher described next.
+Each slice is separated with `lipo`, patched on its own, and put back. When every patched slice
+comes back the same length, each is written into the exact bytes it came from and the fat
+container is never rebuilt — the result is byte-identical to patching the whole file at once,
+which is checked on 10.9.5. When a slice grows, because `insert_dylib` had to make room in a
+header with no padding to spare, the container is rebuilt with `lipo -create`, carrying each
+slice's original alignment through `-segalign`.
 
-### A launch-time watcher (aqwatch)
+Header padding is reported by `check` and gates nothing:
 
-`aqwatch` loads the library into each process as it launches, giving coverage of
-later-started processes with the same per-process confinement `aqinject` has. It polls the
-kernel's process list (`proc_listpids`) every 100 ms and treats any pid it has not seen
-before as a launch, keeping the seen-set as a bitmap over the pid space so a pid that exits
-clears itself on the next sweep. For each new process that is not the daemon itself, one of
-its own children, pid 0/1, or a trust daemon, `aqwatch` runs
-`aqinject <pid> <dylib>`. In-flight `aqinject`
-children are capped and reaped so an app-launch storm cannot fork-bomb the machine. The
-deny list is applied to `proc_pidpath` of the pid, so it matches what the process actually
-is rather than anything the daemon was told.
+```
+x86_64: 712 bytes free (header 32 + commands 2808, first section at 3552) -- fits in the padding
+i386: 2328 bytes free (header 28 + commands 2508, first section at 4864) -- fits in the padding
+```
 
-**One injection per launch, and a failure is reported rather than worked around.** `aqinject`
-waits for the target to be ready and then confirms, by reading the target's own dyld image
-list, that the library actually arrived; it exits 0 only then. `aqwatch` acts on that status
-and does not try again.
+### Reading Mach-O without Xcode
 
-There is deliberately no retry loop and no periodic re-check. Either the injection lands, in
-which case repeating it buys nothing, or it does not, in which case the useful response is a
-log line naming the pid and the reason — not a schedule of further attempts that would hide
-how often the first one misses. Anything that leaves a live process without the library,
-including the one path where no injector runs at all (`MAX_INFLIGHT` exhausted), writes a
-`NOT PATCHED` line to `/var/log/aquatransport.log` (0600, bounded and truncated in place while
-running).
+A stock 10.6 has no `otool`: it is an Xcode tool, and the systems this targets are not
+development machines. Every check that reads a Mach-O therefore has a fallback, because a tool
+that is absent returns nothing, and nothing is indistinguishable from a real answer — an
+unreadable header reported as "0 bytes of padding" or "no load command" blames the binary for a
+missing tool. `lc_dump()` falls back to separating the slice with `lipo`, and the question that
+actually matters — is the load command there — falls back to searching the file's bytes for the
+path, which a load command stores as a literal string. `nm` gets the same treatment: it lists
+undefined symbols too, so no output at all means the tool did not run rather than the dylib
+exports nothing.
 
-That log is only worth reading if it is quiet when nothing is wrong, so the outcomes that are
-expected rather than wrong are classified as such and stay out of it. A target that exits
-part-way through is the ordinary end of most injections — every shell command is one — and it
-is distinguished from a fault at each point it can happen: no task port, no dyld startup, a
-failed `mach_vm_write`, a failed `thread_create_running`. A process that is merely quitting
-answers `kill(pid, 0)` exactly as a running one does, so the liveness test reads `p_stat` and
-treats a zombie as gone, and a failed `task_for_pid` is retried briefly before being believed.
-Measured over ~480 short-lived process launches plus eight forced relaunches of Safari's
-networking service: **zero bytes logged**.
+### Verification, rollback and recovery
 
-### Injecting before libSystem is initialized
+After patching, the installer asks a process started *after* the patch what it loaded
+(`security list-keychains` under `DYLD_PRINT_LIBRARIES`) and re-links the original if the answer
+is no. That check depends on no Mach-O tooling and is the one that matters: it is the same
+question a user is asking.
 
-`aqinject` waits for the target to finish exec'ing before touching it, and the condition it
-waits for has to be the right one. dyld publishes `infoArray` *as it loads*, so
-`infoArrayCount` goes positive early — while dyld is still working, and **before libSystem's
-initializer has run**. Measured on 10.9.5, a `com.apple.WebKit.Networking` launch spends
-**14–51 ms** with an image list published (225 images) and `libSystemInitialized` still false.
-`aqwatch` fires the moment a pid appears in the process list, so it lands inside that window.
+If a patched Security ever stops the machine from booting, the original is a hard link beside
+it. From another volume or single-user mode:
 
-Injecting there asks a process whose pthread subsystem is not yet initialized to run
-`pthread_create` off a bare mach thread with a hand-built TSD. It fails, and it fails
-invisibly: stage 1 gets a non-zero return, stage 2 never runs, no `dlopen` is ever attempted,
-and the injector sits out its entire wait and reports a timeout. Sampling a target caught in
-this state shows exactly that — the stage-1 bootstrap thread spinning at its `jmp`, no stage-2
-thread in existence, and the library unmapped, in a process that is otherwise completely idle.
+```
+ln -f /System/Library/Frameworks/Security.framework/Versions/A/Security.aquatransport-original \
+      /System/Library/Frameworks/Security.framework/Versions/A/Security
+```
 
-The condition the payload actually depends on is the one dyld already exposes, so
-`wait_for_exec` waits for `dyld_all_image_infos.libSystemInitialized` rather than for a
-non-empty image list. Measured over eight forced relaunches of Safari's networking process
-under the watcher, it is patched in **1–2 s every time**.
+Patching invalidates the framework's code signature. Nothing on 10.6–10.9 validates it at load
+— there is no library validation on these systems — but `codesign -v` on Security.framework
+fails while the patch is installed.
 
-"Timed out" and "dlopen returned NULL" are symptoms rather than causes, so the injector reports
-the cause underneath each:
+### What a patch does not reach
 
-- Stage 1 stores `pthread_create`'s return value in the payload (sentinel-initialised, so
-  success is distinguishable from "not reached"), and the injector reports it as an errno.
-- Stage 2 calls `dlerror()` when `dlopen` returns NULL and stores the string pointer; the
-  injector reads the message out of the target and prints it.
-
-Injecting unconditionally means the library goes into every process, including ones that will
-never open a socket. That is deliberate: nothing can know in advance which processes will use
-TLS, so any filter on that is a guess, and the guess is what left Safari's networking service
-permanently unpatched. Measured cost of not guessing, on 10.9.5: **1.65 ms** added to a process
-launch (60 launches, 131 ms → 230 ms) and **0.33 ms** per launch to a shell spawning processes
-back to back (200 launches, 254 ms → 320 ms, the injection being asynchronous).
-
-The watcher runs from `/Library/LaunchDaemons/org.aquatransport.watch.plist` with
-`RunAtLoad`/`KeepAlive`, so it starts at boot and is restarted if it exits. It needs no
-system auditing and no auditd.
-
-**Why not the audit pipe.** The kernel's BSM audit pipe delivers a record per exec, but on
-10.9.5 its subject token identifies the new process only for `fork`+`execve`. For
-`posix_spawn` the subject is the process that *called* `posix_spawn`, the child's pid appears
-in no token at all (`AUT_PROCESS` and the `AUT_ARG` pid token are both absent), and the path
-token is the *child's* executable — so a `posix_spawn` record pairs the parent's pid with the
-child's path.
-
-Anything driven off it therefore injects into the parent while believing it is the child, and
-misses every `posix_spawn` launch — which on 10.9 is nearly every application and XPC service
-launchd starts. It also cannot see its own injector spawns for what they are, so a daemon that
-spawns `aqinject` reads the resulting record as naming itself.
-
-Polling the process list has neither problem: it sees a process however it was created, and
-depends on no privileged record format.
-
-Verified on 10.9.5, x86_64: a freshly launched process is loaded into within about 500 ms,
-whether it was started by `fork`+`execve` or by `posix_spawn`; at idle the daemon holds no
-injectors. Verified on 10.6.8, i386 and x86_64: a freshly launched process goes from
-`FAIL err=-9836` on its first request to `HTTP 404`, with no manual step. Across a reboot the
-LaunchDaemon starts the watcher early (observed as an init-time pid) and newly launched
-processes are loaded into the same way.
-
-There is an inherent window: a process that completes a TLS handshake within the first ~100 ms
-of starting can do so before the watcher loads the library into it. This is fundamental to
-loading a library into a process after it has already started, and it is the price of never
-touching the process's launch. The window is bounded by the poll interval alone; nothing about
-it depends on when the process gets round to loading `Security.framework`.
+Processes already running keep the Security they mapped at launch, and a library already mapped
+survives both the file and the load command that named it. Newly launched processes are covered
+immediately; a reboot covers everything.
 
 ### Flags
 
@@ -288,10 +227,9 @@ Both subsystems rebind symbol pointers by name with fishhook (`deps/fishhook/`).
 
 Rebinding rewrites call sites rather than function bodies, so the "function too small,
 clobbers adjacent memory" failure that makes `SSLClose` unsafe under body-patching schemes
-cannot occur. The property that carries the injector work is this: **rebinding does not
-require the library to be present at process launch.** A library that arrives late — via
-`dlopen`, or loaded into a process that is already running — installs these hooks just as
-well. That is what makes `aqinject`/`aqwatch` possible.
+cannot occur. The property that carries the design is this: **rebinding does not require the
+library to be present at process launch.** A library that arrives late — as this one does in any
+process that reaches Security.framework through a `dlopen` — installs these hooks just as well.
 
 Measured on 10.6.8 and 10.9.5, `i386` and `x86_64`: a `dlopen`ed image successfully rebinds
 CFNetwork's calls into Secure Transport *after* those symbols have already been bound and
@@ -396,7 +334,8 @@ and raw CFNetwork clients while touching no Objective-C, no libdispatch and no F
 images bound after the interposing library is registered, and dyld registers it only for
 libraries inserted at launch. Measured on 10.9.5: the same dylib interposing `getppid`
 returns 4242 under `DYLD_INSERT_LIBRARIES`, and changes nothing when `dlopen`ed into a
-running process. That rules out static interposing for `aqinject`.
+running process. That rules out static interposing here, because a process that `dlopen`s
+Security gets this library at that moment rather than at launch.
 
 Interposing is also address-based — a tuple names a definition, not a name — so a hook
 cannot be installed before the target library is loaded and its symbols are addressable.
@@ -429,7 +368,8 @@ not "things that happen to break" — it is a circular dependency: our verify pa
 (`tf_guard_enter`/`tf_reentrant`, pthread-specific rather than `__thread` for 10.6)
 handles the same-thread case; these four are where the cycle crosses a process boundary.
 
-Anything else misbehaving under injection is a bug in the engine to fix, not a name to add.
+Anything else misbehaving with the library loaded is a bug in the engine to fix, not a name to
+add.
 
 ## The I/O contract
 
@@ -904,9 +844,6 @@ tools/poolprobe.m       # N POOLED requests over a reused connection -- the warm
                         # behind handshake and network time
 tools/latecheck.c       # loads the dylib into a process with no CoreFoundation/Security, then
                         # brings CFNetwork in afterwards: the no-gate property, end to end
-tools/tlsprobe-loop.c   # long-lived cooperating harness: requests api.twitter.com every 2s,
-                        # so you can load the library into it with aqinject and watch the
-                        # same live process go from FAIL to HTTP 404 without restarting
 tools/writecontract.c   # what SSLWrite answers when the transport will not take everything, by
 tools/readcontract.c    # starving an IO callback of its own; run against the stock stack these
                         # print the reference answers, and against the engine they must match.
@@ -921,16 +858,15 @@ tools/bigbufprobe.c     # the sizes a direct Secure Transport caller may pass an
                         # length does not fit in an int
 ```
 
-To demonstrate late loading end-to-end on the disposable test VM:
+To exercise the patch end-to-end without installing it, point one process at a patched copy of
+the framework. `AQ_SECURITY_PATH` patches a copy, `DYLD_FRAMEWORK_PATH` makes one process use
+it, and the system framework is never touched:
 
 ```
-# into one already-running process
-./tlsprobe-loop &                       # prints FAIL err=-9836 every 2s
-sudo ./aqinject $! aquatransport.dylib  # same pid starts printing HTTP 404
-
-# into processes as they launch
-sudo ./aqwatch aquatransport.dylib ./aqinject &   # watcher
-./tlsprobe-loop                                   # a NEW process: FAIL, then HTTP 404, unaided
+cp -R /System/Library/Frameworks/Security.framework /tmp/fw/
+sudo AQ_SECURITY_PATH=/tmp/fw/Security.framework/Versions/A/Security ./install-macos.sh install
+DYLD_FRAMEWORK_PATH=/tmp/fw ./build/httpsprobe https://api.twitter.com/   # HTTP 404
+./build/httpsprobe https://api.twitter.com/                               # FAIL err=-9824
 ```
 
 ## Coverage
@@ -940,7 +876,7 @@ and Electron, Go, current bundled OpenSSL) are unreachable — but they also shi
 already, so they are not broken. The real gap is software linking the system's OpenSSL
 0.9.8, notably Python 2.7's `ssl` module: broken *and* unreachable by this design.
 
-Re-loading is idempotent — `dlopen` of an already-loaded image returns the existing handle
-without re-running the constructor — so `aqinject --all` and the `aqwatch` per-launch load
-compose safely: running `inject` once to cover the current session and `watch` for everything
-launched afterward leaves no process loaded into twice in any harmful way.
+Coverage is decided at launch and holds from the process's first instruction: there is no
+interval in which a process is running but not yet covered. What a patch does not reach is
+processes that were already running when it was applied — they keep the Security they mapped,
+and a reboot is what clears them.

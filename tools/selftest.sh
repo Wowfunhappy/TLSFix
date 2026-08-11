@@ -27,16 +27,22 @@ pass=0; fail=0
 
 [ -f "$D" ] || { echo "no build -- run ./build-macos.sh"; exit 1; }
 
-# The "stock fails" cases launch a probe with no library inserted and require it to fail.
-# An installed aqwatch patches every process as it launches, this one included, so those
-# cases turn into passes-that-report-as-failures -- the suite ends up measuring the watcher
-# rather than the build. Refuse to run rather than report a confusing result.
-if ps ax -o command= 2>/dev/null | grep -q '[a]qwatch'; then
-    echo "aqwatch is running: it would inject into the 'stock' probes and make them succeed."
-    echo "stop it first, then re-run:"
-    echo "    sudo launchctl unload /Library/LaunchDaemons/org.aquatransport.watch.plist"
+# The "stock fails" cases launch a probe with no library inserted and require it to fail. An
+# installed patch loads the library into every process that loads Security, these probes
+# included, so those cases turn into passes-that-report-as-failures -- the suite ends up
+# measuring the installed patch rather than the build. Refuse to run rather than report a
+# confusing result.
+#
+# The load command stores the path as a literal string, so the file's bytes answer this without
+# otool, which a stock 10.6 does not have.
+SECBIN=/System/Library/Frameworks/Security.framework/Versions/A/Security
+if LC_ALL=C grep -q -a -F "$T/aquatransport.dylib" "$SECBIN" 2>/dev/null ||
+   LC_ALL=C grep -q -a -F /usr/share/aquatransport/aquatransport.dylib "$SECBIN" 2>/dev/null; then
+    echo "Security.framework is patched: the 'stock' probes would load the library and succeed."
+    echo "uninstall first, then re-run:"
+    echo "    sudo ./install-macos.sh uninstall"
     echo "    ./tools/selftest.sh"
-    echo "    sudo launchctl load -w /Library/LaunchDaemons/org.aquatransport.watch.plist"
+    echo "    sudo ./install-macos.sh install"
     exit 1
 fi
 [ -x "$PROBE" ] || clang -arch x86_64 -arch i386 -mmacosx-version-min=10.6 -Wno-deprecated-declarations \

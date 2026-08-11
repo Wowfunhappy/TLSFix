@@ -6,12 +6,12 @@
 //   1. Rebinding rewrites call sites instead of patching function bodies, so the
 //      "function too small, clobbers adjacent memory" problem does not arise and
 //      SSLClose/SSLDisposeContext are safe to hook.
-//   2. Rebinding does not require the library to be present at process launch. A library
-//      loaded late -- via dlopen, or loaded into an already-running process -- installs
-//      these hooks just as well. Measured on 10.6.8 and 10.9.5, i386 and x86_64: a dlopen'd
-//      image rebinds CFNetwork's calls into Secure Transport even after those symbols have
-//      already been bound and used. This is what lets aqinject/aqwatch load the library into
-//      a process after it has started.
+//   2. Rebinding does not require the library to be present at process launch. This library
+//      arrives with Security.framework, which names it in a load command, and plenty of
+//      processes reach Security through a dlopen long after CFNetwork has bound and used its
+//      Secure Transport imports. Measured on 10.6.8 and 10.9.5, i386 and x86_64: an image
+//      loaded at that point still rebinds CFNetwork's calls into Secure Transport, after
+//      those symbols have already been bound and used.
 //   3. install_ssl_hooks() decides per process whether to install anything, so a process on
 //      the trust-daemon deny list carries no hooks at all. The per-hook tf_on() gate still
 //      runs on every call, because tf_reentrant() is dynamic and cannot be decided at install
@@ -48,8 +48,8 @@
 // evaluation depend on trust evaluation. tf_reentrant() in the engine guards the
 // same-thread case; these are the processes where the cycle spans a process boundary.
 //
-// Nothing else is listed. If any other process misbehaves under injection, that is a bug
-// in the engine to fix, not a name to add here.
+// Nothing else is listed. If any other process misbehaves with the library loaded, that is a
+// bug in the engine to fix, not a name to add here.
 static const char *kDeny[] = {
     "ocspd", "securityd", "securityd_service", "trustd", 0
 };

@@ -1,51 +1,24 @@
 #!/bin/bash
 # AquaTransport uninstaller. Installed to /Library/AquaTransport/uninstall.sh
 #
-# Removes the watcher daemon, then the files. Because the library is loaded per-process and
-# nothing is written to launchd's global environment, this needs no reboot: once the daemon is
-# gone nothing new loads the library, and the files can be removed immediately. Processes that
-# already loaded it keep running with it until they exit -- a loaded library keeps working even
-# after the file backing it is deleted.
+# Restores Security.framework from the hard link kept beside it, which puts the original inode
+# and mtime back at that path and so returns every process to the shared cache copy, then
+# removes the installed files. aquatransport.sh does the work, so removing by package and
+# removing by hand take the same path.
+#
+# No reboot is needed for the machine to be back to stock, but processes already running keep
+# the library until they restart: a mapped image outlives both the file and the load command
+# that named it. A reboot clears every one.
 
 set -e
-DEST=/Library/AquaTransport
-LIBDIR=/usr/share/aquatransport
-PLIST_LABEL=org.aquatransport.watch
-PLIST="/Library/LaunchDaemons/$PLIST_LABEL.plist"
+DEST="$(cd "$(dirname "$0")" && pwd)"
 
 [ "$(id -u)" = "0" ] || { echo "run with sudo: sudo $0"; exit 1; }
-say() { echo "AquaTransport: $*"; }
+[ -x "$DEST/aquatransport.sh" ] || {
+  echo "AquaTransport: $DEST/aquatransport.sh missing; cannot uninstall automatically."
+  echo "Restore Security.framework by hand with:"
+  echo "  ln -f /System/Library/Frameworks/Security.framework/Versions/A/Security.aquatransport-original \\"
+  echo "        /System/Library/Frameworks/Security.framework/Versions/A/Security"
+  exit 1; }
 
-# ---- stop and remove the watcher -----------------------------------------------------
-if [ -f "$PLIST" ]; then
-  launchctl unload "$PLIST" 2>/dev/null || true
-  rm -f "$PLIST"
-  say "removed watcher daemon ($PLIST)"
-else
-  say "no watcher daemon installed"
-fi
-
-# ---- remove the files, keeping the user's rules --------------------------------------
-if [ -d "$LIBDIR" ]; then
-  if [ -f "$LIBDIR/redirects.txt" ] || [ -f "$LIBDIR/headers.txt" ]; then
-    BACKUP="/Library/AquaTransport-rules-backup"
-    mkdir -p "$BACKUP"
-    for f in redirects.txt headers.txt; do
-      [ -f "$LIBDIR/$f" ] && cp "$LIBDIR/$f" "$BACKUP/$f"
-    done
-    say "copied your rule files to $BACKUP"
-  fi
-  rm -rf "$LIBDIR"
-  say "removed $LIBDIR"
-else
-  say "$LIBDIR is already gone"
-fi
-
-if [ -d "$DEST" ]; then
-  rm -rf "$DEST"
-  say "removed $DEST"
-else
-  say "$DEST is already gone"
-fi
-say "uninstalled."
-exit 0
+exec "$DEST/aquatransport.sh" uninstall

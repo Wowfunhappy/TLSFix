@@ -18,8 +18,9 @@
 // WHY fishhook RATHER THAN dyld INTERPOSING
 //
 // A __DATA,__interpose section only affects images bound after the interposing library is
-// registered, and dyld registers it only for libraries inserted at launch -- a dlopen'd one
-// changes nothing in an already-bound process, which is exactly what aqinject does.
+// registered, and dyld registers it only for libraries inserted at launch. This library
+// arrives as a dependency of Security.framework, which a process may dlopen at any point, and
+// an image loaded then changes nothing in a process whose imports are already bound.
 //
 // Interposing also matches by address rather than by name, so a hook cannot be installed
 // until the target library is loaded and its symbols are addressable. Rebinding by name

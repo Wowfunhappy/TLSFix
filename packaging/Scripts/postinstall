@@ -1,17 +1,20 @@
 #!/bin/bash
 # AquaTransport postinstall.
 #
-# Runs after the payload (/usr/share/aquatransport/{aquatransport.dylib plus rule files} and
-# /Library/AquaTransport/{aqinject,aqwatch}) is on disk. It installs the aqwatch LaunchDaemon,
-# which loads the library into each process as the process launches, and loads it into
-# everything already running. Nothing is written to launchd's global environment, so a faulty
-# library is confined to the process it is loaded into and can never keep the machine from
-# starting.
+# Runs after the payload is on disk:
 #
-# The dylib and the rule files sit under /usr/share, one of the few directories system.sb lets
-# a sandboxed process read; a target dlopens the dylib and reads the rule files itself, under
-# its own sandbox. aqinject and aqwatch sit in /Library/AquaTransport, where root runs them
-# from outside any sandbox.
+#   /usr/share/aquatransport/   the dylib and the rule files -- everything a patched process
+#                               reads for itself, in one of the few directories a sandboxed
+#                               process may read.
+#   /Library/AquaTransport/     insert_dylib and aquatransport.sh, which root runs. Nothing
+#                               sandboxed ever reads these, so the /usr/share requirement that
+#                               governs the dylib does not apply to them.
+#
+# The payload alone changes nothing: the library is loaded because Security.framework carries a
+# load command naming it, and adding that command is what happens here. aquatransport.sh does
+# the work, so a package install and a command-line install take the same path through the same
+# checks -- including the rollback that restores Security if a freshly started process does not
+# load the library.
 #
 # $3 is the target volume, which is not always "/".
 
@@ -20,39 +23,37 @@ TARGET="${3:-/}"
 DEST="$TARGET/Library/AquaTransport"
 LIBDIR="$TARGET/usr/share/aquatransport"
 DYLIB="$LIBDIR/aquatransport.dylib"
-PLIST_LABEL="org.aquatransport.watch"
-PLIST="$TARGET/Library/LaunchDaemons/$PLIST_LABEL.plist"
 
 say() { echo "AquaTransport: $*"; }
 
 # ---- 1. sanity-check the payload ------------------------------------------------------
-# aqinject loads a chosen slice into a chosen process, so a missing slice would only leave
-# some targets unpatched -- but a build missing a slice is a packaging error, so refuse it.
-[ -f "$DYLIB" ]        || { say "FATAL: $DYLIB missing"; exit 1; }
-[ -x "$DEST/aqinject" ] || { say "FATAL: $DEST/aqinject missing"; exit 1; }
-[ -x "$DEST/aqwatch" ]  || { say "FATAL: $DEST/aqwatch missing"; exit 1; }
+[ -f "$DYLIB" ]                 || { say "FATAL: $DYLIB missing"; exit 1; }
+[ -x "$DEST/aquatransport.sh" ] || { say "FATAL: $DEST/aquatransport.sh missing"; exit 1; }
+[ -x "$DEST/insert_dylib" ]     || { say "FATAL: $DEST/insert_dylib missing"; exit 1; }
 
+# A slice missing here would leave processes of that architecture loading Security from disk for
+# nothing: the weak load command resolves to a library with no slice for them, and is skipped.
 if [ -x /usr/bin/lipo ]; then ARCHS=$(/usr/bin/lipo -info "$DYLIB" 2>/dev/null | sed 's/.*://')
 else ARCHS=$(/usr/bin/file "$DYLIB" 2>/dev/null); fi
 for a in x86_64 i386; do
   case "$ARCHS" in
     *"$a"*) ;;
-    *) say "FATAL: $DYLIB has no $a slice (found:$ARCHS); aqinject could not load into $a processes."
+    *) say "FATAL: $DYLIB has no $a slice (found:$ARCHS); $a processes would go unpatched."
        exit 1 ;;
   esac
 done
 
 # ---- 2. ownership and permissions ----------------------------------------------------
-# The dylib is loaded into root daemons, so a user-writable path would be a privilege
+# The library is loaded into root daemons, so a user-writable path would be a privilege
 # escalation. Enforce regardless of how the payload was built.
 #
-# 0644 on the files under $LIBDIR and 0755 on $LIBDIR itself are also what a sandboxed target
-# needs: system.sb's read grant carries a (file-mode #o0004) requirement, and the target has
-# to traverse the directory to reach the dylib.
+# 0644 on the files under $LIBDIR and 0755 on $LIBDIR itself are also what a sandboxed process
+# needs: system.sb's read grant carries a (file-mode #o0004) requirement, and the process has to
+# traverse the directory to reach the dylib.
 chown -R root:wheel "$DEST" "$LIBDIR"
 chmod 0755 "$DEST" "$LIBDIR"
 find "$DEST" "$LIBDIR" -type f -exec chmod 0644 {} +
-chmod 0755 "$DEST/aqinject" "$DEST/aqwatch"
+chmod 0755 "$DEST/aquatransport.sh" "$DEST/insert_dylib"
 [ -f "$DEST/uninstall.sh" ] && chmod 0755 "$DEST/uninstall.sh"
 
 # ---- 3. seed config files without overwriting existing ones --------------------------
@@ -66,42 +67,20 @@ for f in redirects.txt headers.txt flags.txt; do
   fi
 done
 
-# ---- 4. install the watcher LaunchDaemon ---------------------------------------------
-mkdir -p "$TARGET/Library/LaunchDaemons"
-cat > "$PLIST" <<PLIST_EOF
-<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-  <key>Label</key><string>$PLIST_LABEL</string>
-  <key>ProgramArguments</key>
-  <array>
-    <string>/Library/AquaTransport/aqwatch</string>
-    <string>/usr/share/aquatransport/aquatransport.dylib</string>
-    <string>/Library/AquaTransport/aqinject</string>
-  </array>
-  <key>RunAtLoad</key><true/>
-  <key>KeepAlive</key><true/>
-</dict>
-</plist>
-PLIST_EOF
-chown root:wheel "$PLIST"; chmod 0644 "$PLIST"
-
-# ---- 5. start now if installing onto the running system -------------------------------
-# On a target volume that is not the running system, only the plist is placed; it starts on
-# that volume's next boot. On the live system, start the watcher and cover what is running.
+# ---- 4. add the load command to Security.framework ------------------------------------
+# Only on the running system. The patch is verified by asking a freshly started process what it
+# loaded, which can only be asked of the system doing the asking; on another volume there is
+# nothing to run and nothing to verify against, so that volume is patched from its own system.
 if [ "$TARGET" = "/" ]; then
-  launchctl load -w /System/Library/LaunchDaemons/com.apple.auditd.plist 2>/dev/null || true
-  audit -i 2>/dev/null || true
-  launchctl unload "$PLIST" 2>/dev/null || true
-  launchctl load "$PLIST" 2>/dev/null || true
-  "$DEST/aqinject" --all "$DYLIB" 2>/dev/null || true
-  say "watcher running; loaded into running processes."
+  AQ_INSERT_DYLIB="$DEST/insert_dylib" "$DEST/aquatransport.sh" patch
+  say "Security.framework patched."
+  say "Processes already running keep the Security they mapped at launch; reboot for full coverage."
 else
-  say "watcher installed on $TARGET; it starts on that volume's next boot."
+  say "payload installed on $TARGET; nothing is patched until you run"
+  say "  sudo /Library/AquaTransport/aquatransport.sh patch"
+  say "from that system."
 fi
 
-say "installed. No restart required."
 say "Optional flags (one per line) go in $LIBDIR/flags.txt:  debug, disabled-mtls"
 say "To uninstall:  sudo $DEST/uninstall.sh"
 exit 0

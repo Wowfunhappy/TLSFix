@@ -5,13 +5,12 @@
 # external dependency and it is vendored, so a build needs no network access.
 #
 # Output: build/stage/usr/share/aquatransport/aquatransport.dylib (fat i386 + x86_64)
-#         build/stage/Library/AquaTransport/{aqinject, aqwatch}
 #
-# aqinject/aqwatch load the dylib into other processes. Two requirements the build verifies
-# before finishing:
-#   * both architectures present -- so the library can load into i386 and x86_64 targets
+# install-macos.sh adds a load command naming that dylib to Security.framework, so it is loaded
+# into every process that loads Security. Two requirements the build verifies before finishing:
+#   * both architectures present -- so it loads in i386 and x86_64 processes alike
 #   * no symbols exported -- OpenSSL defines the whole SSL_*/EVP_* namespace, which must
-#     not be visible to any host process it loads into
+#     not be visible to any process it is loaded into
 
 set -e
 DIR="$(cd "$(dirname "$0")" && pwd)"
@@ -100,23 +99,26 @@ done
 
 # The stage mirrors the installed layout, so it doubles as a pkgbuild root.
 #
-#   usr/share/aquatransport/   the dylib and the rule files -- everything a target reads for
-#                              itself. /usr/share is one of the few directories a sandboxed
-#                              process may read; see src/mac/aquatransport_config.c.
-#   Library/AquaTransport/     aqinject and aqwatch, which root runs from outside any sandbox.
+#   usr/share/aquatransport/   the dylib and the rule files -- everything a patched process
+#                              reads for itself. /usr/share is one of the few directories a
+#                              sandboxed process may read, which is what puts them there:
+#                              see src/mac/aquatransport_config.c.
+#   Library/AquaTransport/     insert_dylib and the installer script, which root runs to add
+#                              the load command. Nothing sandboxed reads them, so they are not
+#                              bound by the /usr/share grant above.
 ST="$BUILD/stage/usr/share/aquatransport"
 STOOL="$BUILD/stage/Library/AquaTransport"
 
-# Clear the build's own products from the whole stage tree first. Because the stage is a
-# pkgbuild root, a binary sitting at a path this build no longer writes is still packaged and
-# installed, so a copy at a retired path would ship alongside the real one. Matching by name
-# across the tree keeps that true for any path the layout leaves behind.
+# Clear the whole stage tree first, keeping only the rule files. Because the stage is a pkgbuild
+# root, anything left at a path this build no longer writes is still packaged and installed, so
+# a binary from a retired layout would ship alongside the real one. Clearing everything the
+# build regenerates -- rather than a list of names it knows about -- is what keeps that true
+# through a rename: a name dropped from the list is exactly the file that would survive.
 #
-# The rule files are deliberately not touched: they are hand-maintained fixtures that
-# selftest.sh reads through AQUATRANSPORT_DIR, and nothing regenerates them.
+# The rule files are the exception: they are hand-maintained fixtures that selftest.sh reads
+# through AQUATRANSPORT_DIR, and nothing regenerates them.
 if [ -d "$BUILD/stage" ]; then
-  find "$BUILD/stage" -type f \
-    \( -name aquatransport.dylib -o -name aqinject -o -name aqwatch \) -delete
+  find "$BUILD/stage" -type f ! -name '*.txt' -delete
 fi
 
 mkdir -p "$ST" "$STOOL"
@@ -139,7 +141,7 @@ have=$(lipo -info "$ST/aquatransport.dylib" | sed 's/.*://')
 echo "    architectures:$have"
 POST106='^_(strndup|strnlen|getline|getdelim|memmem|getentropy|clock_gettime|clock_gettime_nsec_np|arc4random_buf|dispatch_activate|os_unfair_lock_lock)$'
 for a in "${ARCHS[@]}"; do
-  echo "$have" | grep -qw "$a" || { echo "FATAL: missing $a slice; aqinject could not load into $a targets"; exit 1; }
+  echo "$have" | grep -qw "$a" || { echo "FATAL: missing $a slice; $a processes would go unpatched"; exit 1; }
   n=$(nm -arch "$a" -g "$ST/aquatransport.dylib" 2>/dev/null | grep -cE " (T|D|B|S) _" || true)
   [ "$n" = "0" ] || { echo "FATAL: $a exports $n symbols (OpenSSL namespace would leak)"; exit 1; }
   bad=$(nm -arch "$a" -u "$ST/aquatransport.dylib" 2>/dev/null | tr -d ' ' | grep -E "$POST106" || true)
@@ -151,14 +153,23 @@ echo "    per slice: present, 0 exports, no post-$MIN imports"
 ls -lh "$ST/aquatransport.dylib" | awk '{print "    size: "$5}'
 echo "built: $ST/aquatransport.dylib"
 
-# ---- 4. the loader tools ---------------------------------------------------
-# aqinject loads the dylib into a running process (task_for_pid + a hand-built mach_inject);
-# aqwatch drives aqinject for each process as it launches, off the process list. Both are fat,
-# so a slice loads same-arch targets and re-execs the matching slice for the other architecture.
-iargs=(); for a in "${ARCHS[@]}"; do iargs+=(-arch "$a"); done
-for t in aqinject aqwatch; do
-  echo "==> building $t"
-  clang "${iargs[@]}" -mmacosx-version-min="$MIN" -O2 -Wall -o "$STOOL/$t" "$DIR/tools/$t.c"
-  echo "    architectures:$(lipo -info "$STOOL/$t" | sed 's/.*://')"
-done
-echo "built: $STOOL/aqinject, $STOOL/aqwatch"
+# ---- 4. the package root's root-only tools ----------------------------------
+# A package payload has to carry everything the install needs, and the install needs a patcher:
+# insert_dylib writes the load command into Security.framework, and aquatransport.sh drives it
+# from the postinstall. Both are staged under Library/AquaTransport, and both are removed again
+# by the uninstaller.
+#
+# insert_dylib is not built here and not vendored -- point AQ_INSERT_DYLIB at a build of it, or
+# drop one at deps/insert_dylib. Without it the dylib above is still complete and usable by hand;
+# it is the package root that is not.
+cp "$DIR/install-macos.sh"      "$STOOL/aquatransport.sh"; chmod 0755 "$STOOL/aquatransport.sh"
+cp "$DIR/packaging/uninstall.sh" "$STOOL/uninstall.sh";    chmod 0755 "$STOOL/uninstall.sh"
+
+INS="${AQ_INSERT_DYLIB:-$DIR/deps/insert_dylib}"
+if [ -x "$INS" ]; then
+  cp "$INS" "$STOOL/insert_dylib"; chmod 0755 "$STOOL/insert_dylib"
+  echo "built: $STOOL (insert_dylib from $INS)"
+else
+  echo "NOTE: no insert_dylib at $INS, so $STOOL is not a complete package root."
+  echo "      Set AQ_INSERT_DYLIB or put a build at deps/insert_dylib to package."
+fi
