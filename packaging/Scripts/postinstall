@@ -23,6 +23,7 @@ else
 fi
 
 echo "AquaTransport: optional flags (one per line) go in /usr/share/aquatransport/flags.txt:"
-echo "  debug, disabled-mtls, allow-legacy-tls, disable-certificate-pinning"
+echo "  debug, disabled-mtls, allow-legacy-tls, disable-certificate-pinning,"
+echo "  enforce-apple-safari-ext-chain"
 echo "AquaTransport: to uninstall, run  sudo $DEST/uninstall.sh"
 exit 0

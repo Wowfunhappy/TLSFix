@@ -112,6 +112,10 @@ extern void tf_rewrite_install(void);
 // the same eligibility gate as the rest, so denied processes never carry it.
 extern void tf_trust_install(void);
 
+// Patches Safari.framework so self-signed Safari extensions install and stay installed. See
+// src/mac/aquatransport_safariext_mac.c. Acts only in the Safari process; a no-op elsewhere.
+extern void tf_safariext_install(void);
+
 static OSStatus my_SSLSetIOFuncs(SSLContextRef c, SSLReadFunc rf, SSLWriteFunc wf) {
     if (!tf_on() || ensure_ready() != 1) return o_SSLSetIOFuncs(c, rf, wf);
     OSStatus r = o_SSLSetIOFuncs(c, rf, wf);
@@ -533,4 +537,5 @@ static void aquatransport_init(void) {
     install_ssl_hooks();
     tf_rewrite_install();
     tf_trust_install();
+    tf_safariext_install();
 }

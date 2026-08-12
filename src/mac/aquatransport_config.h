@@ -10,6 +10,8 @@
 //   disable-certificate-pinning  honour system and keychain anchors for anchor-restricted
 //                                evaluations, defeating pinning process-wide (for monitoring
 //                                your own traffic through a locally trusted proxy root)
+//   enforce-apple-safari-ext-chain  leave Safari's Apple-signed-extension checks in force, so
+//                                Safari again refuses self-signed extensions (Safari only)
 
 #ifndef AQUATRANSPORT_CONFIG_H
 #define AQUATRANSPORT_CONFIG_H
