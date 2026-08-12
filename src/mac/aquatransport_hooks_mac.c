@@ -108,6 +108,10 @@ static OSStatus (*o_SSLSetCertificate)(SSLContextRef, CFArrayRef);
 // have nothing to rebind.
 extern void tf_rewrite_install(void);
 
+// Installs the certificate-trust hook. See src/mac/aquatransport_trust_mac.c. Installed under
+// the same eligibility gate as the rest, so denied processes never carry it.
+extern void tf_trust_install(void);
+
 static OSStatus my_SSLSetIOFuncs(SSLContextRef c, SSLReadFunc rf, SSLWriteFunc wf) {
     if (!tf_on() || ensure_ready() != 1) return o_SSLSetIOFuncs(c, rf, wf);
     OSStatus r = o_SSLSetIOFuncs(c, rf, wf);
@@ -528,4 +532,5 @@ static void aquatransport_init(void) {
     // no-op, and fishhook rebinds the call sites when the framework does arrive.
     install_ssl_hooks();
     tf_rewrite_install();
+    tf_trust_install();
 }

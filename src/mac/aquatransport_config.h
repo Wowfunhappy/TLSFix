@@ -5,8 +5,11 @@
 // of readable directories that /usr/share is on -- see the note in aquatransport_config.c.
 //
 // flags.txt holds one flag name per line. Recognised flags:
-//   debug           log handshakes to /tmp/aquatransport-<uid>.log
-//   disabled-mtls   hand client-certificate connections back to the system stack
+//   debug                        log handshakes to /tmp/aquatransport-<uid>.log
+//   disabled-mtls                hand client-certificate connections back to the system stack
+//   disable-certificate-pinning  honour system and keychain anchors for anchor-restricted
+//                                evaluations, defeating pinning process-wide (for monitoring
+//                                your own traffic through a locally trusted proxy root)
 
 #ifndef AQUATRANSPORT_CONFIG_H
 #define AQUATRANSPORT_CONFIG_H
