@@ -7,6 +7,7 @@
 #include <pthread.h>
 #include <sys/stat.h>
 #include <sys/time.h>
+#include <limits.h>
 #include <time.h>
 #include <mach-o/dyld.h>
 
@@ -101,14 +102,30 @@ static int gDbg = 0;
 static void dbg_init(void) { gDbg = tf_flag("debug"); }
 int tf_debug(void) { pthread_once(&gDbgOnce, dbg_init); return gDbg; }
 
-void tf_log(const char *fmt, ...) {
-    if (!tf_debug()) return;
-    // Per-uid path: a single shared file gets created root-owned 0644 by the first daemon
-    // that logs, after which no user process can append to it (and the user cannot even
-    // delete it).
-    char path[256];
+// Where a line goes. Per-uid, because a single shared file gets created root-owned 0644 by
+// the first daemon that logs, after which no user process can append to it (and the user
+// cannot even delete it).
+//
+// A sandboxed daemon is denied /tmp, and those are the processes whose handshakes are hardest
+// to see any other way -- apsd's profile grants `file*` under its own per-process temp
+// directory and nothing under /tmp, so a denied open falls back there rather than dropping
+// the line. confstr names the same directory the sandbox parameter does, so the grant covers
+// the file this opens.
+static FILE *log_open(void) {
+    char path[PATH_MAX];
     snprintf(path, sizeof path, "/tmp/aquatransport-%u.log", (unsigned)getuid());
     FILE *f = fopen(path, "a");
+    if (f) return f;
+    char dir[PATH_MAX];
+    size_t n = confstr(_CS_DARWIN_USER_TEMP_DIR, dir, sizeof dir);
+    if (n == 0 || n > sizeof dir) return NULL;
+    snprintf(path, sizeof path, "%saquatransport-%u.log", dir, (unsigned)getuid());
+    return fopen(path, "a");
+}
+
+void tf_log(const char *fmt, ...) {
+    if (!tf_debug()) return;
+    FILE *f = log_open();
     if (!f) return;
     struct timeval tv; gettimeofday(&tv, NULL);
     fprintf(f, "%ld.%03d [%d %s] ", (long)tv.tv_sec, (int)(tv.tv_usec / 1000),

@@ -227,6 +227,18 @@ connect; with `allow-legacy-tls` the 1.0 and 1.1 endpoints connect (`TLSv1`,
 configured `no-legacy` and those algorithms are absent from the library rather than merely
 unlisted.
 
+A sandboxed daemon cannot write to `/tmp`, and those are the processes whose handshakes are
+hardest to see any other way. `apsd`'s profile grants `file*` under its own per-process temp
+directory and nothing under `/tmp`, so a denied open falls back to the directory `confstr`
+names — the same one the sandbox parameter names, so the grant covers the file:
+
+```
+Sandbox: apsd(1817) deny file-write-create /private/tmp/aquatransport-0.log
+/private/var/folders/zz/…/T/aquatransport-0.log      # where it lands instead
+```
+
+Find one with `sudo find /private/var/folders -name 'aquatransport-*.log'`.
+
 `tf_flag()` (`aquatransport_config.c`) reports whether a name is a line in `flags.txt`;
 `selftest.sh` exercises the mechanism through `debug`. To stop the engine entirely, uninstall
 it — the library stays loaded in processes that already have it, so removing the file is not a
@@ -404,6 +416,58 @@ handles the same-thread case; these four are where the cycle crosses a process b
 
 Anything else misbehaving with the library loaded is a bug in the engine to fix, not a name to
 add.
+
+## Client certificates the security level would refuse
+
+OpenSSL's security level judges the certificate the client *sends* by the same bar it applies
+to the peer's chain. At the default level 2 — 112 bits, no SHA-1 — a 1024-bit client key is
+dropped inside `tls_choose_sigalg`, and a client with nothing left to send sends an **empty
+Certificate message** rather than failing.
+
+Apple still issues 1024-bit device identities. `apsd`'s push certificate is one, so this is
+what the failure looked like on a machine with the library installed:
+
+```
+client_cert_cb host=courier.push.apple.com haveX509=1 keybits=1024 seclevel=2
+handshake ok  host=courier.push.apple.com proto=TLSv1.3 cipher=TLS_AES_256_GCM_SHA384
+SSLRead ABORT ssl_err=1 reason=399  str=ee key too small
+SSLRead ABORT ssl_err=1 reason=1116 str=tlsv13 alert certificate required
+```
+
+— every 300 ms, forever: `apsd` never held a courier connection, so nothing that rides Apple
+push worked, iMessage included. Messages sent from the app sat with `error=4` in `chat.db`.
+
+Two things make it hard to see. The handshake **succeeds**: under TLS 1.3 the client finishes
+before the server has answered, so the rejection arrives later as an alert on the first read.
+And the client's own logs say nothing about the certificate, because from its side nothing
+went wrong — only the server knows an empty Certificate arrived, which is why the regression
+test asks a server (`tools/mtlssrv.c`) instead of the client.
+
+Refusing our own weak key protects nobody: the key is the service's choice, the stock stack
+uses it without complaint, and the alternative is not a stronger connection but no connection.
+So `sec_cb` exempts certificates this library supplied — identified by pointer, since
+`client_cert_cb` hands OpenSSL those exact objects — and requires the check to be one OpenSSL
+did not mark `SSL_SECOP_PEER`, so no relaxation can reach the peer's chain even if a pointer
+somehow matched. Every other check goes to the default callback, saved before ours is
+installed, so the rest of the level applies unchanged.
+
+`selftest.sh` covers both key sizes against a local server that reports what it received.
+Measured against a build without the exemption: RSA-1024 `NO_CLIENT_CERT`, RSA-2048
+`CLIENT_CERT` — so the test discriminates rather than merely passing.
+
+### Clearing the error queue is part of the read contract
+
+`SSL_get_error()` reports `SSL_ERROR_SSL` whenever the thread's error queue is non-empty,
+whatever the call it is asked about actually did. One error left behind by an earlier
+operation — on this connection, on another connection, on any OpenSSL call the thread made —
+therefore turns the next would-block into a protocol failure.
+
+That is not a cosmetic misreport here. `errSSLWouldBlock` means "come back" and
+`errSSLClosedAbort` means the stream is dead, and CFNetwork acts on the difference. In the
+trace above, the first `SSLRead` had merely found the socket empty; it reported an abort
+because `SSL_R_EE_KEY_TOO_SMALL` from the certificate selection was still queued from the
+handshake. So `ERR_clear_error()` runs before every `SSL_read`, `SSL_write` and
+`SSL_do_handshake` in this library, `sh_flush_write` included.
 
 ## The I/O contract
 

@@ -34,6 +34,7 @@
 #include "../aquatransport.h"
 #include "aquatransport_config.h"
 #include "../../deps/fishhook/fishhook.h"
+#include <openssl/err.h>
 #include <pthread.h>
 #include <string.h>
 #include <stdlib.h>
@@ -184,6 +185,7 @@ static OSStatus my_SSLHandshake(SSLContextRef c) {
     sh_unblock_write(s);   // an entry like any other; see bio_bwrite
     if (!s->inited) { if (ossl_init(s)) { s->state = -1; rv = o_SSLHandshake(c); goto done; } s->state = 1; }
     if (s->state == 3) s->approved = 1;   // app approved the server after the auth break, let it proceed
+    ERR_clear_error();                    // see the note above my_SSLRead
     int ret = SSL_do_handshake(s->ssl);
     if (ret == 1) {
         if (tf_debug())
@@ -224,6 +226,16 @@ done:
 // wait on a socket that has already been drained. That hook answering correctly is what makes
 // a short noErr safe -- both halves are the same mechanism.
 //
+// ERR_clear_error() before the call, and before every other SSL_read/SSL_write/SSL_do_handshake
+// in this library, is what makes the answer below trustworthy. SSL_get_error() reports
+// SSL_ERROR_SSL whenever the thread's error queue is non-empty, whatever the call itself did,
+// so one error left behind by an earlier operation -- on this connection, on another
+// connection, on any OpenSSL call this thread made -- turns the next would-block into a
+// protocol failure. Here that is not a cosmetic misreport: errSSLWouldBlock means "come back",
+// errSSLClosedAbort means the stream is dead, and CFNetwork acts on the difference. Observed
+// in apsd, where SSL_R_EE_KEY_TOO_SMALL from the client-certificate selection was still queued
+// when the first read ran, and a connection with data on the way was reported as aborted.
+//
 // One record per call, which is what the stock stack returns and what `SSL_read` yields anyway.
 // Filling the caller's buffer from further records would be legal -- the status says progress,
 // not fullness -- but it is not what a caller measuring this stack would see, and it buys
@@ -242,6 +254,7 @@ static OSStatus my_SSLRead(SSLContextRef c, void *data, size_t len, size_t *proc
     OSStatus rv = noErr;
     if (len) {
         size_t want = len > IO_RUN_MAX ? IO_RUN_MAX : len;
+        ERR_clear_error();
         int n = SSL_read(s->ssl, (unsigned char *)data, (int)want);
         if (n > 0) total = (size_t)n;
         else {
@@ -296,6 +309,7 @@ static OSStatus my_SSLWrite(SSLContextRef c, const void *data, size_t len, size_
     for (size_t off = 0; off < len; ) {
         size_t take = len - off;
         if (take > IO_RUN_MAX) take = IO_RUN_MAX;
+        ERR_clear_error();                               // see the note above my_SSLRead
         int n = SSL_write(s->ssl, (const unsigned char *)data + off, (int)take);
         if (n > 0) { off += (size_t)n; continue; }
         int e = SSL_get_error(s->ssl, n);

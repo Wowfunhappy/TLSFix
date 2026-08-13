@@ -282,6 +282,45 @@ check "short-read contract matches stock" "^identical$" \
   "$([ -n "$cr_stock" ] && [ "$cr_stock" = "$cr_eng" ] && echo identical || echo differs)"
 [ "$cr_stock" = "$cr_eng" ] || diff <(echo "$cr_stock") <(echo "$cr_eng") | sed 's/^/        /'
 
+echo "== client certificates =="
+# Whether the certificate the client was given actually reaches the server. A client that
+# sends an empty Certificate message still completes a TLS 1.3 handshake -- the client
+# finishes before the server has answered -- so "HANDSHAKE OK" on this side proves nothing
+# and the server has to be the one asked. mtlssrv reports what it received.
+#
+# The RSA-1024 identity is the case that matters. OpenSSL's security level judges the
+# certificate we send by the same bar as the peer's, and at the default level it drops a
+# 1024-bit key: the handshake then completes with no certificate sent and the server rejects
+# the connection afterwards. That is what stopped apsd from connecting to Apple's push
+# courier, whose device identity is RSA-1024, and with it iMessage. The RSA-2048 row is the
+# control -- same CA, same server, same path -- and was never affected.
+MTLSSRV="$DIR/build/mtlssrv"
+MTLSPROBE="$DIR/build/mtlsprobe"
+if "$DIR/tools/mtlstest/make.sh" >/dev/null 2>&1; then
+  W="$DIR/tools/mtlstest/work"
+  [ -x "$MTLSSRV" ] || cc -mmacosx-version-min=10.6 -o "$MTLSSRV" "$DIR/tools/mtlssrv.c" \
+      -I"$DIR/build/openssl/include" "$DIR/build/openssl/lib/libssl.a" "$DIR/build/openssl/lib/libcrypto.a"
+  [ -x "$MTLSPROBE" ] || clang -arch x86_64 -mmacosx-version-min=10.6 -Wno-deprecated-declarations \
+      -framework Security -framework CoreFoundation -o "$MTLSPROBE" "$DIR/tools/mtlsprobe.c"
+  port=14443
+  for bits in 2048 1024; do
+    out="$DIR/build/mtlssrv-$bits.out"
+    : > "$out"
+    "$MTLSSRV" "$port" "$W/server.crt" "$W/server.key" "$W/ca.crt" > "$out" 2>/dev/null &
+    srvpid=$!
+    # Wait for the port rather than sleeping: the server prints LISTENING once it is accepting.
+    for _ in $(seq 1 50); do grep -q LISTENING "$out" && break; sleep 0.1; done
+    run "$MTLSPROBE" 127.0.0.1 "$port" "$W/client$bits.p12" test123 > /dev/null 2>&1
+    wait $srvpid 2>/dev/null
+    check "RSA-$bits client certificate reaches the server" "CLIENT_CERT" "$(grep CLIENT "$out")"
+    rm -f "$out"
+    port=$((port+1))
+  done
+  rm -rf "$W"
+else
+  echo "  skip  no /usr/bin/openssl to build the test CA"
+fi
+
 echo "== deny list =="
 # The gate matches on process name, so a copy named ocspd must pass straight through.
 cp "$PROBE" "$DIR/build/ocspd"

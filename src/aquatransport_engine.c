@@ -6,6 +6,7 @@
 #include <openssl/evp.h>
 #include <openssl/bn.h>
 #include <openssl/sha.h>
+#include <openssl/err.h>
 #include <pthread.h>
 #include <string.h>
 #include <stdlib.h>
@@ -353,6 +354,7 @@ void sh_reset_write(Shadow *s) {
 // error.
 int sh_flush_write(Shadow *s) {
     if (!s || !s->wpend) return 1;
+    ERR_clear_error();                                  // see the note above my_SSLRead
     int n = SSL_write(s->ssl, s->wpend, (int)s->wpendLen);
     if (n > 0) { free(s->wpend); s->wpend = NULL; s->wpendLen = 0; return 1; }
     int e = SSL_get_error(s->ssl, n);
@@ -468,6 +470,46 @@ void capture_identity(Shadow *s, CFArrayRef certRefs) {
         if (ix) { if (!chain) chain = sk_X509_new_null(); if (chain) sk_X509_push(chain, ix); else X509_free(ix); }
     }
     s->clientX509 = x; s->clientChain = chain; s->clientKey = key; s->clientBypass = 0;
+}
+
+// The security level judges what the peer presents -- and OpenSSL applies it to the
+// certificate *we* present too, which is a different question with a different answer.
+//
+// Apple still issues RSA-1024 device identities: apsd's push certificate is one, and its
+// issuing CA is SHA-1 signed. At the default level 2 (112 bits, no SHA-1) OpenSSL therefore
+// discards our own certificate inside tls_choose_sigalg, and, having nothing to send, the
+// client sends an *empty* Certificate message. The handshake then completes -- in TLS 1.3 the
+// client finishes without waiting for the server -- and the courier answers with a
+// certificate_required alert on the first read. Measured on 10.9.5: SSL_R_EE_KEY_TOO_SMALL
+// against the 1024-bit identity, then "tlsv13 alert certificate required", every 300 ms
+// forever, which is iMessage with no push connection.
+//
+// Refusing to use our own weak key protects nobody. The key is the service's choice, the
+// stock stack uses it without complaint, and the alternative is not a stronger connection but
+// no connection. So certificates this library supplied are exempt, identified by pointer --
+// client_cert_cb hands OpenSSL these exact objects -- and nothing else is: the check is
+// additionally required to be one OpenSSL did not mark SSL_SECOP_PEER, so no relaxation can
+// reach the peer's chain even if a pointer somehow matched. Everything else is passed to the
+// default callback, which is saved before this one is installed, so every other rule of the
+// level applies unchanged.
+static int (*g_default_sec_cb)(const SSL *, const SSL_CTX *, int, int, int, void *, void *);
+
+static int ours_by_pointer(Shadow *s, const X509 *x) {
+    if (!s || !x) return 0;
+    if (x == s->clientX509) return 1;
+    if (s->clientChain)
+        for (int i = 0; i < sk_X509_num(s->clientChain); i++)
+            if (x == sk_X509_value(s->clientChain, i)) return 1;
+    return 0;
+}
+
+static int sec_cb(const SSL *ssl, const SSL_CTX *ctx, int op, int bits, int nid,
+                  void *other, void *ex) {
+    if (other && !(op & SSL_SECOP_PEER) && (op & SSL_SECOP_OTHER_TYPE) == SSL_SECOP_OTHER_CERT) {
+        Shadow *s = (Shadow *)SSL_get_ex_data((SSL *)ssl, gSslExIdx);
+        if (ours_by_pointer(s, (const X509 *)other)) return 1;
+    }
+    return g_default_sec_cb(ssl, ctx, op, bits, nid, other, ex);
 }
 
 // Provides our client cert during the handshake; -1 suspends before sending it.
@@ -738,6 +780,10 @@ static void do_ready(void) {
         // Per-context rather than per-SSL. Harmless on connections without a client
         // identity: the callback returns 0 for "no cert".
         SSL_CTX_set_client_cert_cb(gCtx, client_cert_cb);
+        // Saved before ours is installed, so sec_cb can defer to it for every check that is
+        // not about a certificate this library supplied. See sec_cb.
+        g_default_sec_cb = SSL_CTX_get_security_callback(gCtx);
+        if (g_default_sec_cb) SSL_CTX_set_security_callback(gCtx, sec_cb);
     }
     gBioMeth = BIO_meth_new(BIO_get_new_index() | BIO_TYPE_SOURCE_SINK, "cfnetwork");
     if (gBioMeth) {
