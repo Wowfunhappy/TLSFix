@@ -85,11 +85,14 @@ static inline int tf_on(void) {
 
 // The real Secure Transport entry points. Resolved before any rebinding; see the header
 // comment for why these exist and why they are not fishhook's `replaced` output.
+static SSLContextRef (*o_SSLCreateContext)(CFAllocatorRef, SSLProtocolSide, SSLConnectionType);
+static OSStatus (*o_SSLNewContext)(Boolean, SSLContextRef *);
 static OSStatus (*o_SSLSetIOFuncs)(SSLContextRef, SSLReadFunc, SSLWriteFunc);
 static OSStatus (*o_SSLSetConnection)(SSLContextRef, SSLConnectionRef);
 static OSStatus (*o_SSLSetPeerDomainName)(SSLContextRef, const char *, size_t);
 static OSStatus (*o_SSLSetPeerID)(SSLContextRef, const void *, size_t);
 static OSStatus (*o_SSLSetSessionOption)(SSLContextRef, SSLSessionOption, Boolean);
+static OSStatus (*o_SSLSetEnableCertVerify)(SSLContextRef, Boolean);
 static OSStatus (*o_SSLHandshake)(SSLContextRef);
 static OSStatus (*o_SSLRead)(SSLContextRef, void *, size_t, size_t *);
 static OSStatus (*o_SSLWrite)(SSLContextRef, const void *, size_t, size_t *);
@@ -116,6 +119,34 @@ extern void tf_trust_install(void);
 // Patches Safari.framework so self-signed Safari extensions install and stay installed. See
 // src/mac/aquatransport_safariext_mac.c. Acts only in the Safari process; a no-op elsewhere.
 extern void tf_safariext_install(void);
+
+// Which side of the handshake a context speaks is settled when it is created and never named
+// again: Secure Transport on 10.6-10.9 exports no way to ask a context afterwards. So the two
+// creation entry points are hooked for that single fact, and a server context is marked here
+// or nowhere. my_SSLHandshake reads the mark and hands the whole connection back.
+static void mark_server_side(SSLContextRef c) {
+    if (!c || ensure_ready() != 1) return;
+    Shadow *s = sh_create(c);
+    if (s) { s->serverSide = 1; sh_release(s); }
+}
+
+// origs_ready() before the call through, in both of these, for the reason the other hooks call
+// tf_on() first: it is what fills the original slot, and these two run before any other hook a
+// context can reach. Its answer is not consulted -- an engine disabled for want of some other
+// entry point still leaves these two forwarding to a real Secure Transport.
+static SSLContextRef my_SSLCreateContext(CFAllocatorRef alloc, SSLProtocolSide side, SSLConnectionType type) {
+    origs_ready();
+    SSLContextRef c = o_SSLCreateContext(alloc, side, type);
+    if (side == kSSLServerSide) mark_server_side(c);
+    return c;
+}
+
+static OSStatus my_SSLNewContext(Boolean isServer, SSLContextRef *ctxPtr) {
+    origs_ready();
+    OSStatus r = o_SSLNewContext(isServer, ctxPtr);
+    if (r == noErr && isServer && ctxPtr) mark_server_side(*ctxPtr);
+    return r;
+}
 
 static OSStatus my_SSLSetIOFuncs(SSLContextRef c, SSLReadFunc rf, SSLWriteFunc wf) {
     if (!tf_on() || ensure_ready() != 1) return o_SSLSetIOFuncs(c, rf, wf);
@@ -176,12 +207,22 @@ static OSStatus my_SSLSetSessionOption(SSLContextRef c, SSLSessionOption opt, Bo
     return o_SSLSetSessionOption(c, opt, val);
 }
 
+// The other half of the trust decision, alongside kSSLSessionOptionBreakOnServerAuth: this one
+// hands the check to the caller outright rather than pausing for it. Recorded because the
+// engine, not Secure Transport, is what evaluates the chain -- see verify_chain.
+static OSStatus my_SSLSetEnableCertVerify(SSLContextRef c, Boolean enable) {
+    if (!tf_on() || ensure_ready() != 1) return o_SSLSetEnableCertVerify(c, enable);
+    Shadow *s = sh_create(c);
+    if (s) { s->noCertVerify = enable ? 0 : 1; sh_release(s); }
+    return o_SSLSetEnableCertVerify(c, enable);
+}
+
 static OSStatus my_SSLHandshake(SSLContextRef c) {
     if (!tf_on()) return o_SSLHandshake(c);
     Shadow *s = sh_get(c);
     if (!s) return o_SSLHandshake(c);
     OSStatus rv;
-    if (!s->rf || !s->wf || !s->conn || s->clientBypass || s->state == -1) { rv = o_SSLHandshake(c); goto done; }
+    if (!s->rf || !s->wf || !s->conn || s->clientBypass || s->serverSide || s->state == -1) { rv = o_SSLHandshake(c); goto done; }
     sh_unblock_write(s);   // an entry like any other; see bio_bwrite
     if (!s->inited) { if (ossl_init(s)) { s->state = -1; rv = o_SSLHandshake(c); goto done; } s->state = 1; }
     if (s->state == 3) s->approved = 1;   // app approved the server after the auth break, let it proceed
@@ -205,7 +246,12 @@ static OSStatus my_SSLHandshake(SSLContextRef c) {
     if (e == SSL_ERROR_WANT_X509_LOOKUP) { s->state = 3; rv = ST_PeerAuth; goto done; }
     if (e == SSL_ERROR_WANT_READ || e == SSL_ERROR_WANT_WRITE) rv = errSSLWouldBlock;
     else {
-        tf_log("handshake FAILED host=%s ssl_err=%d", s->host[0] ? s->host : "(none)", e);
+        // The OpenSSL reason alongside the SSL_get_error class: the class says only that the
+        // connection failed, while the reason names which check refused it.
+        char why[192]; why[0] = 0;
+        unsigned long oe = ERR_peek_last_error();
+        if (oe) ERR_error_string_n(oe, why, sizeof why);
+        tf_log("handshake FAILED host=%s ssl_err=%d %s", s->host[0] ? s->host : "(none)", e, why);
         s->state = -1; rv = ST_ClosedAbort;
     }
 done:
@@ -445,8 +491,12 @@ static OSStatus my_SSLSetCertificate(SSLContextRef c, CFArrayRef certRefs) {
         // the identity and my_SSLHandshake defers the whole handshake to it. General escape
         // hatch for a client-certificate service this engine cannot carry -- one needing
         // TLS 1.3, or a key the Keychain will not sign for.
-        if (tf_flag("disabled-mtls")) s->clientBypass = 1;
-        else capture_identity(s, certRefs);
+        // On a server context this is the server's own identity, which the system stack holds
+        // and uses; nothing here needs it.
+        if (!s->serverSide) {
+            if (tf_flag("disabled-mtls")) s->clientBypass = 1;
+            else capture_identity(s, certRefs);
+        }
         if (s->inited && s->state != -1) { SSL_free(s->ssl); s->ssl = NULL; s->inited = 0; s->state = 0;
              sh_reset_write(s);
              if (s->trust) { CFRelease(s->trust); s->trust = NULL; } }   // new handshake -> new chain
@@ -457,16 +507,36 @@ static OSStatus my_SSLSetCertificate(SSLContextRef c, CFArrayRef certRefs) {
 
 // One row per hooked entry point. The original slot is filled from dlsym before anything
 // is rebound, so an installed hook always has a working original to call through.
+//
+// A row carrying an `absent` stand-in is one whose entry point is not on every system in the
+// 10.6-10.9 range: SSLCreateContext arrived in 10.8. Where the symbol is missing that row alone
+// is inert, rather than the whole engine going quiet for want of it. Every other row is
+// required, and its absence disables the engine -- see origs_ready.
+//
+// Stands in for an entry point that could not be resolved, so an original slot is never
+// NULL and no hook can dereference one. Declared without parameters and called through a
+// pointer that has them, which is safe in the same way -- and for the same reason -- as the
+// six-parameter pass-throughs in aquatransport_rewrite.c: the callee simply does not read
+// what it was passed. Unreachable either way: a hook whose own entry point is missing has no
+// call sites to be rebound, and the rest run only once Secure Transport is loaded, by which
+// point every one of them resolves.
+static OSStatus     st_unavailable(void)     { return ST_Internal; }
+static SSLContextRef st_ctx_unavailable(void) { return NULL; }
+
 static const struct {
     const char *name;
     void       *repl;
     void      **orig;
+    void       *absent;
 } kHooks[] = {
+    { "SSLCreateContext",                (void *)my_SSLCreateContext,                (void **)&o_SSLCreateContext, (void *)st_ctx_unavailable },
+    { "SSLNewContext",                   (void *)my_SSLNewContext,                   (void **)&o_SSLNewContext,    (void *)st_unavailable },
     { "SSLSetIOFuncs",                   (void *)my_SSLSetIOFuncs,                   (void **)&o_SSLSetIOFuncs },
     { "SSLSetConnection",                (void *)my_SSLSetConnection,                (void **)&o_SSLSetConnection },
     { "SSLSetPeerDomainName",            (void *)my_SSLSetPeerDomainName,            (void **)&o_SSLSetPeerDomainName },
     { "SSLSetPeerID",                    (void *)my_SSLSetPeerID,                    (void **)&o_SSLSetPeerID },
     { "SSLSetSessionOption",             (void *)my_SSLSetSessionOption,             (void **)&o_SSLSetSessionOption },
+    { "SSLSetEnableCertVerify",          (void *)my_SSLSetEnableCertVerify,          (void **)&o_SSLSetEnableCertVerify },
     { "SSLHandshake",                    (void *)my_SSLHandshake,                    (void **)&o_SSLHandshake },
     { "SSLRead",                         (void *)my_SSLRead,                         (void **)&o_SSLRead },
     { "SSLWrite",                        (void *)my_SSLWrite,                        (void **)&o_SSLWrite },
@@ -493,19 +563,12 @@ static const struct {
 static pthread_once_t g_origs_once = PTHREAD_ONCE_INIT;
 static int g_origs_ok = 0;
 
-// Stands in for an entry point that could not be resolved, so an original slot is never
-// NULL and no hook can dereference one. Declared without parameters and called through a
-// pointer that has them, which is safe in the same way -- and for the same reason -- as the
-// six-parameter pass-throughs in aquatransport_rewrite.c: the callee simply does not read
-// what it was passed. Unreachable in practice, since a hook only runs when Secure Transport
-// is loaded and every one of these then resolves.
-static OSStatus st_unavailable(void) { return ST_Internal; }
-
 static void resolve_origs(void) {
     int ok = 1;
     for (size_t i = 0; i < NHOOKS; i++) {
         void *real = dlsym(RTLD_DEFAULT, kHooks[i].name);
         if (!real) {
+            if (kHooks[i].absent) { *(kHooks[i].orig) = kHooks[i].absent; continue; }
             tf_log("could not resolve %s", kHooks[i].name);
             *(kHooks[i].orig) = (void *)st_unavailable;
             ok = 0;

@@ -75,12 +75,23 @@ static const char *stname(OSStatus s) {
 
 static SSLContextRef g_ctx;
 
+// How much of the ask was satisfied, as the contract sees it. Whether a read came back short,
+// full, or empty is the answer being measured; the exact byte count of a short one is however
+// much of the response had arrived from the network at that instant, and case 1 below reads a
+// live one, so that number differs from run to run on the same stack. selftest.sh compares
+// this word and drops the count.
+static const char *fill(size_t processed, size_t asked) {
+    if (processed == 0)     return "none";
+    if (processed >= asked) return "full";
+    return "short";
+}
+
 static void report(const char *what, OSStatus st, size_t processed, size_t asked) {
     size_t buffered = 0;
     SSLGetBufferedReadSize(g_ctx, &buffered);
-    printf("  %-32s st=%-20s processed=%-6lu of %-6lu  cb_calls=%d buffered=%s\n",
-           what, stname(st), (unsigned long)processed, (unsigned long)asked, g_calls,
-           buffered ? "yes" : "no");
+    printf("  %-32s st=%-20s processed=%-6lu of %-6lu %-5s cb_calls=%d buffered=%s\n",
+           what, stname(st), (unsigned long)processed, (unsigned long)asked,
+           fill(processed, asked), g_calls, buffered ? "yes" : "no");
 }
 
 int main(int argc, char **argv) {

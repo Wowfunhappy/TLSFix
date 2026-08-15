@@ -275,9 +275,15 @@ check "blocked-write contract matches stock" "^identical$" \
 # The same for SSLRead: whether a short read is noErr or a would-block, and whether what is
 # left over is advertised. How many transport reads it takes to assemble one record is framing
 # rather than contract, so cb_calls is dropped from the comparison the way cb_took is above.
-cr_stock=$("$READCONTRACT" postman-echo.com 2>&1 | grep -E '^  ' | sed 's/ cb_calls=[0-9]*//')
+#
+# The transferred byte count goes too, and for a different reason: the first case reads a live
+# response, so how much of it has arrived by then is a property of the network that run, not of
+# the stack -- two stock runs disagree on it. What the case is actually asking, whether the read
+# came back short or full, is compared through the word the probe prints beside the count.
+cr_strip='s/ cb_calls=[0-9]*//; s/processed=[0-9]* */processed=N /'
+cr_stock=$("$READCONTRACT" postman-echo.com 2>&1 | grep -E '^  ' | sed "$cr_strip")
 cr_eng=$(AQUATRANSPORT_DIR="$T" DYLD_INSERT_LIBRARIES="$D" "$READCONTRACT" postman-echo.com 2>&1 \
-         | grep -E '^  ' | sed 's/ cb_calls=[0-9]*//')
+         | grep -E '^  ' | sed "$cr_strip")
 check "short-read contract matches stock" "^identical$" \
   "$([ -n "$cr_stock" ] && [ "$cr_stock" = "$cr_eng" ] && echo identical || echo differs)"
 [ "$cr_stock" = "$cr_eng" ] || diff <(echo "$cr_stock") <(echo "$cr_eng") | sed 's/^/        /'

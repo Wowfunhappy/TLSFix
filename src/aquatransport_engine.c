@@ -629,7 +629,7 @@ static int verify_chain(X509_STORE_CTX *sctx, void *arg) {
     (void)arg;
     SSL *ssl = (SSL *)X509_STORE_CTX_get_ex_data(sctx, SSL_get_ex_data_X509_STORE_CTX_idx());
     Shadow *s = ssl ? (Shadow *)SSL_get_ex_data(ssl, gSslExIdx) : NULL;
-    if (s && s->breakAuth) return 1;
+    if (s && (s->breakAuth || s->noCertVerify)) return 1;
     STACK_OF(X509) *chain = X509_STORE_CTX_get0_untrusted(sctx);
     if (!chain || sk_X509_num(chain) < 1) return 0;
     unsigned char dg[SHA256_DIGEST_LENGTH];
@@ -761,6 +761,17 @@ static void do_ready(void) {
         SSL_CTX_set_min_proto_version(gCtx, TLS1_2_VERSION);
         SSL_CTX_set_max_proto_version(gCtx, TLS1_3_VERSION);
         SSL_CTX_set_verify(gCtx, SSL_VERIFY_PEER, NULL);
+        // Connect to servers that do not offer RFC 5746 secure renegotiation, which OpenSSL 3
+        // otherwise refuses outright -- "unsafe legacy renegotiation disabled", before a single
+        // byte of application data. That describes every server predating 2010, this system's
+        // own Secure Transport included, which is squarely the range of peers this engine
+        // exists to reach; a browser makes the same allowance.
+        //
+        // The renegotiation attack the extension answers needs a renegotiation to carry it, and
+        // SSL_OP_ALLOW_UNSAFE_LEGACY_RENEGOTIATION -- the option that would permit one against
+        // such a server -- is deliberately not set. So an unpatched server can be reached, and
+        // still cannot be renegotiated with.
+        SSL_CTX_set_options(gCtx, SSL_OP_LEGACY_SERVER_CONNECT);
         gSslExIdx = SSL_get_ex_new_index(0, NULL, NULL, NULL, NULL);
         SSL_CTX_set_cert_verify_callback(gCtx, verify_chain, NULL);
         // Client session cache. OpenSSL's own store is server-side only, so the sessions are

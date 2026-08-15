@@ -47,8 +47,16 @@ typedef struct {
     int              inited;
     int              state;
     int              breakAuth;
+    // SSLSetEnableCertVerify(false): the caller has taken the certificate check on itself --
+    // what curl's -k does on this platform. Secure Transport then completes the handshake
+    // whatever the chain says, and leaves the caller to fetch it with SSLCopyPeerTrust.
+    int              noCertVerify;
     int              approved;
     int              clientBypass;
+    // Set on a context created with kSSLServerSide. This engine speaks the client half of the
+    // handshake -- ossl_init calls SSL_set_connect_state -- so a server context is left to the
+    // system stack entire, the way clientBypass leaves it a client certificate we cannot carry.
+    int              serverSide;
     X509            *clientX509;
     STACK_OF(X509)  *clientChain;
     SecKeyRef        clientKey;
