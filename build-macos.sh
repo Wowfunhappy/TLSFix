@@ -79,6 +79,7 @@ OBJDIR="$BUILD/obj"; rm -rf "$OBJDIR"; mkdir -p "$OBJDIR"
 : > "$BUILD/nothing.exp"
 
 slices=()
+loader_slices=()
 for a in "${ARCHS[@]}"; do
   objs=()
   for src in "${SRCS[@]}"; do
@@ -88,13 +89,24 @@ for a in "${ARCHS[@]}"; do
       -c "$src" -o "$o"
     objs+=("$o")
   done
-  out="$OBJDIR/aquatransport-$a.dylib"
+  out="$OBJDIR/aquatransport_engine-$a.dylib"
   clang -arch "$a" -mmacosx-version-min="$MIN" -dynamiclib -o "$out" \
-    -install_name /usr/share/aquatransport/aquatransport.dylib \
+    -install_name /usr/share/aquatransport/aquatransport_engine.dylib \
     "${objs[@]}" "$LS_OUT/lib/libssl.a" "$LS_OUT/lib/libcrypto.a" \
     -Wl,-lazy_framework,Security -Wl,-lazy_framework,CoreFoundation \
     -Wl,-exported_symbols_list,"$BUILD/nothing.exp"
   slices+=("$out")
+
+  # The loader is what Security.framework's load command names, so it is mapped into every
+  # process on the system. It links nothing but libc: see the header of the source for why
+  # the engine must not be reachable through a load command.
+  lout="$OBJDIR/aquatransport-$a.dylib"
+  clang -arch "$a" -mmacosx-version-min="$MIN" -O2 -fPIC -fvisibility=hidden \
+    -Wall -Wno-deprecated-declarations -dynamiclib -o "$lout" \
+    -install_name /usr/share/aquatransport/aquatransport.dylib \
+    "$DIR/src/mac/aquatransport_loader.c" \
+    -Wl,-exported_symbols_list,"$BUILD/nothing.exp"
+  loader_slices+=("$lout")
   echo "    $a ok"
 done
 
@@ -124,7 +136,8 @@ fi
 
 mkdir -p "$ST" "$STOOL"
 
-lipo -create "${slices[@]}" -output "$ST/aquatransport.dylib"
+lipo -create "${slices[@]}" -output "$ST/aquatransport_engine.dylib"
+lipo -create "${loader_slices[@]}" -output "$ST/aquatransport.dylib"
 
 # The URL rewriter is pure C compiled into the dylib above (src/mac/aquatransport_rewrite.c),
 # so nothing extra is staged and no process has Objective-C loaded into it.
@@ -138,21 +151,26 @@ lipo -create "${slices[@]}" -output "$ST/aquatransport.dylib"
 #   Added in 10.7:  strndup strnlen getline getdelim memmem arc4random_buf
 #   Added in 10.12: getentropy clock_gettime clock_gettime_nsec_np
 echo "==> verifying"
-have=$(lipo -info "$ST/aquatransport.dylib" | sed 's/.*://')
-echo "    architectures:$have"
+for img in aquatransport.dylib aquatransport_engine.dylib; do
+have=$(lipo -info "$ST/$img" | sed 's/.*://')
+echo "    $img architectures:$have"
 POST106='^_(strndup|strnlen|getline|getdelim|memmem|getentropy|clock_gettime|clock_gettime_nsec_np|arc4random_buf|dispatch_activate|os_unfair_lock_lock)$'
 for a in "${ARCHS[@]}"; do
-  echo "$have" | grep -qw "$a" || { echo "FATAL: missing $a slice; $a processes would go unpatched"; exit 1; }
-  n=$(nm -arch "$a" -g "$ST/aquatransport.dylib" 2>/dev/null | grep -cE " (T|D|B|S) _" || true)
-  [ "$n" = "0" ] || { echo "FATAL: $a exports $n symbols (OpenSSL namespace would leak)"; exit 1; }
-  bad=$(nm -arch "$a" -u "$ST/aquatransport.dylib" 2>/dev/null | tr -d ' ' | grep -E "$POST106" || true)
-  [ -z "$bad" ] || { echo "FATAL: $a imports symbols absent on $MIN (would crash on first use):"
+  echo "$have" | grep -qw "$a" || { echo "FATAL: $img missing $a slice; $a processes would go unpatched"; exit 1; }
+  n=$(nm -arch "$a" -g "$ST/$img" 2>/dev/null | grep -cE " (T|D|B|S) _" || true)
+  [ "$n" = "0" ] || { echo "FATAL: $img $a exports $n symbols (OpenSSL namespace would leak)"; exit 1; }
+  bad=$(nm -arch "$a" -u "$ST/$img" 2>/dev/null | tr -d ' ' | grep -E "$POST106" || true)
+  [ -z "$bad" ] || { echo "FATAL: $img $a imports symbols absent on $MIN (would crash on first use):"
                      echo "$bad" | sed 's/^/      /'; exit 1; }
+done
 done
 echo "    per slice: present, 0 exports, no post-$MIN imports"
 
-ls -lh "$ST/aquatransport.dylib" | awk '{print "    size: "$5}'
-echo "built: $ST/aquatransport.dylib"
+ls -lh "$ST/aquatransport.dylib" "$ST/aquatransport_engine.dylib" | awk '{print "    "$9": "$5}'
+# The loader must stay small: its whole purpose is to be harmless to map.
+lsz=$(stat -f%z "$ST/aquatransport.dylib")
+[ "$lsz" -lt 200000 ] || { echo "FATAL: loader is $lsz bytes; it is meant to be a stub"; exit 1; }
+echo "built: $ST/aquatransport.dylib (loader) + $ST/aquatransport_engine.dylib (engine)"
 
 # ---- 4. the package root's root-only tools ----------------------------------
 # A package payload has to carry everything the install needs, and the install needs a patcher:

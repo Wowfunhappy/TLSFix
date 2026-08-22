@@ -56,10 +56,20 @@ static const char *kDeny[] = {
 };
 
 // Whether this process may be touched at all: every process except the trust daemons on the
-// deny list, whose own traffic routing through our verify path would be a cycle.
+// deny list, whose own traffic routing through our verify path would be a cycle, and any
+// process the user has named in disabled-processes.txt.
+//
+// The file is a separate mechanism from kDeny above, not an extension of it. kDeny encodes a
+// structural cycle in our own design. The file exists because a process can host third-party
+// code we have no say over, which is entitled to object to having its imports rebound
+// underneath it -- a DRM module that verifies its own address space, say. Handing the user a
+// name to exclude is the honest answer there; the alternative is that such a process simply
+// cannot run on a machine with this library installed.
 static int process_eligible(void) {
     const char *pn = getprogname();
-    if (pn) for (int i = 0; kDeny[i]; i++) if (!strcmp(pn, kDeny[i])) return 0;
+    if (!pn) return 1;
+    for (int i = 0; kDeny[i]; i++) if (!strcmp(pn, kDeny[i])) return 0;
+    if (tf_name_listed("disabled-processes.txt", pn)) return 0;
     return 1;
 }
 
@@ -606,7 +616,12 @@ static void install_ssl_hooks(void) {
 __attribute__((constructor))
 static void aquatransport_init(void) {
     // Denied processes get nothing installed, not even a gate.
-    if (!process_eligible()) return;
+    if (!process_eligible()) {
+        // Worth a line even though nothing follows it: an exclusion that silently fails to
+        // apply and one that applies but does not help look identical from outside.
+        if (tf_debug()) tf_log("not installed in %s: excluded", getprogname() ? getprogname() : "?");
+        return;
+    }
     // Unconditionally, and deliberately not behind tf_on(): tf_on() reports false until Secure
     // Transport is loaded, so gating installation on it would mean never installing in a
     // process that loads Security later. Rebinding a symbol no loaded image imports is a

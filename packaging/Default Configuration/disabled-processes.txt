@@ -1,0 +1,19 @@
+# Processes AquaTransport stays out of entirely: no hooks, and the engine is never even
+# loaded into them. They fall back to the system TLS stack, and nothing else on the Mac is
+# affected. One executable name per line; '#' begins a comment.
+#
+# The name is the executable's, not the app's. Activity Monitor shows it, or run
+#   ps -axco command | sort -u
+# For an XPC service it is the service's bundle identifier, as below.
+#
+# Use this when a process hosts code that objects to sharing its address space -- typically
+# something that checks its own integrity and reacts badly to finding a library it did not
+# expect. That check happens when the engine is mapped, before any of its code runs, so a
+# process in that position has to be kept off the list of things it is mapped into.
+
+# Safari's page-rendering process. Widevine DRM playback (Netflix, Amazon, Spotify and the
+# rest) loads Google's CDM here, and the CDM refuses to decrypt with the engine mapped
+# alongside it -- it hangs the tab rather than reporting an error. Nothing is lost by
+# excluding it: WebKit does its network I/O in com.apple.WebKit.Networking, a separate
+# process that is not on this list and still gets the engine.
+com.apple.WebKit.WebContent

@@ -21,6 +21,7 @@ DIR="$(cd "$(dirname "$0")" && pwd)"
 SRC="$DIR/build/stage/usr/share/aquatransport"
 LIBDIR=/usr/share/aquatransport
 DYLIB="$LIBDIR/aquatransport.dylib"
+ENGINE="$LIBDIR/aquatransport_engine.dylib"
 SEC="${AQ_SECURITY_PATH:-/System/Library/Frameworks/Security.framework/Versions/A/Security}"
 BACKUP="$SEC.aquatransport-original"
 INSERT="${AQ_INSERT_DYLIB:-/usr/local/bin/insert_dylib}"
@@ -34,11 +35,16 @@ install)
 
   # A package install has already put the library in place; a build in this tree supersedes it,
   # by rename rather than in-place write, so a load in progress never sees a partial file.
+  # The engine goes first. Only the loader is named by a load command, so a window in which
+  # the loader is present and the engine is not is a window of processes without TLS.
   mkdir -p "$LIBDIR"
-  [ -f "$SRC/aquatransport.dylib" ] &&
-    { cp "$SRC/aquatransport.dylib" "$DYLIB.new"; mv -f "$DYLIB.new" "$DYLIB"; }
+  for lib in aquatransport_engine.dylib aquatransport.dylib; do
+    [ -f "$SRC/$lib" ] &&
+      { cp "$SRC/$lib" "$LIBDIR/$lib.new"; mv -f "$LIBDIR/$lib.new" "$LIBDIR/$lib"; }
+  done
   [ -f "$DYLIB" ] || { echo "no library at $DYLIB -- run ./build-macos.sh first"; exit 1; }
-  for f in flags.txt headers.txt redirects.txt; do [ -f "$LIBDIR/$f" ] || : > "$LIBDIR/$f"; done
+  [ -f "$ENGINE" ] || { echo "no engine at $ENGINE -- run ./build-macos.sh first"; exit 1; }
+  for f in flags.txt headers.txt redirects.txt disabled-processes.txt; do [ -f "$LIBDIR/$f" ] || : > "$LIBDIR/$f"; done
 
   # 0755 on the directory and 0644 on the files is what system.sb requires: it grants
   # file-read* under /usr/share only for world-readable files, and because the load command is

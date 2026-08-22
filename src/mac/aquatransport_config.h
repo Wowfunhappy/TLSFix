@@ -12,6 +12,13 @@
 //                                your own traffic through a locally trusted proxy root)
 //   enforce-apple-safari-ext-chain  leave Safari's Apple-signed-extension checks in force, so
 //                                Safari again refuses self-signed extensions (Safari only)
+//
+// disabled-processes.txt holds one executable name per line, matched exactly against
+// getprogname(). A listed process gets nothing installed in it -- no hooks, no gate -- so it
+// keeps the system TLS stack and every other process is unaffected. Intended for processes
+// hosting third-party code that inspects its own address space and will not tolerate having
+// its imports rebound. Find the name to list in Activity Monitor or `ps -axco command`; for an
+// XPC service it is the service's bundle identifier, e.g. com.apple.WebKit.WebContent.
 
 #ifndef AQUATRANSPORT_CONFIG_H
 #define AQUATRANSPORT_CONFIG_H

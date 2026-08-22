@@ -49,7 +49,7 @@ sudo ./install-macos.sh uninstall  # restore Security.framework, then remove the
 
 | path | contents |
 | --- | --- |
-| `/usr/share/aquatransport/` | `aquatransport.dylib`, `flags.txt`, `headers.txt`, `redirects.txt` |
+| `/usr/share/aquatransport/` | `aquatransport.dylib` (loader), `aquatransport_engine.dylib`, `flags.txt`, `headers.txt`, `redirects.txt`, `disabled-processes.txt` |
 | `/Library/AquaTransport/` | `insert_dylib`, `aquatransport.sh`, `uninstall.sh` — placed by the installer package, run by root |
 
 The split follows from who reads what. A patched process makes both of its reads itself — dyld
@@ -194,6 +194,33 @@ normally with it stripped. A test that exercises only unsigned binaries misses t
 Processes already running keep the Security they mapped at launch, and a library already mapped
 survives both the file and the load command that named it. Newly launched processes are covered
 immediately; a reboot covers everything.
+
+### Staying out of a process
+
+The installed library is two images. `aquatransport.dylib` is a ~25 KB loader that links
+nothing but libc, and it is the only thing Security.framework's load command names.
+`aquatransport_engine.dylib` is everything else — the hooks and OpenSSL — and the loader
+`dlopen()`s it, from beside itself, only for processes not named in `disabled-processes.txt`.
+
+The split exists because a load command is unconditional. Whatever Security names is mapped
+into every process on the system, and a process hosting third-party code cannot always afford
+that: Google's Widevine CDM inspects its own address space and refuses to decrypt when it finds
+an unexpected 9 MB image there, hanging the tab rather than reporting an error. That check runs
+against the *mapping*, before any engine code does, so no flag the engine reads can prevent it —
+which is what a gate inside the engine would have been. The only fix available is not to be
+mapped, and the only way to be conditionally not-mapped behind an unconditional load command is
+for the thing named by it to be a stub that loads the rest itself.
+
+`disabled-processes.txt` holds one executable name per line, matched exactly against
+`getprogname()`; `#` begins a comment. An excluded process gets the system TLS stack and
+nothing else on the Mac is affected. The shipped default lists
+`com.apple.WebKit.WebContent`, Safari's rendering process, which costs nothing because WebKit
+does its network I/O in `com.apple.WebKit.Networking` — a separate process that still gets the
+engine.
+
+This is a different mechanism from the `kDeny[]` list in `aquatransport_hooks_mac.c`, which
+names the trust daemons whose own traffic would otherwise route through our verify path and
+make trust evaluation depend on trust evaluation. That list is structural and not user-editable.
 
 ### Flags
 

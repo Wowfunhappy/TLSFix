@@ -370,7 +370,10 @@ int tf_name_listed(const char *file, const char *name) {
     while (fgets(buf, sizeof buf, f)) {
         size_t l = strlen(buf);
         while (l && (buf[l-1] == '\n' || buf[l-1] == '\r' || buf[l-1] == ' ' || buf[l-1] == '\t')) buf[--l] = 0;
-        if (l == 0) continue;
+        // '#' comments are accepted here and nowhere else: this is the one rule file a user
+        // writes from scratch rather than by copying a block, so it has to be able to say
+        // what a line is for. The block files are positional and a stray line changes meaning.
+        if (l == 0 || buf[0] == '#') continue;
         if (!strcmp(buf, name)) { hit = 1; break; }
     }
     fclose(f);
