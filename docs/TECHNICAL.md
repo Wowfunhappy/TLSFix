@@ -225,14 +225,12 @@ make trust evaluation depend on trust evaluation. That list is structural and no
 ### Flags
 
 `flags.txt` in `/usr/share/aquatransport/` holds one flag name per line, read at runtime by
-every loaded copy of the library. The recognised flags are:
+every loaded copy of the library. Two flags are recognised:
 
 ```
 disabled-mtls   # hand client-certificate connections back to the system stack
 debug           # log handshakes to /tmp/aquatransport-<uid>.log
 allow-legacy-tls # allow TLS 1.0/1.1 and their cipher suites
-disable-certificate-pinning    # honour system/keychain anchors for anchor-restricted evaluations
-enforce-apple-safari-ext-chain # leave Safari's Apple-signed-extension checks in force (Safari only)
 ```
 
 `allow-legacy-tls` is read per connection rather than once per process, so it applies to connections

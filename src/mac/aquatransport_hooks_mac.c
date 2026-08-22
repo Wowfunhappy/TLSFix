@@ -126,10 +126,6 @@ extern void tf_rewrite_install(void);
 // the same eligibility gate as the rest, so denied processes never carry it.
 extern void tf_trust_install(void);
 
-// Patches Safari.framework so self-signed Safari extensions install and stay installed. See
-// src/mac/aquatransport_safariext_mac.c. Acts only in the Safari process; a no-op elsewhere.
-extern void tf_safariext_install(void);
-
 // Which side of the handshake a context speaks is settled when it is created and never named
 // again: Secure Transport on 10.6-10.9 exports no way to ask a context afterwards. So the two
 // creation entry points are hooked for that single fact, and a server context is marked here
@@ -629,5 +625,4 @@ static void aquatransport_init(void) {
     install_ssl_hooks();
     tf_rewrite_install();
     tf_trust_install();
-    tf_safariext_install();
 }
