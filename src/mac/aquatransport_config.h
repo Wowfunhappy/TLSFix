@@ -7,6 +7,7 @@
 // flags.txt holds one flag name per line. Recognised flags:
 //   debug                        log handshakes to /tmp/aquatransport-<uid>.log
 //   disabled-mtls                hand client-certificate connections back to the system stack
+//   disable-icloud-gsa            turn off iCloud authentication on 10.7+ (docs/ICLOUD.md)
 //   disable-certificate-pinning  honour system and keychain anchors for anchor-restricted
 //                                evaluations, defeating pinning process-wide (for monitoring
 //                                your own traffic through a locally trusted proxy root)

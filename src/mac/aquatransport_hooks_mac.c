@@ -33,6 +33,7 @@
 
 #include "../aquatransport.h"
 #include "aquatransport_config.h"
+#include "aquatransport_gsa_mail.h"
 #include "../../deps/fishhook/fishhook.h"
 #include <openssl/err.h>
 #include <pthread.h>
@@ -172,6 +173,7 @@ static OSStatus my_SSLSetConnection(SSLContextRef c, SSLConnectionRef conn) {
 
 static OSStatus my_SSLSetPeerDomainName(SSLContextRef c, const char *name, size_t len) {
     if (!tf_on() || ensure_ready() != 1) return o_SSLSetPeerDomainName(c, name, len);
+    tf_gsa_prepare_mail(name, len);
     OSStatus r = o_SSLSetPeerDomainName(c, name, len);
     Shadow *s = sh_create(c);
     if (s) {

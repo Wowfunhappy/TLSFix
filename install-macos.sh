@@ -33,16 +33,32 @@ case "${1:-}" in install|uninstall) ;; *) sed -n '2,5p' "$0" | sed 's/^# \{0,1\}
 
 case "$1" in
 install)
-  [ -e "$BACKUP" ] && { echo "already installed"; exit 1; }
+  updating=0
+  if [ -e "$BACKUP" ]; then
+    # Updating the payload needs no further framework patch. Refuse an inconsistent
+    # backup/patch pair before changing anything, retaining the recovery original.
+    LC_ALL=C grep -q -a -F "$DYLIB" "$SEC" ||
+      { echo "Security backup exists but the AquaTransport load command is missing"; exit 1; }
+    updating=1
+  fi
+  # Require the complete payload before replacing any library. Package installations
+  # can supply it in LIBDIR instead of the build stage.
+  for lib in aquatransport_gsa.dylib aquatransport_engine.dylib aquatransport.dylib; do
+    [ -f "$SRC/$lib" ] || [ -f "$LIBDIR/$lib" ] ||
+      { echo "missing $lib -- run ./build-macos.sh first"; exit 1; }
+  done
 
   # A package install has already put the library in place; a build in this tree supersedes it,
   # by rename rather than in-place write, so a load in progress never sees a partial file.
-  # The engine goes first. Only the loader is named by a load command, so a window in which
+  # Dependencies go first. Only the loader is named by a load command, so a window in which
   # the loader is present and the engine is not is a window of processes without TLS.
   mkdir -p "$LIBDIR" "$CONFDIR"
-  for lib in aquatransport_engine.dylib aquatransport.dylib; do
-    [ -f "$SRC/$lib" ] &&
-      { cp "$SRC/$lib" "$LIBDIR/$lib.new"; mv -f "$LIBDIR/$lib.new" "$LIBDIR/$lib"; }
+  for lib in aquatransport_gsa.dylib aquatransport_engine.dylib aquatransport.dylib; do
+    if [ -f "$SRC/$lib" ]; then
+      cp "$SRC/$lib" "$LIBDIR/$lib.new"
+      chown root:wheel "$LIBDIR/$lib.new"; chmod 0644 "$LIBDIR/$lib.new"
+      mv -f "$LIBDIR/$lib.new" "$LIBDIR/$lib"
+    fi
   done
   [ -f "$DYLIB" ] || { echo "no library at $DYLIB -- run ./build-macos.sh first"; exit 1; }
   [ -f "$ENGINE" ] || { echo "no engine at $ENGINE -- run ./build-macos.sh first"; exit 1; }
@@ -59,6 +75,10 @@ install)
   # root:wheel because the library loads into root daemons.
   chown root:wheel "$LIBDIR" "$DYLIB" "$ENGINE"
   chmod 0755 "$LIBDIR"; chmod 0644 "$DYLIB" "$ENGINE"
+  if [ -f "$LIBDIR/aquatransport_gsa.dylib" ]; then
+    chown root:wheel "$LIBDIR/aquatransport_gsa.dylib"
+    chmod 0644 "$LIBDIR/aquatransport_gsa.dylib"
+  fi
 
   # insert_dylib and the installer scripts are run as programs, not read as data, so they keep the
   # execute bit. Still world-readable, which is all the /usr/share grant asks for.
@@ -72,6 +92,11 @@ install)
   # world-readable for the sandbox; the subpath grant reaches this depth under /usr/share.
   chown root:admin "$CONFDIR"; chmod 0775 "$CONFDIR"
   chown root:admin "$CONFDIR"/*; chmod 0664 "$CONFDIR"/*
+
+  if [ "$updating" = 1 ]; then
+    echo "Updated. Quit and reopen affected applications, including System Preferences for iCloud."
+    exit 0
+  fi
 
   # --strip-codesig: editing the file invalidates Security's signature, and an invalid signature
   # is far worse than none. The kernel validates the pages of a signed library as a signed

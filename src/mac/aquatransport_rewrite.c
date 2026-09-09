@@ -54,12 +54,14 @@
 // as the caller asked.
 
 #include "aquatransport_config.h"
+#include "aquatransport_gsa_mail.h"
 #include "../../deps/fishhook/fishhook.h"
 #include <CoreFoundation/CoreFoundation.h>
 #include <dlfcn.h>
 #include <pthread.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/utsname.h>
 
 typedef void *(*fn6)(void *, void *, void *, void *, void *, void *);
 
@@ -69,6 +71,7 @@ static CFURLRef (*p_GetURL)(void *);
 static void    *(*p_MutableCopy)(CFAllocatorRef, void *);
 static void     (*p_SetURL)(void *, CFURLRef);
 static void     (*p_SetHeader)(void *, CFStringRef, CFStringRef);
+static fn6       p_CreateConnection;
 static int       g_resolved;
 static pthread_once_t g_resolve_once = PTHREAD_ONCE_INIT;
 
@@ -77,6 +80,7 @@ static void resolve_once(void) {
     p_MutableCopy = (void *(*)(CFAllocatorRef, void *))dlsym(RTLD_DEFAULT, "CFURLRequestCreateMutableCopy");
     p_SetURL      = (void (*)(void *, CFURLRef))dlsym(RTLD_DEFAULT, "CFURLRequestSetURL");
     p_SetHeader   = (void (*)(void *, CFStringRef, CFStringRef))dlsym(RTLD_DEFAULT, "CFURLRequestSetHTTPHeaderFieldValue");
+    p_CreateConnection = (fn6)dlsym(RTLD_DEFAULT, "CFURLConnectionCreate");
     g_resolved = (p_GetURL && p_MutableCopy && p_SetURL && p_SetHeader);
 }
 static int resolved(void) { pthread_once(&g_resolve_once, resolve_once); return g_resolved; }
@@ -107,6 +111,76 @@ static char *cf_to_c(CFStringRef s) {
     if (!buf) return NULL;
     if (!CFStringGetCString(s, buf, max, kCFStringEncodingUTF8)) { free(buf); return NULL; }
     return buf;
+}
+
+/* Authentication needs Foundation, but loading it from Security's constructor breaks
+ * fork-based daemons. Load this authentication image only inside a relevant URL request,
+ * after Foundation is already present, on Lion or later. No ObjC imports in the engine. */
+static pthread_once_t g_gsa_once = PTHREAD_ONCE_INIT;
+static void load_gsa_once(void) {
+    struct utsname os;
+    if (uname(&os) || atoi(os.release) < 11) return;
+    Dl_info info;
+    char path[1024];
+    if (!dladdr((void *)&load_gsa_once, &info) || !info.dli_fname) return;
+    const char *slash = strrchr(info.dli_fname, '/');
+    if (!slash || snprintf(path, sizeof path, "%.*s/aquatransport_gsa.dylib",
+            (int)(slash-info.dli_fname), info.dli_fname) >= sizeof path) return;
+    if (!dlopen(path, RTLD_NOW | RTLD_LOCAL) && tf_debug())
+        tf_log("iCloud GSA module could not be loaded");
+}
+
+static void prepare_gsa(void) {
+    void *(*get_class)(const char *) = dlsym(RTLD_DEFAULT, "objc_getClass");
+    // A C-only request must not consume the once token: Foundation may arrive later.
+    if (get_class && get_class("NSURLConnection")) pthread_once(&g_gsa_once, load_gsa_once);
+}
+
+/* Mail's socket transport need not make an HTTP request before authentication.
+ * Enter here from TLS setup, outside all TLS locks and after MailCore is loaded.
+ * No Foundation or Objective-C library is linked into this C engine. */
+void tf_gsa_prepare_mail(const char *host, size_t length) {
+    if (!aq_mail_host(host, length) || tf_flag("disable-icloud-gsa")) return;
+    void *(*get_class)(const char *) = dlsym(RTLD_DEFAULT, "objc_getClass");
+    if (!get_class || !get_class("_MCAppleTokenSaslClient")) return;
+    prepare_gsa();
+    void *adapter = get_class("AQMailTokenAdapter");
+    void *(*selector)(const char *) = dlsym(RTLD_DEFAULT, "sel_registerName");
+    void (*send)(void *, void *) = dlsym(RTLD_DEFAULT, "objc_msgSend");
+    if (adapter && selector && send) send(adapter, selector("install"));
+}
+
+static int gsa_dav_url(const char *url) {
+    if (strncasecmp(url, "https://", 8)) return 0;
+    const char *h = url + 8, *end = h + strcspn(h, "/?#");
+    /* Native CoreDAV discovery embeds the account name in the authority. Match
+     * the host after userinfo, never a hostname inside the username or path. */
+    for (const char *p = h; p < end; p++) if (*p == '@') h = p + 1;
+    if (*h == 'p' || *h == 'P') {
+        h++;
+        const char *digits = h;
+        while (*h >= '0' && *h <= '9') h++;
+        if (h == digits || *h++ != '-') return 0;
+    }
+    size_t n; const char *legacy;
+    if (!strncasecmp(h, "caldav.icloud.com", 17)) { n = 17; legacy = ":8443"; }
+    else if (!strncasecmp(h, "contacts.icloud.com", 19)) { n = 19; legacy = ":8843"; }
+    else return 0;
+    return h+n == end || (end-(h+n) == 4 && !strncmp(h+n, ":443", 4)) ||
+           (end-(h+n) == 5 && !strncmp(h+n, legacy, 5));
+}
+
+static int gsa_reserved_url(const char *url) {
+    /* Authentication requests must not be redirected or have credentials logged by
+     * general URL/header rules. Match a full authority, including its slash. */
+    return gsa_dav_url(url) || !strncasecmp(url, "https://gsa.apple.com/", 22) ||
+           !strncasecmp(url, "https://setup.icloud.com/", 25) ||
+           !strncasecmp(url, "https://profile.ess.apple.com/", 30) ||
+           !strncasecmp(url, "https://service.ess.apple.com/", 30) ||
+           !strncasecmp(url, "https://profile.ess.apple.com:443/", 34) ||
+           !strncasecmp(url, "https://service.ess.apple.com:443/", 34) ||
+           !strncasecmp(url, "https://gsa.apple.com:443/", 26) ||
+           !strncasecmp(url, "https://setup.icloud.com:443/", 29);
 }
 
 static const tf_headerrule *match_headers(const char *url) {
@@ -153,6 +227,12 @@ static int apply_rules(void *m) {
     char *before = cf_to_c(CFURLGetString(url));
     if (!before) return 0;
 
+    if (!tf_flag("disable-icloud-gsa") && gsa_reserved_url(before)) {
+        prepare_gsa();
+        free(before);
+        return 0;
+    }
+
     char *after = tf_apply_redirect(before);
     const char *effective = after ? after : before;
     const tf_headerrule *hr = match_headers(effective);
@@ -198,7 +278,7 @@ static void *rewritten(void *req) {
 
 // Hooks call through to the ORIGINAL captured by fishhook, so a request we rewrote is
 // never re-entered through the same hook.
-static fn6 o_SendSync, o_CreateWithProps, o_MutableCopy, o_MsgCreate, o_MsgSetHeader;
+static fn6 o_SendSync, o_CreateWithProps, o_Create, o_MutableCopy, o_MsgCreate, o_MsgSetHeader;
 
 static void *my_SendSync(void *a, void *b, void *c, void *d, void *e, void *f) {
     void *m = rewritten(a);
@@ -214,6 +294,16 @@ static void *my_CreateWithProps(void *a, void *b, void *c, void *d, void *e, voi
     return r;
 }
 
+// Mavericks AOSRequest calls this entry directly, before any mutable-copy funnel.
+static void *my_Create(void *a, void *b, void *c, void *d, void *e, void *f) {
+    // Resolve the real function even when fishhook captured an unbound lazy slot.
+    resolved();
+    void *m = rewritten(b);
+    void *r = (p_CreateConnection ? p_CreateConnection : o_Create)(a, m ? m : b, c, d, e, f);
+    if (m) CFRelease(m);
+    return r;
+}
+
 // The raw-stream path: rules applied to the URL the message is built around, and to the message
 // once it exists.
 static void *my_MsgCreate(void *alloc, void *method, void *url, void *version, void *e, void *f) {
@@ -223,6 +313,10 @@ static void *my_MsgCreate(void *alloc, void *method, void *url, void *version, v
     char *before = cf_to_c(CFURLGetString((CFURLRef)url));
     if (!before) return p_MsgCreate((CFAllocatorRef)alloc, (CFStringRef)method,
                                     (CFURLRef)url, (CFStringRef)version);
+    if (!tf_flag("disable-icloud-gsa") && gsa_reserved_url(before)) {
+        free(before);
+        return p_MsgCreate((CFAllocatorRef)alloc, (CFStringRef)method, (CFURLRef)url, (CFStringRef)version);
+    }
 
     char *after = tf_apply_redirect(before);
     const tf_headerrule *hr = match_headers(after ? after : before);
@@ -275,6 +369,9 @@ static void my_MsgSetHeader(void *msg, void *name, void *value, void *d, void *e
     char *before = url ? cf_to_c(CFURLGetString(url)) : NULL;
     if (url) CFRelease(url);
     if (!hn || !before) { free(hn); free(before); p_MsgSetHeader(msg, (CFStringRef)name, (CFStringRef)value); return; }
+    if (!tf_flag("disable-icloud-gsa") && gsa_reserved_url(before)) {
+        free(hn); free(before); p_MsgSetHeader(msg, (CFStringRef)name, (CFStringRef)value); return;
+    }
 
     char *after = tf_apply_redirect(before);
     const tf_headerrule *hr = match_headers(after ? after : before);
@@ -305,9 +402,10 @@ void tf_rewrite_install(void) {
         { "CFURLRequestCreateMutableCopy",         (void *)my_MutableCopy,     (void **)&o_MutableCopy },
         { "CFURLConnectionSendSynchronousRequest", (void *)my_SendSync,        (void **)&o_SendSync },
         { "CFURLConnectionCreateWithProperties",   (void *)my_CreateWithProps, (void **)&o_CreateWithProps },
+        { "CFURLConnectionCreate",                 (void *)my_Create,          (void **)&o_Create },
         { "CFHTTPMessageCreateRequest",            (void *)my_MsgCreate,       (void **)&o_MsgCreate },
         { "CFHTTPMessageSetHeaderFieldValue",      (void *)my_MsgSetHeader,    (void **)&o_MsgSetHeader },
     };
     // Also arms a dyld add-image callback, so CFNetwork loaded later still gets rebound.
-    rebind_symbols(r, 5);
+    rebind_symbols(r, sizeof r / sizeof r[0]);
 }

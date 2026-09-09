@@ -23,8 +23,11 @@ skipped there), both `x86_64` and `i386`.
 ./tools/selftest.sh       # per-process tests, installs nothing
 ```
 
-Everything is vendored: `deps/openssl-3.5.7.tar.gz` (checksum matches upstream). No network
-needed to build.
+OpenSSL is vendored: `deps/openssl-3.5.7.tar.gz` (checksum matches upstream).
+The iCloud authentication module also needs a GC-capable compiler;
+see [ICLOUD.md](ICLOUD.md) for toolchain setup, configuration, and its experimental
+validation status. It is a separate image loaded at request time, not a Foundation
+dependency of the TLS engine. Once the toolchain is present, builds need no network.
 
 The build enforces three invariants, each guarding a failure that is silent at link time:
 

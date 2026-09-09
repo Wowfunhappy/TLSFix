@@ -1,8 +1,8 @@
 #!/bin/bash
 # Builds AquaTransport for Mac OS X 10.6 - 10.9.
 #
-# Everything is built from sources in this repo: deps/openssl-*.tar.gz is the only
-# external dependency and it is vendored, so a build needs no network access.
+# OpenSSL is vendored. The GSA module also needs a GC-capable compiler;
+# see docs/ICLOUD.md. Once the toolchain is present, builds need no network access.
 #
 # Output: build/stage/usr/share/aquatransport/aquatransport.dylib (fat i386 + x86_64)
 #
@@ -19,6 +19,16 @@ MIN="${AQUATRANSPORT_MIN_OS:-10.6}"
 ARCHS=(x86_64 i386)
 
 BUILD="$DIR/build"
+mkdir -p "$BUILD"
+GSA_CC="${AQUATRANSPORT_GSA_CC:-$BUILD/gsa-toolchain/bin/clang}"
+[ -x "$GSA_CC" ] || GSA_CC="${AQUATRANSPORT_GSA_CC:-clang}"
+# Clang 3.4 still emits GC write barriers; newer Apple clang cannot. See docs/ICLOUD.md.
+if ! printf '@interface AQGC @end\n@implementation AQGC @end\n' | \
+    "$GSA_CC" -x objective-c -fobjc-gc -c -o "$BUILD/gsa-gc-check.o" - 2>/dev/null; then
+  echo "GSA needs a GC-capable compiler. Set AQUATRANSPORT_GSA_CC (see docs/ICLOUD.md)."
+  exit 1
+fi
+rm -f "$BUILD/gsa-gc-check.o"
 LS_SRC="$BUILD/src/openssl-$OPENSSL_VERSION"
 LS_OUT="$BUILD/openssl"
 TARBALL="$DIR/deps/openssl-$OPENSSL_VERSION.tar.gz"
@@ -79,6 +89,7 @@ OBJDIR="$BUILD/obj"; rm -rf "$OBJDIR"; mkdir -p "$OBJDIR"
 
 slices=()
 loader_slices=()
+gsa_slices=()
 for a in "${ARCHS[@]}"; do
   objs=()
   for src in "${SRCS[@]}"; do
@@ -106,6 +117,23 @@ for a in "${ARCHS[@]}"; do
     "$DIR/src/mac/aquatransport_loader.c" \
     -Wl,-exported_symbols_list,"$BUILD/nothing.exp"
   loader_slices+=("$lout")
+
+  # iCloud begins at 10.7. This separate image supports GC for System Preferences;
+  # the engine stays pure C and the loader never maps it during process startup.
+  gobj="$OBJDIR/aquatransport_gsa-$a.o"
+  "$GSA_CC" -arch "$a" -mmacosx-version-min=10.7 -O2 -fPIC -fvisibility=hidden \
+    -fobjc-gc -Wall -Wno-deprecated-declarations -I"$LS_OUT/include" \
+    -c "$DIR/src/mac/aquatransport_gsa.m" -o "$gobj"
+  cobj="$OBJDIR/aquatransport_gsa_crypto-$a.o"
+  clang -arch "$a" -mmacosx-version-min=10.7 -O2 -fPIC -fvisibility=hidden \
+    -Wall -Wno-deprecated-declarations -I"$LS_OUT/include" \
+    -c "$DIR/src/mac/aquatransport_gsa_crypto.c" -o "$cobj"
+  gout="$OBJDIR/aquatransport_gsa-$a.dylib"
+  clang -arch "$a" -mmacosx-version-min=10.7 -dynamiclib -o "$gout" \
+    -install_name /usr/share/aquatransport/aquatransport_gsa.dylib \
+    "$gobj" "$cobj" "$OBJDIR/aquatransport_config-$a.o" "$LS_OUT/lib/libcrypto.a" \
+    -framework Foundation -framework IOKit -lz -Wl,-exported_symbols_list,"$BUILD/nothing.exp"
+  gsa_slices+=("$gout")
   echo "    $a ok"
 done
 
@@ -130,9 +158,10 @@ mkdir -p "$ST"
 
 lipo -create "${slices[@]}" -output "$ST/aquatransport_engine.dylib"
 lipo -create "${loader_slices[@]}" -output "$ST/aquatransport.dylib"
+lipo -create "${gsa_slices[@]}" -output "$ST/aquatransport_gsa.dylib"
 
 # The URL rewriter is pure C compiled into the dylib above (src/mac/aquatransport_rewrite.c),
-# so nothing extra is staged and no process has Objective-C loaded into it.
+# and has no Objective-C dependency. The GSA image is loaded at request time.
 
 # ---- 3. verify the invariants ----------------------------------------------
 # Per slice: the architecture is present; nothing is exported (OpenSSL's whole SSL_*/EVP_*
@@ -143,7 +172,7 @@ lipo -create "${loader_slices[@]}" -output "$ST/aquatransport.dylib"
 #   Added in 10.7:  strndup strnlen getline getdelim memmem arc4random_buf
 #   Added in 10.12: getentropy clock_gettime clock_gettime_nsec_np
 echo "==> verifying"
-for img in aquatransport.dylib aquatransport_engine.dylib; do
+for img in aquatransport.dylib aquatransport_engine.dylib aquatransport_gsa.dylib; do
 have=$(lipo -info "$ST/$img" | sed 's/.*://')
 echo "    $img architectures:$have"
 POST106='^_(strndup|strnlen|getline|getdelim|memmem|getentropy|clock_gettime|clock_gettime_nsec_np|arc4random_buf|dispatch_activate|os_unfair_lock_lock)$'
@@ -157,9 +186,13 @@ for a in "${ARCHS[@]}"; do
 done
 done
 echo "    per slice: present, 0 exports, no post-$MIN imports"
+# OS X's Objective-C collector is x86_64 only; i386 uses retain/release.
+otool -arch x86_64 -ov "$ST/aquatransport_gsa.dylib" | grep -q 'OBJC_IMAGE_SUPPORTS_GC' ||
+  { echo "FATAL: GSA x86_64 does not support Objective-C garbage collection"; exit 1; }
+echo "    GSA: GC-compatible, deployment target 10.7"
 
 ls -lh "$ST/aquatransport.dylib" "$ST/aquatransport_engine.dylib" | awk '{print "    "$9": "$5}'
 # The loader must stay small: its whole purpose is to be harmless to map.
 lsz=$(stat -f%z "$ST/aquatransport.dylib")
 [ "$lsz" -lt 200000 ] || { echo "FATAL: loader is $lsz bytes; it is meant to be a stub"; exit 1; }
-echo "built: $ST/aquatransport.dylib (loader) + $ST/aquatransport_engine.dylib (engine)"
+echo "built: loader + TLS engine + iCloud GSA module in $ST"
