@@ -55,6 +55,7 @@
 
 #include "aquatransport_config.h"
 #include "aquatransport_gsa_mail.h"
+#include "aquatransport_maps.h"
 #include "../../deps/fishhook/fishhook.h"
 #include <CoreFoundation/CoreFoundation.h>
 #include <dlfcn.h>
@@ -72,6 +73,7 @@ static void    *(*p_MutableCopy)(CFAllocatorRef, void *);
 static void     (*p_SetURL)(void *, CFURLRef);
 static void     (*p_SetHeader)(void *, CFStringRef, CFStringRef);
 static fn6       p_CreateConnection;
+static fn6       p_SendSync, p_CreateWithProps;
 static int       g_resolved;
 static pthread_once_t g_resolve_once = PTHREAD_ONCE_INIT;
 
@@ -81,6 +83,8 @@ static void resolve_once(void) {
     p_SetURL      = (void (*)(void *, CFURLRef))dlsym(RTLD_DEFAULT, "CFURLRequestSetURL");
     p_SetHeader   = (void (*)(void *, CFStringRef, CFStringRef))dlsym(RTLD_DEFAULT, "CFURLRequestSetHTTPHeaderFieldValue");
     p_CreateConnection = (fn6)dlsym(RTLD_DEFAULT, "CFURLConnectionCreate");
+    p_SendSync = (fn6)dlsym(RTLD_DEFAULT, "CFURLConnectionSendSynchronousRequest");
+    p_CreateWithProps = (fn6)dlsym(RTLD_DEFAULT, "CFURLConnectionCreateWithProperties");
     g_resolved = (p_GetURL && p_MutableCopy && p_SetURL && p_SetHeader);
 }
 static int resolved(void) { pthread_once(&g_resolve_once, resolve_once); return g_resolved; }
@@ -233,7 +237,9 @@ static int apply_rules(void *m) {
         return 0;
     }
 
-    char *after = tf_apply_redirect(before);
+    char *after = tf_maps_rewrite_url(before);
+    int maps = after != NULL;
+    if (!after) after = tf_apply_redirect(before);
     const char *effective = after ? after : before;
     const tf_headerrule *hr = match_headers(effective);
     if (!after && !hr) { free(before); return 0; }
@@ -256,7 +262,8 @@ static int apply_rules(void *m) {
             CFRelease(nu);
         }
         if (s) CFRelease(s);
-        tf_log("rewrite %s -> %s", before, after);
+        if (maps) tf_log("rewrote legacy map service URL");
+        else tf_log("rewrite %s -> %s", before, after);
     }
     if (hr) apply_header_rule(hr, m, (hdr_set)p_SetHeader);
     free(before); free(after);
@@ -276,20 +283,22 @@ static void *rewritten(void *req) {
     return NULL;
 }
 
-// Hooks call through to the ORIGINAL captured by fishhook, so a request we rewrote is
-// never re-entered through the same hook.
+// Resolve callable originals with dlsym. A fishhook-captured lazy binding stub can
+// overwrite our hook when invoked: the first async map request would be rewritten,
+// but subsequent requests would bypass us and reach the retired tile hostname.
+// Keep captured pointers only as a fallback when symbol resolution fails.
 static fn6 o_SendSync, o_CreateWithProps, o_Create, o_MutableCopy, o_MsgCreate, o_MsgSetHeader;
 
 static void *my_SendSync(void *a, void *b, void *c, void *d, void *e, void *f) {
     void *m = rewritten(a);
-    void *r = o_SendSync(m ? m : a, b, c, d, e, f);
+    void *r = (p_SendSync ? p_SendSync : o_SendSync)(m ? m : a, b, c, d, e, f);
     if (m) CFRelease(m);
     return r;
 }
 
 static void *my_CreateWithProps(void *a, void *b, void *c, void *d, void *e, void *f) {
     void *m = rewritten(b);
-    void *r = o_CreateWithProps(a, m ? m : b, c, d, e, f);
+    void *r = (p_CreateWithProps ? p_CreateWithProps : o_CreateWithProps)(a, m ? m : b, c, d, e, f);
     if (m) CFRelease(m);
     return r;
 }
@@ -318,7 +327,9 @@ static void *my_MsgCreate(void *alloc, void *method, void *url, void *version, v
         return p_MsgCreate((CFAllocatorRef)alloc, (CFStringRef)method, (CFURLRef)url, (CFStringRef)version);
     }
 
-    char *after = tf_apply_redirect(before);
+    char *after = tf_maps_rewrite_url(before);
+    int maps = after != NULL;
+    if (!after) after = tf_apply_redirect(before);
     const tf_headerrule *hr = match_headers(after ? after : before);
 
     CFURLRef use = (CFURLRef)url;
@@ -327,7 +338,7 @@ static void *my_MsgCreate(void *alloc, void *method, void *url, void *version, v
     if (after) {
         ns = CFStringCreateWithCString(NULL, after, kCFStringEncodingUTF8);
         nu = ns ? CFURLCreateWithString(NULL, ns, NULL) : NULL;
-        if (nu) { use = nu; tf_log("rewrite %s -> %s", before, after); }
+        if (nu) { use = nu; if (maps) tf_log("rewrote legacy map service URL"); else tf_log("rewrite %s -> %s", before, after); }
     }
 
     void *msg = p_MsgCreate((CFAllocatorRef)alloc, (CFStringRef)method, use, (CFStringRef)version);
@@ -388,7 +399,8 @@ static void my_MsgSetHeader(void *msg, void *name, void *value, void *d, void *e
 // CFURLConnection* entry points at all, so without this hook it would go unrewritten.
 // The result is already mutable, so the rules are applied to it directly.
 static void *my_MutableCopy(void *a, void *b, void *c, void *d, void *e, void *f) {
-    void *m = o_MutableCopy(a, b, c, d, e, f);
+    resolved();
+    void *m = p_MutableCopy ? p_MutableCopy(a, b) : o_MutableCopy(a, b, c, d, e, f);
     if (m) apply_rules(m);
     return m;
 }
@@ -398,6 +410,7 @@ static void *my_MutableCopy(void *a, void *b, void *c, void *d, void *e, void *f
 // fewer than the real count would make the callee read uninitialised registers or stack.
 // This keeps the pass-through safe without depending on private headers being exact.
 void tf_rewrite_install(void) {
+    tf_maps_install();
     struct rebinding r[] = {
         { "CFURLRequestCreateMutableCopy",         (void *)my_MutableCopy,     (void **)&o_MutableCopy },
         { "CFURLConnectionSendSynchronousRequest", (void *)my_SendSync,        (void **)&o_SendSync },

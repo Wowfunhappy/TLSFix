@@ -43,7 +43,7 @@ install)
   fi
   # Require the complete payload before replacing any library. Package installations
   # can supply it in LIBDIR instead of the build stage.
-  for lib in aquatransport_gsa.dylib aquatransport_engine.dylib aquatransport.dylib; do
+  for lib in aquatransport_maps.dylib aquatransport_gsa.dylib aquatransport_engine.dylib aquatransport.dylib; do
     [ -f "$SRC/$lib" ] || [ -f "$LIBDIR/$lib" ] ||
       { echo "missing $lib -- run ./build-macos.sh first"; exit 1; }
   done
@@ -53,7 +53,7 @@ install)
   # Dependencies go first. Only the loader is named by a load command, so a window in which
   # the loader is present and the engine is not is a window of processes without TLS.
   mkdir -p "$LIBDIR" "$CONFDIR"
-  for lib in aquatransport_gsa.dylib aquatransport_engine.dylib aquatransport.dylib; do
+  for lib in aquatransport_maps.dylib aquatransport_gsa.dylib aquatransport_engine.dylib aquatransport.dylib; do
     if [ -f "$SRC/$lib" ]; then
       cp "$SRC/$lib" "$LIBDIR/$lib.new"
       chown root:wheel "$LIBDIR/$lib.new"; chmod 0644 "$LIBDIR/$lib.new"
@@ -75,10 +75,11 @@ install)
   # root:wheel because the library loads into root daemons.
   chown root:wheel "$LIBDIR" "$DYLIB" "$ENGINE"
   chmod 0755 "$LIBDIR"; chmod 0644 "$DYLIB" "$ENGINE"
-  if [ -f "$LIBDIR/aquatransport_gsa.dylib" ]; then
-    chown root:wheel "$LIBDIR/aquatransport_gsa.dylib"
-    chmod 0644 "$LIBDIR/aquatransport_gsa.dylib"
-  fi
+  for lib in aquatransport_gsa.dylib aquatransport_maps.dylib; do
+    if [ -f "$LIBDIR/$lib" ]; then
+      chown root:wheel "$LIBDIR/$lib"; chmod 0644 "$LIBDIR/$lib"
+    fi
+  done
 
   # insert_dylib and the installer scripts are run as programs, not read as data, so they keep the
   # execute bit. Still world-readable, which is all the /usr/share grant asks for.

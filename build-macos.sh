@@ -83,13 +83,14 @@ fi
 # ---- 2. the dylib ----------------------------------------------------------
 echo "==> building aquatransport.dylib (min $MIN)"
 SRCS=("$DIR/src/aquatransport_engine.c" "$DIR/src/mac/aquatransport_hooks_mac.c" "$DIR/src/mac/aquatransport_config.c"
-      "$DIR/src/mac/aquatransport_rewrite.c" "$DIR/src/mac/aquatransport_trust_mac.c" "$DIR/deps/fishhook/fishhook.c")
+      "$DIR/src/mac/aquatransport_maps.c" "$DIR/src/mac/aquatransport_rewrite.c" "$DIR/src/mac/aquatransport_trust_mac.c" "$DIR/deps/fishhook/fishhook.c")
 OBJDIR="$BUILD/obj"; rm -rf "$OBJDIR"; mkdir -p "$OBJDIR"
 : > "$BUILD/nothing.exp"
 
 slices=()
 loader_slices=()
 gsa_slices=()
+maps_slices=()
 for a in "${ARCHS[@]}"; do
   objs=()
   for src in "${SRCS[@]}"; do
@@ -134,6 +135,12 @@ for a in "${ARCHS[@]}"; do
     "$gobj" "$cobj" "$OBJDIR/aquatransport_config-$a.o" "$LS_OUT/lib/libcrypto.a" \
     -framework Foundation -framework IOKit -lz -Wl,-exported_symbols_list,"$BUILD/nothing.exp"
   gsa_slices+=("$gout")
+  mout="$OBJDIR/aquatransport_maps-$a.dylib"
+  "$GSA_CC" -arch "$a" -mmacosx-version-min=10.9 -O2 -fPIC -fvisibility=hidden \
+    -fobjc-gc -Wall -dynamiclib "$DIR/src/mac/aquatransport_maps.m" \
+    -framework Foundation -install_name /usr/share/aquatransport/aquatransport_maps.dylib \
+    -Wl,-exported_symbols_list,"$BUILD/nothing.exp" -o "$mout"
+  maps_slices+=("$mout")
   echo "    $a ok"
 done
 
@@ -159,6 +166,7 @@ mkdir -p "$ST"
 lipo -create "${slices[@]}" -output "$ST/aquatransport_engine.dylib"
 lipo -create "${loader_slices[@]}" -output "$ST/aquatransport.dylib"
 lipo -create "${gsa_slices[@]}" -output "$ST/aquatransport_gsa.dylib"
+lipo -create "${maps_slices[@]}" -output "$ST/aquatransport_maps.dylib"
 
 # The URL rewriter is pure C compiled into the dylib above (src/mac/aquatransport_rewrite.c),
 # and has no Objective-C dependency. The GSA image is loaded at request time.
@@ -172,7 +180,7 @@ lipo -create "${gsa_slices[@]}" -output "$ST/aquatransport_gsa.dylib"
 #   Added in 10.7:  strndup strnlen getline getdelim memmem arc4random_buf
 #   Added in 10.12: getentropy clock_gettime clock_gettime_nsec_np
 echo "==> verifying"
-for img in aquatransport.dylib aquatransport_engine.dylib aquatransport_gsa.dylib; do
+for img in aquatransport.dylib aquatransport_engine.dylib aquatransport_gsa.dylib aquatransport_maps.dylib; do
 have=$(lipo -info "$ST/$img" | sed 's/.*://')
 echo "    $img architectures:$have"
 POST106='^_(strndup|strnlen|getline|getdelim|memmem|getentropy|clock_gettime|clock_gettime_nsec_np|arc4random_buf|dispatch_activate|os_unfair_lock_lock)$'
@@ -190,6 +198,9 @@ echo "    per slice: present, 0 exports, no post-$MIN imports"
 otool -arch x86_64 -ov "$ST/aquatransport_gsa.dylib" | grep -q 'OBJC_IMAGE_SUPPORTS_GC' ||
   { echo "FATAL: GSA x86_64 does not support Objective-C garbage collection"; exit 1; }
 echo "    GSA: GC-compatible, deployment target 10.7"
+otool -arch x86_64 -ov "$ST/aquatransport_maps.dylib" | grep -q 'OBJC_IMAGE_SUPPORTS_GC' ||
+  { echo "FATAL: maps module does not support Objective-C garbage collection"; exit 1; }
+echo "    Maps: GC-compatible, deployment target 10.9"
 
 ls -lh "$ST/aquatransport.dylib" "$ST/aquatransport_engine.dylib" | awk '{print "    "$9": "$5}'
 # The loader must stay small: its whole purpose is to be harmless to map.
