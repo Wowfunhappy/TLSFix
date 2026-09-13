@@ -119,7 +119,7 @@ The old pane may show a generic authentication failure rather than instructions 
 entering the code. The user completed this two-attempt flow with a real account. SMS-only
 verification (`secondaryAuth`), account recovery, account creation, terms acceptance,
 Game Center and Find My are not implemented. The experimental iMessage profile
-adapter is described below; its server acceptance is not yet verified. This module does not
+adapter is described below; native iMessage sign-in is user-confirmed on Mavericks. This module does not
 guarantee that iCloud services work after account creation.
 
 To turn the capability off, add `disable-icloud-gsa` to
@@ -223,8 +223,7 @@ case-folded equality, not a contains query.
 Adapter 10 passes 98 offline checks, including compressed iMessage sign-in, 2FA,
 failed delegates, missing credentials, malformed statuses, rejected redirects,
 invalid server proofs, decompression limits, endpoint scope and the off flag,
-alongside the existing iCloud/DAV/Mail checks. Apple issuing the Madrid delegate
-with this PET and successful native iMessage activation still require a user test.
+alongside the existing iCloud/DAV/Mail checks. The user confirmed native iMessage sign-in succeeds with adapter 10 on 2026-09-09.
 The offline 2FA tests run in one process; they do not verify preservation of pending
 verification state across an XPC agent restart. FaceTime uses the same profile
 endpoint, but its use of this delegate and repeated authentication are unverified.

@@ -106,6 +106,8 @@ Credits
 \
 AquaTransport is based on the TLSFix package for iOS written by nfzerox and ObscureMosquito.\
 \
+AquaTransport uses code adapted from the GSAFix package for iOS written by Pod. Pod additionally located the correct URLs and headers for various services used by AquaTransport. Thank you!\
+\
 A huge thank you to Krackers for reviewing code and generally entertaining all of my inane ideas and mistakes. His immense patience and technical knowledge has been invaluable.\
 \
 AquaTransport uses and relies upon OpenSSL, which is licensed under the terms of the Apache License v2.\
@@ -113,8 +115,6 @@ AquaTransport uses and relies upon OpenSSL, which is licensed under the terms of
 AquaTransport uses Fishhook, a library created by Facebook, Inc, which is licensed under the terms of the BSD-3-Clause license.\
 \
 As stated above, thank you to {\field{\*\fldinst{HYPERLINK "https://preloading.dev/"}}{\fldrslt Preloading}} for the Twitter API Bridge.\
-\
-Thank you to Pod for finding the right URLs and headers for various services.\
 
 \b\fs56 \
 For Advanced Users
@@ -212,11 +212,14 @@ Add any of the below flags to
 \pard\tx220\tx720\tx1440\tx2160\tx2880\tx3600\tx4320\tx5040\tx5760\tx6480\tx7200\tx7920\tx8640\li720\fi-720\pardirnatural
 \ls4\ilvl0\cf0 {\listtext	\'95	}debug\
 \pard\tx940\tx1440\tx2160\tx2880\tx3600\tx4320\tx5040\tx5760\tx6480\tx7200\tx7920\tx8640\li1440\fi-1440\pardirnatural
-\ls4\ilvl1\cf0 {\listtext	\uc0\u8259 	}log each secure connection to /tmp/aquatransport-<your-user-id>.log.\
+\ls4\ilvl1\cf0 {\listtext	\uc0\u8259 	}Log each secure connection to /tmp/aquatransport-<your-user-id>.log.\
 \pard\tx220\tx720\tx1440\tx2160\tx2880\tx3600\tx4320\tx5040\tx5760\tx6480\tx7200\tx7920\tx8640\li720\fi-720\pardirnatural
 \ls4\ilvl0\cf0 {\listtext	\'95	}disable-certificate-pinning\
 \pard\tx940\tx1440\tx2160\tx2880\tx3600\tx4320\tx5040\tx5760\tx6480\tx7200\tx7920\tx8640\li1440\fi-1440\pardirnatural
 \ls4\ilvl1\cf0 {\listtext	\uc0\u8259 	}Honor system and keychain anchors even for apps which say not to. May be useful for monitoring your Mac's traffic.\
+\pard\tx220\tx720\tx1440\tx2160\tx2880\tx3600\tx4320\tx5040\tx5760\tx6480\tx7200\tx7920\tx8640\li720\fi-720\pardirnatural
+\ls4\ilvl0\cf0 {\listtext	\'95	}disable-icloud-gsa\
+{\listtext	\'95	}disable-maps-fixes\
 \pard\tx720\tx1440\tx2160\tx2880\tx3600\tx4320\tx5040\tx5760\tx6480\tx7200\tx7920\tx8640\pardirnatural
 \cf0 \
 If adding multiple flags, put each flag on a separate line.}
