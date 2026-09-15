@@ -53,10 +53,10 @@ typedef struct {
     int              noCertVerify;
     int              approved;
     int              clientBypass;
-    // Set on a context created with kSSLServerSide. This engine speaks the client half of the
-    // handshake -- ossl_init calls SSL_set_connect_state -- so a server context is left to the
-    // system stack entire, the way clientBypass leaves it a client certificate we cannot carry.
+    // Server support is enabled separately from the existing client path.
     int              serverSide;
+    int              serverAuth;
+    int              serverBypass;
     X509            *clientX509;
     STACK_OF(X509)  *clientChain;
     SecKeyRef        clientKey;

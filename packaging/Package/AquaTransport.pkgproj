@@ -182,7 +182,24 @@
 								</dict>
 								<dict>
 									<key>CHILDREN</key>
-									<array/>
+									<array>
+										<dict>
+											<key>CHILDREN</key>
+											<array/>
+											<key>GID</key>
+											<integer>0</integer>
+											<key>PATH</key>
+											<string>../../build/stage/Library/LaunchDaemons/org.aquatransport.bootstrap.plist</string>
+											<key>PATH_TYPE</key>
+											<integer>1</integer>
+											<key>PERMISSIONS</key>
+											<integer>420</integer>
+											<key>TYPE</key>
+											<integer>3</integer>
+											<key>UID</key>
+											<integer>0</integer>
+										</dict>
+									</array>
 									<key>GID</key>
 									<integer>0</integer>
 									<key>PATH</key>
@@ -418,6 +435,22 @@
 													<key>GID</key>
 													<integer>0</integer>
 													<key>PATH</key>
+													<string>../../build/stage/usr/share/aquatransport/aquatransport-bootstrap</string>
+													<key>PATH_TYPE</key>
+													<integer>1</integer>
+													<key>PERMISSIONS</key>
+													<integer>493</integer>
+													<key>TYPE</key>
+													<integer>3</integer>
+													<key>UID</key>
+													<integer>0</integer>
+												</dict>
+												<dict>
+													<key>CHILDREN</key>
+													<array/>
+													<key>GID</key>
+													<integer>0</integer>
+													<key>PATH</key>
 													<string>../../build/stage/usr/share/aquatransport/aquatransport.dylib</string>
 													<key>PATH_TYPE</key>
 													<integer>1</integer>
@@ -473,6 +506,103 @@
 													<integer>420</integer>
 													<key>TYPE</key>
 													<integer>3</integer>
+													<key>UID</key>
+													<integer>0</integer>
+												</dict>
+												<dict>
+													<key>CHILDREN</key>
+													<array/>
+													<key>GID</key>
+													<integer>0</integer>
+													<key>PATH</key>
+													<string>../../build/stage/usr/share/aquatransport/aquatransport_airdrop.dylib</string>
+													<key>PATH_TYPE</key>
+													<integer>1</integer>
+													<key>PERMISSIONS</key>
+													<integer>493</integer>
+													<key>TYPE</key>
+													<integer>3</integer>
+													<key>UID</key>
+													<integer>0</integer>
+												</dict>
+												<dict>
+													<key>CHILDREN</key>
+													<array>
+														<dict>
+															<key>CHILDREN</key>
+															<array/>
+															<key>GID</key>
+															<integer>0</integer>
+															<key>PATH</key>
+															<string>../../build/stage/usr/share/aquatransport/airdrop/ad_ble_wake</string>
+															<key>PATH_TYPE</key>
+															<integer>1</integer>
+															<key>PERMISSIONS</key>
+															<integer>493</integer>
+															<key>TYPE</key>
+															<integer>3</integer>
+															<key>UID</key>
+															<integer>0</integer>
+														</dict>
+														<dict>
+															<key>CHILDREN</key>
+															<array/>
+															<key>GID</key>
+															<integer>0</integer>
+															<key>PATH</key>
+															<string>../../build/stage/usr/share/aquatransport/airdrop/org.aquatransport.airdrop</string>
+															<key>PATH_TYPE</key>
+															<integer>1</integer>
+															<key>PERMISSIONS</key>
+															<integer>493</integer>
+															<key>TYPE</key>
+															<integer>3</integer>
+															<key>UID</key>
+															<integer>0</integer>
+														</dict>
+														<dict>
+															<key>CHILDREN</key>
+															<array/>
+															<key>GID</key>
+															<integer>0</integer>
+															<key>PATH</key>
+															<string>../../build/stage/usr/share/aquatransport/airdrop/org.aquatransport.airdrop.plist</string>
+															<key>PATH_TYPE</key>
+															<integer>1</integer>
+															<key>PERMISSIONS</key>
+															<integer>420</integer>
+															<key>TYPE</key>
+															<integer>3</integer>
+															<key>UID</key>
+															<integer>0</integer>
+														</dict>
+														<dict>
+															<key>CHILDREN</key>
+															<array/>
+															<key>GID</key>
+															<integer>0</integer>
+															<key>PATH</key>
+															<string>../../build/stage/usr/share/aquatransport/airdrop/owl</string>
+															<key>PATH_TYPE</key>
+															<integer>1</integer>
+															<key>PERMISSIONS</key>
+															<integer>493</integer>
+															<key>TYPE</key>
+															<integer>3</integer>
+															<key>UID</key>
+															<integer>0</integer>
+														</dict>
+													</array>
+													<key>GID</key>
+													<integer>0</integer>
+													<key>PATH</key>
+													<string>airdrop</string>
+													<key>PATH_TYPE</key>
+													<integer>2</integer>
+													<key>PERMISSIONS</key>
+													<integer>493</integer>
+													<key>TYPE</key>
+													<integer>2</integer>
 													<key>UID</key>
 													<integer>0</integer>
 												</dict>
@@ -669,7 +799,7 @@
 				<key>USE_HFS+_COMPRESSION</key>
 				<false/>
 				<key>VERSION</key>
-				<string>2026.09.09</string>
+				<string>2026.09.21</string>
 			</dict>
 			<key>TYPE</key>
 			<integer>0</integer>
@@ -1184,6 +1314,50 @@
 			<key>UUID</key>
 			<string>638B3C41-6606-4330-9386-0659D0F3DFE2</string>
 		</dict>
+		<dict>
+			<key>MUST-CLOSE-APPLICATION-ITEMS</key>
+			<array/>
+			<key>MUST-CLOSE-APPLICATIONS</key>
+			<false/>
+			<key>PACKAGE_SETTINGS</key>
+			<dict>
+				<key>AUTHENTICATION</key>
+				<integer>1</integer>
+				<key>CONCLUSION_ACTION</key>
+				<integer>0</integer>
+				<key>FOLLOW_SYMBOLIC_LINKS</key>
+				<false/>
+				<key>IDENTIFIER</key>
+				<string></string>
+				<key>LOCATION</key>
+				<integer>0</integer>
+				<key>NAME</key>
+				<string>tap</string>
+				<key>OVERWRITE_PERMISSIONS</key>
+				<false/>
+				<key>PAYLOAD_SIZE</key>
+				<integer>-1</integer>
+				<key>REFERENCE_PATH</key>
+				<string></string>
+				<key>RELOCATABLE</key>
+				<false/>
+				<key>USE_HFS+_COMPRESSION</key>
+				<false/>
+				<key>VERSION</key>
+				<string>1.0</string>
+			</dict>
+			<key>PATH</key>
+			<dict>
+				<key>PATH</key>
+				<string>../tap.pkg</string>
+				<key>PATH_TYPE</key>
+				<integer>1</integer>
+			</dict>
+			<key>TYPE</key>
+			<integer>1</integer>
+			<key>UUID</key>
+			<string>91CD7730-18E3-475A-8DEA-7B3155B851BE</string>
+		</dict>
 	</array>
 	<key>PROJECT</key>
 	<dict>
@@ -1270,6 +1444,69 @@ Distrusted Certificates:• Chambers of Commerce Root
 								<integer>0</integer>
 								<key>UUID</key>
 								<string>012A339D-4EE5-4462-8CFD-7986D71B52EE</string>
+							</dict>
+							<dict>
+								<key>CHILDREN</key>
+								<array/>
+								<key>DESCRIPTION</key>
+								<array>
+									<dict>
+										<key>LANGUAGE</key>
+										<string>English</string>
+										<key>VALUE</key>
+										<string>Required for modern AirDrop support.
+
+The ethertap kernel extension allows applications to connect simulated ethernet segments to the kernel via virtual ethernet interfaces.</string>
+									</dict>
+								</array>
+								<key>OPTIONS</key>
+								<dict>
+									<key>HIDDEN</key>
+									<false/>
+									<key>STATE</key>
+									<integer>1</integer>
+								</dict>
+								<key>PACKAGE_UUID</key>
+								<string>91CD7730-18E3-475A-8DEA-7B3155B851BE</string>
+								<key>REQUIREMENTS</key>
+								<array>
+									<dict>
+										<key>BEHAVIOR</key>
+										<integer>0</integer>
+										<key>DICTIONARY</key>
+										<dict>
+											<key>IC_REQUIREMENT_OS_DISK_TYPE</key>
+											<integer>0</integer>
+											<key>IC_REQUIREMENT_OS_DISTRIBUTION_TYPE</key>
+											<integer>0</integer>
+											<key>IC_REQUIREMENT_OS_MINIMUM_VERSION</key>
+											<integer>100905</integer>
+										</dict>
+										<key>IC_REQUIREMENT_CHECK_TYPE</key>
+										<integer>-1</integer>
+										<key>IDENTIFIER</key>
+										<string>fr.whitebox.Packages.requirement.os</string>
+										<key>MESSAGE</key>
+										<array/>
+										<key>NAME</key>
+										<string>Operating System</string>
+										<key>STATE</key>
+										<true/>
+									</dict>
+								</array>
+								<key>TITLE</key>
+								<array>
+									<dict>
+										<key>LANGUAGE</key>
+										<string>English</string>
+										<key>VALUE</key>
+										<string>Ethertap Driver</string>
+									</dict>
+								</array>
+								<key>TYPE</key>
+								<integer>0</integer>
+								<key>UUID</key>
+								<string>2726635C-468C-4E0E-BDE0-DF9F41176EA0</string>
 							</dict>
 						</array>
 						<key>REMOVED</key>

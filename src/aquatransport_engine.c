@@ -526,7 +526,7 @@ static int sec_cb(const SSL *ssl, const SSL_CTX *ctx, int op, int bits, int nid,
 static int client_cert_cb(SSL *ssl, X509 **px509, EVP_PKEY **ppkey) {
     Shadow *s = (Shadow *)SSL_get_ex_data(ssl, gSslExIdx);
     if (!s || !s->clientX509) return 0;          // no identity -> send no certificate
-    if (s->breakAuth && !s->approved) return -1;
+    if (!s->serverSide && s->breakAuth && !s->approved) return -1;
     EVP_PKEY *certpub = X509_get_pubkey(s->clientX509);
     if (!certpub) return 0;
     RSA *rpub = EVP_PKEY_get1_RSA(certpub); EVP_PKEY_free(certpub);
@@ -572,6 +572,22 @@ int ossl_init(Shadow *s) {
     BIO_set_data(bio, s);
     BIO_set_init(bio, 1);
     SSL_set_bio(s->ssl, bio, bio);
+    if (s->serverSide) {
+        X509 *certificate=NULL; EVP_PKEY *key=NULL;
+        if(client_cert_cb(s->ssl,&certificate,&key)!=1) goto server_failed;
+        int installed=SSL_use_certificate(s->ssl,certificate)==1 && SSL_use_PrivateKey(s->ssl,key)==1 && SSL_check_private_key(s->ssl)==1;
+        X509_free(certificate); EVP_PKEY_free(key);
+        if(!installed || !SSL_set_cipher_list(s->ssl,"ECDHE+AESGCM:ECDHE+CHACHA20")) goto server_failed;
+        /* The SecKey adapter signs; it does not provide RSA key exchange. */
+        SSL_set_options(s->ssl,SSL_OP_NO_TICKET|SSL_OP_NO_RENEGOTIATION);
+        int verify=s->serverAuth==kNeverAuthenticate ? SSL_VERIFY_NONE : SSL_VERIFY_PEER;
+        if(s->serverAuth==kAlwaysAuthenticate) verify|=SSL_VERIFY_FAIL_IF_NO_PEER_CERT;
+        SSL_set_verify(s->ssl,verify,NULL);
+        SSL_set_accept_state(s->ssl);
+        s->inited=1; return 0;
+server_failed:
+        SSL_free(s->ssl); s->ssl=NULL; return -1;
+    }
     if (s->host[0]) { SSL_set_tlsext_host_name(s->ssl, s->host); SSL_set1_host(s->ssl, s->host); }
     // Ask the server to staple its OCSP response into the handshake. A server that does not
     // support this ignores the extension. See attach_stapled_ocsp for what the response saves.
@@ -629,11 +645,11 @@ static int verify_chain(X509_STORE_CTX *sctx, void *arg) {
     (void)arg;
     SSL *ssl = (SSL *)X509_STORE_CTX_get_ex_data(sctx, SSL_get_ex_data_X509_STORE_CTX_idx());
     Shadow *s = ssl ? (Shadow *)SSL_get_ex_data(ssl, gSslExIdx) : NULL;
-    if (s && (s->breakAuth || s->noCertVerify)) return 1;
+    if (s && ((!s->serverSide && s->breakAuth) || s->noCertVerify)) return 1;
     STACK_OF(X509) *chain = X509_STORE_CTX_get0_untrusted(sctx);
     if (!chain || sk_X509_num(chain) < 1) return 0;
     unsigned char dg[SHA256_DIGEST_LENGTH];
-    int haveDg = chain_ok_digest(chain, s && s->host[0] ? s->host : "", dg);
+    int haveDg = !(s && s->serverSide) && chain_ok_digest(chain, s && s->host[0] ? s->host : "", dg);
     if (haveDg && chain_ok_get(dg)) {
         if (tf_debug()) tf_log("verify_chain host=%s cached ok", s && s->host[0] ? s->host : "?");
         return 1;
@@ -652,7 +668,7 @@ static int verify_chain(X509_STORE_CTX *sctx, void *arg) {
     }
     CFStringRef host = (s && s->host[0]) ? CFStringCreateWithCString(NULL, s->host, kCFStringEncodingUTF8) : NULL;
     tf_guard_enter();                       // anything Security opens from here is not ours to hook
-    SecPolicyRef pol = SecPolicyCreateSSL(true, host);
+    SecPolicyRef pol = SecPolicyCreateSSL(!(s && s->serverSide), host);
     SecTrustRef t = NULL; int ok = 0;
     if (SecTrustCreateWithCertificates(arr, pol, &t) == errSecSuccess && t) {
         attach_stapled_ocsp(s, t);
@@ -673,18 +689,23 @@ static int verify_chain(X509_STORE_CTX *sctx, void *arg) {
 
 // peer chain handed back to the app
 CFArrayRef sh_cert_array(Shadow *s) {
-    STACK_OF(X509) *chain = SSL_get_peer_cert_chain(s->ssl);
-    if (!chain) return NULL;
-    CFMutableArrayRef arr = CFArrayCreateMutable(NULL, 0, cf_type_array_cb());
-    for (int i = 0; i < sk_X509_num(chain); i++) {
-        unsigned char *der = NULL; int dl = i2d_X509(sk_X509_value(chain, i), &der);
-        if (dl > 0 && der) {
-            CFDataRef d = CFDataCreate(NULL, der, dl);
-            SecCertificateRef sc = d ? SecCertificateCreateWithData(NULL, d) : NULL;
-            if (sc) { CFArrayAppendValue(arr, sc); CFRelease(sc); }
-            if (d) CFRelease(d);
+    STACK_OF(X509) *chain=SSL_get_peer_cert_chain(s->ssl);
+    X509 *leaf=SSL_get0_peer_certificate(s->ssl);
+    if(!leaf) return NULL;
+    CFMutableArrayRef arr=CFArrayCreateMutable(NULL,0,cf_type_array_cb());
+    if(!arr) return NULL;
+    int count=chain ? sk_X509_num(chain) : 0;
+    for(int i=-1;i<count;i++) {
+        X509 *certificate=i<0 ? leaf : sk_X509_value(chain,i);
+        if(i>=0 && X509_cmp(certificate,leaf)==0) continue;
+        unsigned char *der=NULL; int length=i2d_X509(certificate,&der);
+        if(length>0 && der) {
+            CFDataRef data=CFDataCreate(NULL,der,length);
+            SecCertificateRef native=data ? SecCertificateCreateWithData(NULL,data) : NULL;
+            if(native) { CFArrayAppendValue(arr,native); CFRelease(native); }
+            if(data) CFRelease(data);
         }
-        if (der) OPENSSL_free(der);
+        OPENSSL_free(der);
     }
     return arr;
 }
@@ -714,7 +735,7 @@ int sh_build_trust(Shadow *s, SecTrustRef *trust) {
     if (!arr) return 0;
     long ncerts = (long)CFArrayGetCount(arr);
     CFStringRef hostStr = s->host[0] ? CFStringCreateWithCString(NULL, s->host, kCFStringEncodingUTF8) : NULL;
-    SecPolicyRef pol = SecPolicyCreateSSL(true, hostStr);
+    SecPolicyRef pol = SecPolicyCreateSSL(!s->serverSide, hostStr);
     if (hostStr) CFRelease(hostStr);
     SecTrustRef t = NULL;
     tf_guard_enter();
@@ -751,7 +772,7 @@ static void do_ready(void) {
     gRsaExIdx = RSA_get_ex_new_index(0, NULL, NULL, NULL, NULL);
     gRsaMeth = RSA_meth_dup(RSA_get_default_method());
     if (gRsaMeth) { RSA_meth_set1_name(gRsaMeth, "aquatransport-seckey"); RSA_meth_set_priv_enc(gRsaMeth, rsa_seckey_priv_enc); }
-    gCtx = SSL_CTX_new(TLS_client_method());
+    gCtx = SSL_CTX_new(TLS_method());
     if (gCtx) {
         // TLS 1.2 and 1.3 only, at OpenSSL's own default security level and cipher list. That
         // list excludes the legacy suites -- RC4, export grades, single DES -- so nothing weak

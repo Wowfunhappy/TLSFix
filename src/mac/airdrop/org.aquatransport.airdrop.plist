@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+<key>Label</key><string>org.aquatransport.airdrop</string>
+<key>ProgramArguments</key><array><string>/usr/share/aquatransport/airdrop/org.aquatransport.airdrop</string></array>
+<key>Sockets</key><dict><key>Listener</key><dict>
+<key>SockFamily</key><string>Unix</string>
+<key>SockType</key><string>stream</string>
+<key>SockPathName</key><string>/var/run/org.aquatransport.airdrop.sock</string>
+<key>SockPathMode</key><integer>438</integer>
+</dict></dict>
+<key>ProcessType</key><string>Background</string>
+</dict></plist>

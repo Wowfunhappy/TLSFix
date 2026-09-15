@@ -40,6 +40,43 @@ To uninstall, double click Uninstall.command and follow the instructions.\
 If you previously installed {\field{\*\fldinst{HYPERLINK "https://mavericksforever.com/downloads/Aqua%20Proxy.dmg"}}{\fldrslt Aqua Proxy}}, please uninstall it before installing AquaTransport.\
 
 \b\fs56 \
+Tips and Tricks
+\b0\fs24 \
+\pard\tx720\tx1440\tx2160\tx2880\tx3600\tx4320\tx5040\tx5760\tx6480\tx7200\tx7920\tx8640\pardirnatural
+
+\b\fs40 \cf0 \
+Airdrop
+\b0\fs24 \
+\
+AquaTransport makes it possible to use Airdrop with modern Macs and iPhones! To use this feature, your computer must be running OS X 10.9 Mavericks, and your hardware must support Bluetooth LE and 5 Ghz Wi-Fi with active Monitor Mode. An ethertap driver, included with the AquaTransport installer by default, must also be present.\
+\
+You will be disconnected from Wi-Fi while AirDrop is in use.\
+
+\b\fs40 \
+Twitter / BlueSky
+\b0\fs24 \
+\
+You can use AquaTransport to log into your BlueSky account as if it was a Twitter account!\
+\
+First, in BlueSky, go to {\field{\*\fldinst{HYPERLINK "https://bsky.app/settings/app-passwords"}}{\fldrslt Settings 
+\f1 \uc0\u8594 
+\f0  Privacy and security 
+\f1 \uc0\u8594 
+\f0  App passwords}} 
+\f1 \uc0\u8594 
+\f0  and add a new app password.\
+\
+Then, on your Mac, log in with your full BlueSky handle as the username (e.g. @johnappleseed.bsky.social) and your previously-generated app password as the password.\
+\
+This will work in System Preferences as well as in the official Twitter app for Mac, version 2.1.1 or earlier. To be clear, you will be using the Twitter 
+\i app
+\i0  to log into and use your 
+\i BlueSky
+\i0  account.\
+\
+Thank you to {\field{\*\fldinst{HYPERLINK "https://preloading.dev/"}}{\fldrslt Preloading}} for making this possible by building and hosting {\field{\*\fldinst{HYPERLINK "https://twb.preloading.dev/"}}{\fldrslt TwitterAPIBridge}}!
+\b\fs56 \
+\
 Frequently Asked Questions
 \b0\fs24 \
 \
@@ -67,46 +104,15 @@ Frequently Asked Questions
 \b Answer
 \b0 : Send a message to 
 \b Wowfunhappy \'95\'a0gmail.com
-\b0  and I will do my best to help! Please feel free to send a second message if you don't hear back within a few days.\
-\pard\tx720\tx1440\tx2160\tx2880\tx3600\tx4320\tx5040\tx5760\tx6480\tx7200\tx7920\tx8640\pardirnatural
-
-\b\fs56 \cf0 \
-Tips and Tricks
-\b0\fs24 \
-\pard\tx720\tx1440\tx2160\tx2880\tx3600\tx4320\tx5040\tx5760\tx6480\tx7200\tx7920\tx8640\pardirnatural
-
-\b\fs40 \cf0 \
-Twitter / BlueSky
-\b0\fs24 \
+\b0  and I will do my best to help! Please feel free to send a second message if you don't hear back within a few days.
+\b\fs56 \
 \
-You can use AquaTransport to log into your BlueSky account as if it was a Twitter account!\
-\
-First, in BlueSky, go to {\field{\*\fldinst{HYPERLINK "https://bsky.app/settings/app-passwords"}}{\fldrslt Settings 
-\f1 \uc0\u8594 
-\f0  Privacy and security 
-\f1 \uc0\u8594 
-\f0  App passwords}} 
-\f1 \uc0\u8594 
-\f0  and add a new app password.\
-\
-Then, on your Mac, log in with your full BlueSky handle as the username (e.g. @johnappleseed.bsky.social) and your previously-generated app password as the password.\
-\
-This will work in System Preferences as well as in the official Twitter app for Mac, version 2.1.1 or earlier. To be clear, you will be using the Twitter 
-\i app
-\i0  to log into and use your 
-\i BlueSky
-\i0  account.\
-\
-Thank you to {\field{\*\fldinst{HYPERLINK "https://preloading.dev/"}}{\fldrslt Preloading}} for making this possible by building and hosting {\field{\*\fldinst{HYPERLINK "https://twb.preloading.dev/"}}{\fldrslt TwitterAPIBridge}}!\
-\pard\tx720\tx1440\tx2160\tx2880\tx3600\tx4320\tx5040\tx5760\tx6480\tx7200\tx7920\tx8640\pardirnatural
-
-\b\fs56 \cf0 \
 Credits
 \b0\fs24 \
 \
 AquaTransport is based on the TLSFix package for iOS written by nfzerox and ObscureMosquito.\
 \
-AquaTransport uses code adapted from the GSAFix package for iOS written by Pod. Pod additionally located the correct URLs and headers for various services used by AquaTransport. Thank you!\
+AquaTransport uses code adapted from the GSAFix package for iOS written by Pod. Pod additionally located the correct URLs and headers for various services used by AquaTransport.\
 \
 A huge thank you to Krackers for reviewing code and generally entertaining all of my inane ideas and mistakes. His immense patience and technical knowledge has been invaluable.\
 \
@@ -114,9 +120,14 @@ AquaTransport uses and relies upon OpenSSL, which is licensed under the terms of
 \
 AquaTransport uses Fishhook, a library created by Facebook, Inc, which is licensed under the terms of the BSD-3-Clause license.\
 \
+AquaTransport includes the ethertap kernel extension created by Mattias Nissler.\
+\
+AquaTransport uses and relies upon Open Wireless Link (OWL), a library created by Seemoo Lab, which is licensed under the terms of the GPL v3.\
+\
 As stated above, thank you to {\field{\*\fldinst{HYPERLINK "https://preloading.dev/"}}{\fldrslt Preloading}} for the Twitter API Bridge.\
+\pard\tx720\tx1440\tx2160\tx2880\tx3600\tx4320\tx5040\tx5760\tx6480\tx7200\tx7920\tx8640\pardirnatural
 
-\b\fs56 \
+\b\fs56 \cf0 \
 For Advanced Users
 \fs48 \
 
@@ -204,15 +215,19 @@ Add any of the below flags to
 \pard\tx220\tx720\tx1440\tx2160\tx2880\tx3600\tx4320\tx5040\tx5760\tx6480\tx7200\tx7920\tx8640\li720\fi-720\pardirnatural
 \ls4\ilvl0\cf0 {\listtext	\'95	}allow-legacy-tls\
 \pard\tx940\tx1440\tx2160\tx2880\tx3600\tx4320\tx5040\tx5760\tx6480\tx7200\tx7920\tx8640\li1440\fi-1440\pardirnatural
-\ls4\ilvl1\cf0 {\listtext	\uc0\u8259 	}Allows TLS 1.0/1.1 connections and insecure cipher suites. These connections are considered insecure and blocked by most modern software.\
-\pard\tx220\tx720\tx1440\tx2160\tx2880\tx3600\tx4320\tx5040\tx5760\tx6480\tx7200\tx7920\tx8640\li720\fi-720\pardirnatural
-\ls4\ilvl0\cf0 {\listtext	\'95	}disabled-mtls\
-\pard\tx940\tx1440\tx2160\tx2880\tx3600\tx4320\tx5040\tx5760\tx6480\tx7200\tx7920\tx8640\li1440\fi-1440\pardirnatural
-\ls4\ilvl1\cf0 {\listtext	\uc0\u8259 	}Let SecureTransport handle mtls connections, instead of AquaTransport.\
+\ls4\ilvl1\cf0 {\listtext	\uc0\u8259 	}Allows TLS 1.0/1.1 connections and insecure cipher suites, even when tls modernization is enabled. These connections are considered insecure.\
 \pard\tx220\tx720\tx1440\tx2160\tx2880\tx3600\tx4320\tx5040\tx5760\tx6480\tx7200\tx7920\tx8640\li720\fi-720\pardirnatural
 \ls4\ilvl0\cf0 {\listtext	\'95	}debug\
 \pard\tx940\tx1440\tx2160\tx2880\tx3600\tx4320\tx5040\tx5760\tx6480\tx7200\tx7920\tx8640\li1440\fi-1440\pardirnatural
 \ls4\ilvl1\cf0 {\listtext	\uc0\u8259 	}Log each secure connection to /tmp/aquatransport-<your-user-id>.log.\
+\pard\tx220\tx720\tx1440\tx2160\tx2880\tx3600\tx4320\tx5040\tx5760\tx6480\tx7200\tx7920\tx8640\li720\fi-720\pardirnatural
+\ls4\ilvl0\cf0 {\listtext	\'95	}disable-mtls\
+\pard\tx940\tx1440\tx2160\tx2880\tx3600\tx4320\tx5040\tx5760\tx6480\tx7200\tx7920\tx8640\li1440\fi-1440\pardirnatural
+\ls4\ilvl1\cf0 {\listtext	\uc0\u8259 	}Let SecureTransport handle mtls connections, instead of AquaTransport.\
+\pard\tx220\tx720\tx1440\tx2160\tx2880\tx3600\tx4320\tx5040\tx5760\tx6480\tx7200\tx7920\tx8640\li720\fi-720\pardirnatural
+\ls4\ilvl0\cf0 {\listtext	\'95	}disable-modern-airdrop\
+\pard\tx940\tx1440\tx2160\tx2880\tx3600\tx4320\tx5040\tx5760\tx6480\tx7200\tx7920\tx8640\li1440\fi-1440\pardirnatural
+\ls4\ilvl1\cf0 {\listtext	\uc0\u8259 	}You must restart your computer for this change to take effect.\
 \pard\tx220\tx720\tx1440\tx2160\tx2880\tx3600\tx4320\tx5040\tx5760\tx6480\tx7200\tx7920\tx8640\li720\fi-720\pardirnatural
 \ls4\ilvl0\cf0 {\listtext	\'95	}disable-certificate-pinning\
 \pard\tx940\tx1440\tx2160\tx2880\tx3600\tx4320\tx5040\tx5760\tx6480\tx7200\tx7920\tx8640\li1440\fi-1440\pardirnatural

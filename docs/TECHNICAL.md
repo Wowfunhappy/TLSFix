@@ -47,12 +47,12 @@ The build enforces three invariants, each guarding a failure that is silent at l
 
 ```
 sudo ./install-macos.sh install    # place the files, then patch Security.framework
-sudo ./install-macos.sh uninstall  # restore Security.framework, then remove the files
+bash "packaging/DMG Image/Uninstall.command"  # restore Security.framework, remove files, restart
 ```
 
 | path | contents |
 | --- | --- |
-| `/usr/share/aquatransport/` | `aquatransport.dylib` (loader), `aquatransport_engine.dylib`, `flags.txt`, `headers.txt`, `redirects.txt`, `disabled.txt`, and the root-only `insert_dylib`, `aquatransport.sh`, `uninstall.sh` |
+| `/usr/share/aquatransport/` | AquaTransport libraries, optional `airdrop/` runtime payload, and editable rules under `config/`; no installer or uninstaller scripts |
 
 The directory is `/usr/share` because of who reads what. A patched process makes both of its reads itself — dyld
 maps the dylib at launch, and the library reads the rule files at runtime — so both happen under
@@ -231,7 +231,7 @@ make trust evaluation depend on trust evaluation. That list is structural and no
 every loaded copy of the library. Two flags are recognised:
 
 ```
-disabled-mtls   # hand client-certificate connections back to the system stack
+disable-mtls   # hand client-certificate connections back to the system stack
 debug           # log handshakes to /tmp/aquatransport-<uid>.log
 allow-legacy-tls # allow TLS 1.0/1.1 and their cipher suites
 ```
@@ -926,7 +926,7 @@ version agnostic in OpenSSL — it calls `client_cert_cb` for TLS 1.3 as well, a
 same `-1` → `SSL_X509_LOOKUP` suspend, so the pre-approval pause survives at every version.
 `tools/mtlsprobe.c` drives it end to end against a local `s_server` requiring a client
 certificate; verified at TLS 1.0, 1.2 and 1.3, with the server confirming the client
-certificate each time. `disabled-mtls` is the escape hatch.
+certificate each time. `disable-mtls` is the escape hatch.
 
 **OpenSSL 3.5.** The current LTS, supported to 2030-04. The engine's floor is TLS 1.0: a
 legacy server that stock Secure Transport can reach must stay reachable through the engine,

@@ -1,3 +1,4 @@
+#include "aquatransport_airdrop.h"
 // macOS hook layer for AquaTransport (10.6 - 10.9).
 //
 // Hooks are installed with fishhook, which rebinds symbol pointers by name. Properties this
@@ -103,6 +104,7 @@ static OSStatus (*o_SSLSetConnection)(SSLContextRef, SSLConnectionRef);
 static OSStatus (*o_SSLSetPeerDomainName)(SSLContextRef, const char *, size_t);
 static OSStatus (*o_SSLSetPeerID)(SSLContextRef, const void *, size_t);
 static OSStatus (*o_SSLSetSessionOption)(SSLContextRef, SSLSessionOption, Boolean);
+static OSStatus (*o_SSLSetClientSideAuthenticate)(SSLContextRef, SSLAuthenticate);
 static OSStatus (*o_SSLSetEnableCertVerify)(SSLContextRef, Boolean);
 static OSStatus (*o_SSLHandshake)(SSLContextRef);
 static OSStatus (*o_SSLRead)(SSLContextRef, void *, size_t, size_t *);
@@ -144,7 +146,11 @@ static void mark_server_side(SSLContextRef c) {
 static SSLContextRef my_SSLCreateContext(CFAllocatorRef alloc, SSLProtocolSide side, SSLConnectionType type) {
     origs_ready();
     SSLContextRef c = o_SSLCreateContext(alloc, side, type);
-    if (side == kSSLServerSide) mark_server_side(c);
+    if (side == kSSLServerSide) {
+        mark_server_side(c);
+        if(type!=kSSLStreamType && c) { Shadow *s=sh_get(c); if(s) { s->serverBypass|=2; sh_release(s); } }
+    }
+
     return c;
 }
 
@@ -207,12 +213,27 @@ static OSStatus my_SSLSetPeerID(SSLContextRef c, const void *peerID, size_t len)
     return r;
 }
 
+static OSStatus my_SSLSetClientSideAuthenticate(SSLContextRef c, SSLAuthenticate auth) {
+    if(!tf_on() || ensure_ready()!=1) return o_SSLSetClientSideAuthenticate(c,auth);
+    OSStatus result=o_SSLSetClientSideAuthenticate(c,auth);
+    if(result==noErr && tf_on() && ensure_ready()==1) {
+        Shadow *s=sh_create(c); if(s) { s->serverAuth=auth; sh_release(s); }
+    }
+    return result;
+}
 static OSStatus my_SSLSetSessionOption(SSLContextRef c, SSLSessionOption opt, Boolean val) {
     if (tf_on() && ensure_ready() == 1 && opt == kSSLSessionOptionBreakOnServerAuth) {
         Shadow *s = sh_create(c);
         if (s) { s->breakAuth = val ? 1 : 0; sh_release(s); }
     }
-    return o_SSLSetSessionOption(c, opt, val);
+    OSStatus result=o_SSLSetSessionOption(c,opt,val);
+    if(result==noErr && tf_on() && ensure_ready()==1 && opt==kSSLSessionOptionBreakOnClientAuth) {
+        /* Preserve the native mid-handshake client-auth pause until the engine
+         * supports its contract; never silently omit the application's check. */
+        Shadow *s=sh_create(c); if(s) { s->serverBypass=(s->serverBypass&~1)|(val ? 1 : 0); sh_release(s); }
+    }
+    return result;
+
 }
 
 // The other half of the trust decision, alongside kSSLSessionOptionBreakOnServerAuth: this one
@@ -225,12 +246,14 @@ static OSStatus my_SSLSetEnableCertVerify(SSLContextRef c, Boolean enable) {
     return o_SSLSetEnableCertVerify(c, enable);
 }
 
+static int server_tls_enabled(void) { return !tf_flag("disable-server-tls") && (tf_airdrop_active() || tf_flag("enable-server-tls")); }
+
 static OSStatus my_SSLHandshake(SSLContextRef c) {
     if (!tf_on()) return o_SSLHandshake(c);
     Shadow *s = sh_get(c);
     if (!s) return o_SSLHandshake(c);
     OSStatus rv;
-    if (!s->rf || !s->wf || !s->conn || s->clientBypass || s->serverSide || s->state == -1) { rv = o_SSLHandshake(c); goto done; }
+    if (!s->rf || !s->wf || !s->conn || s->clientBypass || (s->serverSide && (!server_tls_enabled() || s->serverBypass || !s->clientX509)) || s->state == -1) { rv = o_SSLHandshake(c); goto done; }
     sh_unblock_write(s);   // an entry like any other; see bio_bwrite
     if (!s->inited) { if (ossl_init(s)) { s->state = -1; rv = o_SSLHandshake(c); goto done; } s->state = 1; }
     if (s->state == 3) s->approved = 1;   // app approved the server after the auth break, let it proceed
@@ -246,7 +269,7 @@ static OSStatus my_SSLHandshake(SSLContextRef c) {
                    s->breakAuth ? " [app-verified]" : "",
                    pc ? sk_X509_num(pc) : -1); }
         // server-auth-only pinning has no client-cert pause point, so ask the app here (once) before connecting
-        if (s->breakAuth && !s->approved) { s->state = 3; rv = ST_PeerAuth; goto done; }
+        if (!s->serverSide && s->breakAuth && !s->approved) { s->state = 3; rv = ST_PeerAuth; goto done; }
         s->state = 2; rv = noErr; goto done;
     }
     int e = SSL_get_error(s->ssl, ret);
@@ -501,8 +524,8 @@ static OSStatus my_SSLSetCertificate(SSLContextRef c, CFArrayRef certRefs) {
         // TLS 1.3, or a key the Keychain will not sign for.
         // On a server context this is the server's own identity, which the system stack holds
         // and uses; nothing here needs it.
-        if (!s->serverSide) {
-            if (tf_flag("disabled-mtls")) s->clientBypass = 1;
+        if (!s->serverSide || server_tls_enabled()) {
+            if (!s->serverSide && tf_flag("disabled-mtls")) s->clientBypass = 1;
             else capture_identity(s, certRefs);
         }
         if (s->inited && s->state != -1) { SSL_free(s->ssl); s->ssl = NULL; s->inited = 0; s->state = 0;
@@ -544,6 +567,7 @@ static const struct {
     { "SSLSetPeerDomainName",            (void *)my_SSLSetPeerDomainName,            (void **)&o_SSLSetPeerDomainName },
     { "SSLSetPeerID",                    (void *)my_SSLSetPeerID,                    (void **)&o_SSLSetPeerID },
     { "SSLSetSessionOption",             (void *)my_SSLSetSessionOption,             (void **)&o_SSLSetSessionOption },
+    { "SSLSetClientSideAuthenticate", (void *)my_SSLSetClientSideAuthenticate, (void **)&o_SSLSetClientSideAuthenticate },
     { "SSLSetEnableCertVerify",          (void *)my_SSLSetEnableCertVerify,          (void **)&o_SSLSetEnableCertVerify },
     { "SSLHandshake",                    (void *)my_SSLHandshake,                    (void **)&o_SSLHandshake },
     { "SSLRead",                         (void *)my_SSLRead,                         (void **)&o_SSLRead },
@@ -625,6 +649,7 @@ static void aquatransport_init(void) {
     // process that loads Security later. Rebinding a symbol no loaded image imports is a
     // no-op, and fishhook rebinds the call sites when the framework does arrive.
     install_ssl_hooks();
+    tf_airdrop_install();
     tf_rewrite_install();
     tf_trust_install();
 }
