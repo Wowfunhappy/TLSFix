@@ -47,12 +47,12 @@ The build enforces three invariants, each guarding a failure that is silent at l
 
 ```
 sudo ./install-macos.sh install    # place the files, then patch Security.framework
-sudo ./install-macos.sh uninstall  # restore Security.framework, then remove the files
+bash "packaging/DMG Image/Uninstall.command"  # restore Security.framework, remove files, restart
 ```
 
 | path | contents |
 | --- | --- |
-| `/usr/share/aquatransport/` | `aquatransport.dylib` (loader), `aquatransport_engine.dylib`, `flags.txt`, `headers.txt`, `redirects.txt`, `disabled.txt`, and the root-only `insert_dylib`, `aquatransport.sh`, `uninstall.sh` |
+| `/usr/share/aquatransport/` | AquaTransport libraries, optional `airdrop/` runtime payload, and editable rules under `config/`; no installer or uninstaller scripts |
 
 The directory is `/usr/share` because of who reads what. A patched process makes both of its reads itself — dyld
 maps the dylib at launch, and the library reads the rule files at runtime — so both happen under

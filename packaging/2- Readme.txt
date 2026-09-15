@@ -10,4 +10,6 @@ Credits & Acknowledgments:
 
 ¥ AquaTransport uses Fishhook, a library created by Facebook, Inc, which is licensed under the terms of the BSD-3-Clause license.
 
+¥ AquaTransport uses and relies upon Open Wireless Link (OWL), a library created by Seemoo Lab, which is licensed under the terms of the GPL v3.
+
 ¥ÊThank you to Preloading for the Twitter API Bridge.

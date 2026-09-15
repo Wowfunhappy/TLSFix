@@ -83,7 +83,7 @@ fi
 # ---- 2. the dylib ----------------------------------------------------------
 echo "==> building aquatransport.dylib (min $MIN)"
 SRCS=("$DIR/src/aquatransport_engine.c" "$DIR/src/mac/aquatransport_hooks_mac.c" "$DIR/src/mac/aquatransport_config.c"
-      "$DIR/src/mac/aquatransport_maps.c" "$DIR/src/mac/aquatransport_rewrite.c" "$DIR/src/mac/aquatransport_trust_mac.c" "$DIR/deps/fishhook/fishhook.c")
+      "$DIR/src/mac/aquatransport_airdrop.c" "$DIR/src/mac/aquatransport_maps.c" "$DIR/src/mac/aquatransport_rewrite.c" "$DIR/src/mac/aquatransport_trust_mac.c" "$DIR/deps/fishhook/fishhook.c")
 OBJDIR="$BUILD/obj"; rm -rf "$OBJDIR"; mkdir -p "$OBJDIR"
 : > "$BUILD/nothing.exp"
 
@@ -167,6 +167,10 @@ lipo -create "${slices[@]}" -output "$ST/aquatransport_engine.dylib"
 lipo -create "${loader_slices[@]}" -output "$ST/aquatransport.dylib"
 lipo -create "${gsa_slices[@]}" -output "$ST/aquatransport_gsa.dylib"
 lipo -create "${maps_slices[@]}" -output "$ST/aquatransport_maps.dylib"
+
+# AirDrop is a separate Mavericks-only image, loaded after the C eligibility gate.
+bash "$DIR/tools/build-airdrop.sh"
+
 
 # The URL rewriter is pure C compiled into the dylib above (src/mac/aquatransport_rewrite.c),
 # and has no Objective-C dependency. The GSA image is loaded at request time.

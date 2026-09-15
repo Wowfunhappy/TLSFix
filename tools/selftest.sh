@@ -40,7 +40,7 @@ if LC_ALL=C grep -q -a -F "$T/aquatransport.dylib" "$SECBIN" 2>/dev/null ||
    LC_ALL=C grep -q -a -F /usr/share/aquatransport/aquatransport.dylib "$SECBIN" 2>/dev/null; then
     echo "Security.framework is patched: the 'stock' probes would load the library and succeed."
     echo "uninstall first, then re-run:"
-    echo "    sudo ./install-macos.sh uninstall"
+    echo '    bash "packaging/DMG Image/Uninstall.command"'
     echo "    ./tools/selftest.sh"
     echo "    sudo ./install-macos.sh install"
     exit 1
