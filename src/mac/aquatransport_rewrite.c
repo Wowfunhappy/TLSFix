@@ -174,10 +174,36 @@ static int gsa_dav_url(const char *url) {
            (end-(h+n) == 5 && !strncmp(h+n, legacy, 5));
 }
 
+/* Find My uses numbered shards, not a fixed p166 endpoint. */
+static int findmy_host(const char *url) {
+    if (strncasecmp(url, "https://", 8)) return 0;
+    const char *h = url+8;
+    if (*h == 'p' || *h == 'P') {
+        const char *digits = ++h;
+        while (*h >= '0' && *h <= '9') h++;
+        if (h == digits || *h++ != '-') return 0;
+    }
+    if (strncasecmp(h, "fmip.icloud.com", 15)) return 0;
+    h += 15;
+    if (!strncmp(h, ":443", 4)) h += 4;
+    return *h == '/';
+}
+
+static int rewrite_findmy(void *request) {
+    struct utsname os;
+    if (uname(&os) || atoi(os.release) != 13) return 0;
+    prepare_gsa();
+    void *(*get_class)(const char *) = dlsym(RTLD_DEFAULT, "objc_getClass");
+    void *(*selector)(const char *) = dlsym(RTLD_DEFAULT, "sel_registerName");
+    signed char (*send)(void *, void *, void *) = dlsym(RTLD_DEFAULT, "objc_msgSend");
+    void *cls = get_class ? get_class("AQFindMyAdapter") : NULL;
+    return cls && selector && send ? send(cls, selector("rewriteRequest:"), request) : 0;
+}
+
 static int gsa_reserved_url(const char *url) {
     /* Authentication requests must not be redirected or have credentials logged by
      * general URL/header rules. Match a full authority, including its slash. */
-    return gsa_dav_url(url) || !strncasecmp(url, "https://gsa.apple.com/", 22) ||
+    return findmy_host(url) || gsa_dav_url(url) || !strncasecmp(url, "https://gsa.apple.com/", 22) ||
            !strncasecmp(url, "https://setup.icloud.com/", 25) ||
            !strncasecmp(url, "https://profile.ess.apple.com/", 30) ||
            !strncasecmp(url, "https://service.ess.apple.com/", 30) ||
@@ -231,6 +257,11 @@ static int apply_rules(void *m) {
     char *before = cf_to_c(CFURLGetString(url));
     if (!before) return 0;
 
+    if (!tf_flag("disable-icloud-gsa") && findmy_host(before)) {
+        int changed = rewrite_findmy(m);
+        free(before);
+        return changed;
+    }
     if (!tf_flag("disable-icloud-gsa") && gsa_reserved_url(before)) {
         prepare_gsa();
         free(before);

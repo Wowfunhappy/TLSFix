@@ -133,9 +133,22 @@ Expired entries are removed on the next attempt.
 The old pane may show a generic authentication failure rather than instructions for
 entering the code. The user completed this two-attempt flow with a real account. SMS-only
 verification (`secondaryAuth`), account recovery, account creation, terms acceptance,
-Game Center and Find My are not implemented. The experimental iMessage profile
+Game Center and full Find My support are not implemented. The experimental iMessage profile
 adapter is described below; native iMessage sign-in is user-confirmed on Mavericks. This module does not
 guarantee that iCloud services work after account creation.
+
+On Mavericks, a narrow Find My compatibility fix adds a missing top-level
+`"positionType": ""` to JSON POST bodies at
+`https://p<number>-fmip.icloud.com/fmipservice/findme/<dsprsid>/<hardware-udid>/currentLocation`
+(and the unnumbered `fmip.icloud.com` host). It preserves existing values, the
+server shard, authentication, and all other JSON fields. It skips streamed,
+compressed, malformed, and over-1-MiB bodies. The native CFURLRequest transport
+still sends the request; this does not implement Find My registration or other
+service operations. Location data is not logged. Like authentication endpoints,
+Find My hosts bypass generic redirect/header rules while the adapter is enabled.
+This fix shares `disable-icloud-gsa`. Run `bash tools/findmy-selftest.sh` on Mavericks
+for its offline 32-bit/64-bit request regression tests. Live location delivery still
+needs verification with a real device/account.
 
 To turn the capability off, add `disable-icloud-gsa` to
 `/usr/share/aquatransport/config/flags.txt`. Remove that line to turn it back on. An already running

@@ -15,6 +15,7 @@
 #include "aquatransport_config.h"
 #include "aquatransport_gsa_crypto.h"
 #include "aquatransport_gsa_mail.h"
+#include "aquatransport_findmy.inc"
 
 static NSString *const AQHandled = @"AquaTransportGSAHandled";
 static NSString *const AQErrorDomain = @"AquaTransport.iCloud";
