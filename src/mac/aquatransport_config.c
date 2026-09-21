@@ -58,7 +58,7 @@ static int recheck_due(time_t *last) {
 }
 
 // A flag is on when its name appears on its own line in flags.txt (one flag per line),
-// alongside headers.txt and redirects.txt. Recognised flags: "debug" and "disabled-mtls".
+// alongside headers.txt and redirects.txt. Recognised flags: "debug" and "disable-mtls".
 static pthread_mutex_t gFlagLock = PTHREAD_MUTEX_INITIALIZER;
 static char  **gFlagName = NULL;
 static int     gNFlag = 0;

@@ -517,7 +517,7 @@ static OSStatus my_SSLSetCertificate(SSLContextRef c, CFArrayRef certRefs) {
     if (!tf_on() || ensure_ready() != 1) return o_SSLSetCertificate(c, certRefs);
     Shadow *s = sh_create(c);
     if (s) {
-        // disabled-mtls hands client-certificate connections back to the system stack:
+        // disable-mtls hands client-certificate connections back to the system stack:
         // SSLSetCertificate is forwarded below either way, so the system stack still holds
         // the identity and my_SSLHandshake defers the whole handshake to it. General escape
         // hatch for a client-certificate service this engine cannot carry -- one needing
@@ -525,7 +525,7 @@ static OSStatus my_SSLSetCertificate(SSLContextRef c, CFArrayRef certRefs) {
         // On a server context this is the server's own identity, which the system stack holds
         // and uses; nothing here needs it.
         if (!s->serverSide || server_tls_enabled()) {
-            if (!s->serverSide && tf_flag("disabled-mtls")) s->clientBypass = 1;
+            if (!s->serverSide && tf_flag("disable-mtls")) s->clientBypass = 1;
             else capture_identity(s, certRefs);
         }
         if (s->inited && s->state != -1) { SSL_free(s->ssl); s->ssl = NULL; s->inited = 0; s->state = 0;
