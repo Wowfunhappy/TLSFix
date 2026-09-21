@@ -1685,7 +1685,7 @@ The ethertap kernel extension allows applications to connect simulated ethernet 
 			<key>BUILD_PATH</key>
 			<dict>
 				<key>PATH</key>
-				<string>build</string>
+				<string>../DMG Image</string>
 				<key>PATH_TYPE</key>
 				<integer>1</integer>
 			</dict>
