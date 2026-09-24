@@ -9,6 +9,8 @@
 #include <sys/time.h>
 #include <limits.h>
 #include <time.h>
+#include <stdint.h>
+#include <dlfcn.h>
 #include <mach-o/dyld.h>
 
 // Config lives under /usr/share because sandboxed targets read these files themselves.
@@ -181,33 +183,57 @@ int tf_glob_prefix(const char *pattern, const char *s) {
 // /Applications/Dictionary.app/Contents/MacOS/Dictionary that yields bundle name
 // "Dictionary" and executable name "Dictionary".
 //
-// Note this identifies the process making the request, which is not always the app the
-// user thinks of: a WebKit2 app hands its loads to the shared com.apple.WebKit.Networking
-// service, so a rule scoped to Safari would never match. The apps these rules target
-// (Dictionary, HelpViewer, iWork, Twitter) all use WebKit1 and load in-process.
+// Note this identifies the process making the request, which is not always the app the user
+// thinks of: a WebKit2 app hands its loads to a com.apple.WebKit.Networking service that runs
+// under its own name, not the app's. That service's requests are attributed to the app
+// responsible for it as well (the responsible-process lookup below), so a rule scoped to the app
+// -- Safari, or any WebKit2 app -- matches the loads it makes there, not only a "*" scope.
 
 static char gAppName[256];
 static char gExeName[256];
+// The app a shared network service is loading for, when that is a different process than this
+// one. Both empty in an ordinary app, where the responsible process is the app itself.
+static char gRespAppName[256];
+static char gRespExeName[256];
 static pthread_once_t gIdOnce = PTHREAD_ONCE_INIT;
 
-static void id_init(void) {
-    const char *exe = _dyld_get_image_name(0);
-    if (exe) {
-        const char *slash = strrchr(exe, '/');
-        snprintf(gExeName, sizeof gExeName, "%s", slash ? slash + 1 : exe);
-        // ".../Foo.app/Contents/MacOS/Foo" -> "Foo"
-        const char *app = strstr(exe, ".app/");
-        if (app) {
-            const char *start = app;
-            while (start > exe && *(start - 1) != '/') start--;
-            size_t n = (size_t)(app - start);
-            if (n && n < sizeof gAppName) { memcpy(gAppName, start, n); gAppName[n] = 0; }
-        }
+// "/path/Foo.app/Contents/MacOS/Bar" -> app "Foo", exe "Bar". Either output may be left empty.
+static void names_from_exe(const char *exe, char *appOut, size_t appLen, char *exeOut, size_t exeLen) {
+    appOut[0] = 0; exeOut[0] = 0;
+    if (!exe) return;
+    const char *slash = strrchr(exe, '/');
+    snprintf(exeOut, exeLen, "%s", slash ? slash + 1 : exe);
+    const char *app = strstr(exe, ".app/");
+    if (app) {
+        const char *start = app;
+        while (start > exe && *(start - 1) != '/') start--;
+        size_t n = (size_t)(app - start);
+        if (n && n < appLen) { memcpy(appOut, start, n); appOut[n] = 0; }
     }
+}
+
+static void id_init(void) {
+    names_from_exe(_dyld_get_image_name(0), gAppName, sizeof gAppName, gExeName, sizeof gExeName);
     if (!gExeName[0]) {
         const char *pn = getprogname();
         if (pn) snprintf(gExeName, sizeof gExeName, "%s", pn);
     }
+    // The responsible process names the app a shared XPC service -- com.apple.WebKit.Networking
+    // above all -- is loading for. Resolved by name: the call is absent before 10.9, and where it
+    // is missing, is denied, or answers with this process itself (an ordinary app, or a daemon
+    // that answers for no one), no second identity is recorded.
+    pid_t (*resp_pid)(pid_t) = (pid_t (*)(pid_t))dlsym(RTLD_DEFAULT, "responsibility_get_pid_responsible_for_pid");
+    int (*pid_path)(int, void *, uint32_t) = (int (*)(int, void *, uint32_t))dlsym(RTLD_DEFAULT, "proc_pidpath");
+    if (resp_pid && pid_path) {
+        pid_t rp = resp_pid(getpid());
+        if (rp > 0 && rp != getpid()) {
+            char path[4096];
+            if (pid_path((int)rp, path, sizeof path) > 0)
+                names_from_exe(path, gRespAppName, sizeof gRespAppName, gRespExeName, sizeof gRespExeName);
+        }
+    }
+    if (gRespAppName[0] || gRespExeName[0])
+        tf_log("scope: %s is loading for app=%s exe=%s", gExeName, gRespAppName, gRespExeName);
 }
 
 // Tokens are separated by commas, not spaces: plenty of executables have a space in the
@@ -233,6 +259,8 @@ int tf_scope_matches(const char *scope) {
             memcpy(tok, p, len); tok[len] = 0;
             if (gAppName[0] && !strcmp(tok, gAppName)) return 1;
             if (gExeName[0] && !strcmp(tok, gExeName)) return 1;
+            if (gRespAppName[0] && !strcmp(tok, gRespAppName)) return 1;
+            if (gRespExeName[0] && !strcmp(tok, gRespExeName)) return 1;
         }
         p = (*end == ',') ? end + 1 : end;
     }
