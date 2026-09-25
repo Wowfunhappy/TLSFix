@@ -28,7 +28,7 @@ static BOOL supportsAirDropChannel(CWInterface *wifi) {
 
 static void loadAirDropIfEligible(void) {
     struct utsname os; char interface[32]={0}; struct stat tap;
-    if(uname(&os) || atoi(os.release)!=13 || sizeof(void *)!=8 || tf_flag("disable-airdrop") ||
+    if(uname(&os) || atoi(os.release)!=13 || sizeof(void *)!=8 || tf_flag("disable-modern-airdrop") ||
        lstat("/dev/tap0",&tap) || !S_ISCHR(tap.st_mode) ||
        !hardware_supported(interface,sizeof(interface)) || !trusted(@AQ_AIRDROP_JOB)) return;
     if(!supportsAirDropChannel([CWInterface interfaceWithName:[NSString stringWithUTF8String:interface]])) return;

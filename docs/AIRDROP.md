@@ -11,11 +11,11 @@ Activation requires all of the following:
 - Exactly one usable `IO80211Interface` with a BSD interface name; no vendor, PCI ID or driver-model whitelist.
 - Exactly one connected Bluetooth controller with LE support.
 - Root-owned module, helper, launchd job, radio executables and safe ancestor directories.
-- No `disable-airdrop` entry in AquaTransport's `config/flags.txt`.
+- No `disable-modern-airdrop` entry in AquaTransport's `config/flags.txt`.
 
 Required native symbols, methods, encodings and ownership are checked before hooks are installed. Unsupported systems retain their original AirDrop behavior. The universal loader has no new Foundation or IOKit linkage; the independent Objective-C module targets 10.9 only. It loads before SharingDaemon starts, outside the universal loader's constructor. Wi-Fi models are intentionally open to tester feedback. Multiple Wi-Fi interfaces remain ineligible because this adapter cannot safely choose which radio to take over.
 
-On each Mavericks boot, AquaTransport's package-level bootstrap checks `disable-airdrop`, TAP, Wi-Fi channel 149 and Bluetooth LE eligibility before loading the socket-activated radio-helper job. The bootstrap is intentionally independent of the AirDrop payload so other optional features can use it later. The payload remains installed when ineligible, so changing the flag or hardware takes effect after a reboot without leaving the radio-helper job loaded unnecessarily. The helper independently checks hardware, TAP and the current console user again before taking the radio. Its commands cannot specify executable paths or arbitrary arguments. Missing dependencies or startup failure unwind radio ownership gracefully. OWL then requires monitor-mode activation and radiotap capture; failure stops the radio processes and restores the Wi-Fi lease. Passing these capability checks does not establish successful AWDL communication on an untested card.
+On each Mavericks boot, AquaTransport's package-level bootstrap checks `disable-modern-airdrop`, TAP, Wi-Fi channel 149 and Bluetooth LE eligibility before loading the socket-activated radio-helper job. The bootstrap is intentionally independent of the AirDrop payload so other optional features can use it later. The payload remains installed when ineligible, so changing the flag or hardware takes effect after a reboot without leaving the radio-helper job loaded unnecessarily. The helper independently checks hardware, TAP and the current console user again before taking the radio. Its commands cannot specify executable paths or arbitrary arguments. Missing dependencies or startup failure unwind radio ownership gracefully. OWL then requires monitor-mode activation and radiotap capture; failure stops the radio processes and restores the Wi-Fi lease. Passing these capability checks does not establish successful AWDL communication on an untested card.
 
 ## Wi-Fi and transfer lifetime
 
@@ -41,7 +41,7 @@ Run `./build-macos.sh` for the complete payload. It calls `tools/build-airdrop.s
 
 `sudo ./install-macos.sh install` installs the complete staged build, including the socket helper. The Packages project also includes the AirDrop payload and uses its existing postinstall for helper setup during installation and updates. The single shipped `Uninstall.command` directly unloads/removes the helper, restores Security.framework and removes AquaTransport. No install or uninstall script is installed in `/usr/share`. Installation or updates can end an active transfer; perform them while AirDrop is idle.
 
-Setting `disable-airdrop` and rebooting disables activation and leaves the radio-helper job unloaded while retaining the files. Remove the flag and reboot to make an otherwise eligible installation available again.
+Setting `disable-modern-airdrop` and rebooting disables activation and leaves the radio-helper job unloaded while retaining the files. Remove the flag and reboot to make an otherwise eligible installation available again.
 
 The development Mac now runs through AquaTransport alone. The former ModernAirDrop SIMBL bundle and helper were moved out of their load locations; rollback copies and diagnostic evidence are retained separately.
 

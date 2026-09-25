@@ -11,6 +11,8 @@
 //   disable-certificate-pinning  honour system and keychain anchors for anchor-restricted
 //                                evaluations, defeating pinning process-wide (for monitoring
 //                                your own traffic through a locally trusted proxy root)
+//   disable-modern-airdrop       keep native AirDrop behavior instead of the adapter, checked
+//                                at boot and by the daemon adapter (docs/AIRDROP.md)
 //
 // disabled.txt holds one executable name per line, matched exactly against
 // getprogname(). A listed process gets nothing installed in it -- no hooks, no gate -- so it

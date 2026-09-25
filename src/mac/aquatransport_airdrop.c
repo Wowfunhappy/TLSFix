@@ -36,7 +36,7 @@ static int trusted_file(const char *path) {
 }
 #include "aquatransport_airdrop_hardware.h"
 static void load_adapter(void) {
-    if(tf_flag("disable-airdrop") || !tap_available()) return;
+    if(tf_flag("disable-modern-airdrop") || !tap_available()) return;
     if(!trusted_file("/usr/share/aquatransport/airdrop/org.aquatransport.airdrop") ||
        !trusted_file("/usr/share/aquatransport/airdrop/org.aquatransport.airdrop.plist") ||
        !trusted_file("/usr/share/aquatransport/airdrop/owl") ||
@@ -71,7 +71,7 @@ static void air_drop_cache_limit(int connection_type,int limit) {
 void tf_airdrop_install(void) {
     struct utsname os; char executable[1024]; uint32_t size=sizeof(executable);
     if(uname(&os) || _NSGetExecutablePath(executable,&size) ||
-       !aq_airdrop_platform_supported((unsigned)atoi(os.release),sizeof(void *),executable,tap_available()) || tf_flag("disable-airdrop")) return;
+       !aq_airdrop_platform_supported((unsigned)atoi(os.release),sizeof(void *),executable,tap_available()) || tf_flag("disable-modern-airdrop")) return;
     native_cache_limit=dlsym(RTLD_DEFAULT,"_CFNetworkHTTPConnectionCacheSetLimit");
     if(!native_cache_limit) return;
     struct rebinding hook={"_CFNetworkHTTPConnectionCacheSetLimit",(void *)&air_drop_cache_limit,NULL};
