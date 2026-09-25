@@ -14,13 +14,17 @@ static NSCountedSet *leased_transfer_servers;
 @property(copy) NSArray *servers;
 - (void)finish;
 @end
+static void drain_after_stop(id server);
+static BOOL receive_in_progress(void) {
+    @synchronized([AQTransferLease class]) { return receiving_transfers!=0; }
+}
 static void flush_transfer_servers(void) {
     dispatch_async(dispatch_get_main_queue(),^{
         @synchronized([AQTransferLease class]) {
             if(receiving_transfers) return;
             NSArray *servers=[deferred_transfer_servers allObjects];
             [deferred_transfer_servers removeAllObjects];
-            for(id server in servers) { [transfer_servers removeObject:server]; original_stop(server,@selector(stop)); release_radio(server); }
+            for(id server in servers) { [transfer_servers removeObject:server]; original_stop(server,@selector(stop)); drain_after_stop(server); release_radio(server); }
         }
     });
 }

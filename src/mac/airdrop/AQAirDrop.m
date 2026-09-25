@@ -54,6 +54,7 @@ static NSDictionary *helper(NSString *command) {
 }
 #include "AQRadio.inc"
 #include "AQTransferLease.inc"
+#include "AQServerDrain.inc"
 static BOOL is_airdrop_browser(id browser) {
     return *((const unsigned char *)(__bridge const void *)browser+browser_airdrop_offset)!=0;
 }
@@ -149,6 +150,7 @@ static void stop_server(id server,SEL selector) {
     if(defer_transfer_server_stop(server)) return;
     forget_transfer_server(server);
     original_stop(server,selector);
+    drain_after_stop(server);
     release_radio(server);
 }
 static Method checked_method(NSString *class_name,const char *selector,const char *encoding) {
@@ -175,6 +177,13 @@ __attribute__((constructor)) static void install_airdrop(void) { @autoreleasepoo
     if(!transfer_begin || !transfer_end || !transfer_notify || !receive_notify || !receive_end || !receive_ask || strcmp(ivar_getTypeEncoding(receive_ask),"^{_CFHTTPServerRequest=}")) return;
     receive_ask_offset=ivar_getOffset(receive_ask);
     Method start=checked_method(@"SDWormholeServer","startHTTPServer","v16@0:8"),stop=checked_method(@"SDWormholeServer","stop","v16@0:8");
+    Class server_class=NSClassFromString(@"SDWormholeServer");
+    Ivar server_http=class_getInstanceVariable(server_class,"_server"),server_connections=class_getInstanceVariable(server_class,"_connections");
+    server_queue_ivar=class_getInstanceVariable(server_class,"_queue");
+    if(!server_http || strcmp(ivar_getTypeEncoding(server_http),"^{_CFHTTPServer=}") ||
+       !server_connections || strcmp(ivar_getTypeEncoding(server_connections),"^{__CFDictionary=}") ||
+       !server_queue_ivar || strcmp(ivar_getTypeEncoding(server_queue_ivar),"@\"NSObject<OS_dispatch_queue>\"")) return;
+    server_http_offset=ivar_getOffset(server_http); server_connections_offset=ivar_getOffset(server_connections);
     Method request=checked_method(@"SDWormholeConnection","didReceiveRequest:","v24@0:8^{_CFHTTPServerRequest=}16");
     Method offer_event=checked_method(@"SDWormholeConnection","handleReadStreamEvent:event:","v32@0:8^{__CFReadStream=}16Q24");
     if(!offer_event) return;
@@ -205,6 +214,7 @@ __attribute__((constructor)) static void install_airdrop(void) { @autoreleasepoo
     RESOLVE(original_create_connection,"CFURLConnectionCreateWithProperties");
     RESOLVE(copy_mutable_request,"CFURLRequestCreateMutableCopy"); RESOLVE(set_request_header,"CFURLRequestSetHTTPHeaderFieldValue");
     RESOLVE(response_message,"CFURLResponseGetHTTPResponse");
+    RESOLVE(server_connection_invalidate,"_CFHTTPServerConnectionInvalidate");
     CFStringRef *url=dlsym(RTLD_DEFAULT,"_kCFHTTPServerRequestURL"); if(!url) return; request_url=*url;
 #undef RESOLVE
     radio_lock=[NSLock new];

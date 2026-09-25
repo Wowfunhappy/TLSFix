@@ -15,6 +15,7 @@ static unsigned test_interface(const char*n){return radio_running?10:0;}
 #include "../src/mac/airdrop/AQRadio.inc"
 static void (*original_stop)(id,SEL);
 #include "../src/mac/airdrop/AQTransferLease.inc"
+static void drain_after_stop(id server){}
 @interface Operation : NSObject { @public void *_askRequest; }
 @end
 @implementation Operation
