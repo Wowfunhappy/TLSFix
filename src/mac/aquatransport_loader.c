@@ -90,7 +90,10 @@ static void aquatransport_loader_init(void) {
 
     char path[1024];
     if (!aq_engine_path(path, sizeof path)) { aq_complain(dir, "cannot locate engine"); return; }
-    // RTLD_LOCAL because the engine exports nothing and nothing should be able to bind to it.
-    if (!dlopen(path, RTLD_NOW | RTLD_LOCAL))
+    // RTLD_GLOBAL so the engine's one exported symbol, the WKExternalURLRewrite hook, is where a
+    // patched WebKit's dlsym(RTLD_DEFAULT, ...) will find it. The engine exports nothing else --
+    // the build verifies the OpenSSL namespace stays hidden -- so making it global exposes only
+    // that hook and cannot let anything bind to the engine's internals.
+    if (!dlopen(path, RTLD_NOW | RTLD_GLOBAL))
         aq_complain(dir, dlerror());
 }

@@ -436,6 +436,45 @@ static void *my_MutableCopy(void *a, void *b, void *c, void *d, void *e, void *f
     return m;
 }
 
+// The WebKit host hook -- the engine's one exported symbol. A patched WebKit resolves it by name
+// and calls it for each outgoing request in its network process, passing the request URL and a
+// mutable dictionary of its header fields (names compared case-insensitively). This carries the
+// same redirect and header rules the CFNetwork entry points above apply, to the loads a WebKit
+// port routes through its own transport instead of CFNetwork.
+//
+// The contract is WebKit's, read from its caller: url and headers belong to WebKit and are not
+// released here; header rules edit the dictionary in place, where a rule with an empty value
+// removes the field; a returned URL is created +1 and released by WebKit, and returning NULL
+// leaves the request's URL unchanged.
+static void dict_header_set(void *dict, CFStringRef name, CFStringRef value) {
+    if (value) CFDictionarySetValue((CFMutableDictionaryRef)dict, name, value);
+    else       CFDictionaryRemoveValue((CFMutableDictionaryRef)dict, name);
+}
+
+__attribute__((visibility("default")))
+CFURLRef WKExternalURLRewrite(CFURLRef url, CFMutableDictionaryRef headers) {
+    if (!url) return NULL;
+    char *before = cf_to_c(CFURLGetString(url));
+    if (!before) return NULL;
+
+    char *after = tf_apply_redirect(before);
+    const char *effective = after ? after : before;
+
+    if (headers) {
+        const tf_headerrule *hr = match_headers(effective);
+        if (hr) apply_header_rule(hr, headers, dict_header_set);
+    }
+
+    CFURLRef result = NULL;
+    if (after) {
+        CFStringRef s = CFStringCreateWithCString(NULL, after, kCFStringEncodingUTF8);
+        if (s) { result = CFURLCreateWithString(NULL, s, NULL); CFRelease(s); }
+        tf_log("wk rewrite %s -> %s", before, after);
+    }
+    free(before); free(after);
+    return result;
+}
+
 // Six pointer parameters are declared on purpose. The real arities are 4; on both x86_64
 // and i386 passing more arguments than the callee reads is harmless, whereas declaring
 // fewer than the real count would make the callee read uninitialised registers or stack.

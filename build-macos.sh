@@ -86,6 +86,9 @@ SRCS=("$DIR/src/aquatransport_engine.c" "$DIR/src/mac/aquatransport_hooks_mac.c"
       "$DIR/src/mac/aquatransport_airdrop.c" "$DIR/src/mac/aquatransport_maps.c" "$DIR/src/mac/aquatransport_rewrite.c" "$DIR/src/mac/aquatransport_trust_mac.c" "$DIR/deps/fishhook/fishhook.c")
 OBJDIR="$BUILD/obj"; rm -rf "$OBJDIR"; mkdir -p "$OBJDIR"
 : > "$BUILD/nothing.exp"
+# The engine exports exactly one symbol: the URL-rewrite hook a patched WebKit resolves by name.
+# Nothing else -- the OpenSSL namespace stays hidden, checked below.
+printf '_WKExternalURLRewrite\n' > "$BUILD/engine.exp"
 
 slices=()
 loader_slices=()
@@ -105,7 +108,7 @@ for a in "${ARCHS[@]}"; do
     -install_name /usr/share/aquatransport/aquatransport_engine.dylib \
     "${objs[@]}" "$LS_OUT/lib/libssl.a" "$LS_OUT/lib/libcrypto.a" \
     -Wl,-lazy_framework,Security -Wl,-lazy_framework,CoreFoundation \
-    -Wl,-exported_symbols_list,"$BUILD/nothing.exp"
+    -Wl,-exported_symbols_list,"$BUILD/engine.exp"
   slices+=("$out")
 
   # The loader is what Security.framework's load command names, so it is mapped into every
@@ -190,14 +193,14 @@ echo "    $img architectures:$have"
 POST106='^_(strndup|strnlen|getline|getdelim|memmem|getentropy|clock_gettime|clock_gettime_nsec_np|arc4random_buf|dispatch_activate|os_unfair_lock_lock)$'
 for a in "${ARCHS[@]}"; do
   echo "$have" | grep -qw "$a" || { echo "FATAL: $img missing $a slice; $a processes would go unpatched"; exit 1; }
-  n=$(nm -arch "$a" -g "$ST/$img" 2>/dev/null | grep -cE " (T|D|B|S) _" || true)
-  [ "$n" = "0" ] || { echo "FATAL: $img $a exports $n symbols (OpenSSL namespace would leak)"; exit 1; }
+  leak=$(nm -arch "$a" -g "$ST/$img" 2>/dev/null | grep -E " (T|D|B|S) _" | awk '{print $NF}' | grep -vxF '_WKExternalURLRewrite' || true)
+  [ -z "$leak" ] || { echo "FATAL: $img $a exports symbols beyond the WebKit hook (OpenSSL namespace would leak):"; echo "$leak" | sed 's/^/      /'; exit 1; }
   bad=$(nm -arch "$a" -u "$ST/$img" 2>/dev/null | tr -d ' ' | grep -E "$POST106" || true)
   [ -z "$bad" ] || { echo "FATAL: $img $a imports symbols absent on $MIN (would crash on first use):"
                      echo "$bad" | sed 's/^/      /'; exit 1; }
 done
 done
-echo "    per slice: present, 0 exports, no post-$MIN imports"
+echo "    per slice: present, only the WebKit hook exported, no post-$MIN imports"
 # OS X's Objective-C collector is x86_64 only; i386 uses retain/release.
 otool -arch x86_64 -ov "$ST/aquatransport_gsa.dylib" | grep -q 'OBJC_IMAGE_SUPPORTS_GC' ||
   { echo "FATAL: GSA x86_64 does not support Objective-C garbage collection"; exit 1; }
