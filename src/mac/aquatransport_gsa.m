@@ -194,38 +194,6 @@ static NSData *aq_send(AQGSAProtocol *owner, NSMutableURLRequest *req, NSHTTPURL
     return wire->body;
 }
 
-static NSString *aq_md5hex(NSData *data) {
-    unsigned char digest[EVP_MAX_MD_SIZE]; unsigned int count = 0;
-    if (!EVP_Digest([data bytes], [data length], digest, &count, EVP_md5(), NULL) || count != 16) return nil;
-    char hex[33];
-    for (unsigned int i = 0; i < count; i++) snprintf(hex+2*i, 3, "%02x", digest[i]);
-    return [NSString stringWithUTF8String:hex];
-}
-
-/* GSAPort's provider authenticates its GET using a public protocol key, an expiry
- * and a device identifier. It does not receive Apple account credentials. MD5 is
- * mandated by that service's request format, unrelated to our SRP/TLS crypto. */
-static NSMutableURLRequest *aq_gsaport_request(NSString *device, NSTimeInterval now) {
-    if (!aq_string(device) || now < 0 || now > UINT32_MAX-180) return nil;
-    const char *key = "674822be7c2573ea82ff68e5579f4e5ea770b36609fe7ffe04d983de57fb9607";
-    uint32_t expiry = (uint32_t)(now+180);
-    unsigned char little[4] = {expiry, expiry >> 8, expiry >> 16, expiry >> 24};
-    NSMutableData *signedData = [NSMutableData dataWithBytes:little length:4];
-    [signedData appendData:[[NSString stringWithFormat:@"icloud.podpod123.com/anisette.php?%@", device] dataUsingEncoding:NSUTF8StringEncoding]];
-    [signedData appendBytes:key length:strlen(key)];
-    unsigned char digest[EVP_MAX_MD_SIZE]; unsigned int len = 0;
-    if (!EVP_Digest([signedData bytes], [signedData length], digest, &len, EVP_md5(), NULL) || len != 16) return nil;
-    NSMutableData *signature = [NSMutableData dataWithBytes:key length:strlen(key)];
-    [signature appendBytes:digest length:len];
-    NSString *signatureHex = aq_md5hex(signature), *deviceHash = aq_md5hex([device dataUsingEncoding:NSUTF8StringEncoding]);
-    if (!signatureHex || !deviceHash) return nil;
-    NSMutableURLRequest *req = [NSMutableURLRequest requestWithURL:[NSURL URLWithString:@"https://icloud.podpod123.com/anisette.php"]];
-    [req setValue:device forHTTPHeaderField:@"X-Device-Uuid"];
-    [req setValue:deviceHash forHTTPHeaderField:@"pk"];
-    [req setValue:[NSString stringWithFormat:@"%u_%@", expiry, signatureHex] forHTTPHeaderField:@"podkey"];
-    return req;
-}
-
 static NSString *aq_device_uuid(void) {
     io_service_t service = IOServiceGetMatchingService(kIOMasterPortDefault, IOServiceMatching("IOPlatformExpertDevice"));
     if (!service) return nil;
@@ -236,79 +204,46 @@ static NSString *aq_device_uuid(void) {
     return device;
 }
 
-static NSDictionary *aq_remote_anisette(AQGSAProtocol *owner, NSMutableURLRequest *req, NSError **error) {
-    NSHTTPURLResponse *r = nil;
-    NSData *d = aq_send(owner, req, &r, error);
-    if (!d) return nil;
-    if ([r statusCode] != 200) {
-        *error = aq_error(11, [NSString stringWithFormat:@"The anisette server returned HTTP %ld.", (long)[r statusCode]]); return nil;
-    }
-    NSDictionary *json = aq_dict([NSJSONSerialization JSONObjectWithData:d options:0 error:NULL]);
-    if (!json) { *error = aq_error(11, @"The anisette server did not return a JSON dictionary."); return nil; }
-    NSMutableDictionary *headers = [NSMutableDictionary dictionary];
-    /* A provider cannot supply credentials, endpoints or arbitrary protocol fields. */
-    for (NSString *key in [NSArray arrayWithObjects:@"X-Apple-I-MD", @"X-Apple-I-MD-M", @"X-Apple-I-MD-LU",
-            @"X-Apple-I-MD-RINFO", @"X-Mme-Device-Id", @"X-Apple-I-SRL-NO", @"X-MMe-Client-Info", nil]) {
-        id raw = [json objectForKey:key];
-        if ([key isEqual:@"X-Apple-I-MD-RINFO"] && [raw isKindOfClass:[NSNumber class]]) raw = [raw stringValue];
-        NSString *v = aq_string(raw);
-        if (v && [v length] <= 16384 && [v rangeOfCharacterFromSet:[NSCharacterSet controlCharacterSet]].location == NSNotFound)
-            [headers setObject:v forKey:key];
-    }
-    return headers;
+static NSString *aq_device_field(id value) {
+    NSString *s = aq_string(value);
+    return s && [s length] <= 16384 &&
+        [s rangeOfCharacterFromSet:[NSCharacterSet controlCharacterSet]].location == NSNotFound ? s : nil;
 }
 
+static NSMutableURLRequest *aq_apple_request(NSString *url, NSDictionary *headers);
+#ifdef AQ_NATIVE_DIAGNOSTIC
+#include "aquatransport_anisette.inc"
+@interface AQNativeAnisette : AQNativeAnisetteGenerator @end
+@implementation AQNativeAnisette @end
+#else
+#include "aquatransport_anisette_client.inc"
+#endif
+
+/* One provider: the Mac's native AOSKit/CoreADI state. */
 static NSDictionary *aq_anisette(AQGSAProtocol *owner, NSError **error) {
+    if ([owner isStopped]) { *error = aq_error(NSUserCancelledError, @"Sign-in cancelled."); return nil; }
     NSMutableDictionary *headers = [NSMutableDictionary dictionary];
-    NSString *path = [[NSString stringWithUTF8String:tf_dir()] stringByAppendingPathComponent:@"gsa-anisette-url.txt"];
-    NSString *endpoint = [[NSString stringWithContentsOfFile:path encoding:NSUTF8StringEncoding error:NULL]
-                            stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
-    if ([endpoint length]) {
-        NSURL *url = [NSURL URLWithString:endpoint];
-        BOOL local = [[url host] isEqual:@"127.0.0.1"] || [[url host] isEqual:@"localhost"] || [[url host] isEqual:@"[::1]"];
-        if ((![[url scheme] isEqual:@"https"] && !(local && [[url scheme] isEqual:@"http"])) ||
-            ![url host] || [url user] || [url password] || [url fragment]) {
-            *error = aq_error(10, @"The anisette server must use HTTPS (HTTP is allowed only on loopback)."); return nil;
-        }
-        NSDictionary *remote = aq_remote_anisette(owner, [NSMutableURLRequest requestWithURL:url], error);
-        if (!remote) return nil;
-        [headers addEntriesFromDictionary:remote];
-    } else {
-        dlopen("/System/Library/PrivateFrameworks/AOSKit.framework/AOSKit", RTLD_LAZY | RTLD_LOCAL);
-        Class utility = NSClassFromString(@"AOSUtilities");
-        SEL otp = NSSelectorFromString(@"retrieveOTPHeadersForDSID:");
-        SEL udid = NSSelectorFromString(@"machineUDID");
-        if ([utility respondsToSelector:otp] && [utility respondsToSelector:udid]) {
-            NSDictionary *d = aq_dict(((id(*)(id,SEL,id))objc_msgSend)(utility, otp, @"-2"));
-            NSString *machine = aq_string([d objectForKey:@"X-Apple-MD-M"]);
-            NSString *oneTime = aq_string([d objectForKey:@"X-Apple-MD"]);
-            NSString *device = aq_string(((id(*)(id,SEL))objc_msgSend)(utility, udid));
-            if (machine && oneTime && device) {
-                [headers setObject:machine forKey:@"X-Apple-I-MD-M"];
-                [headers setObject:oneTime forKey:@"X-Apple-I-MD"];
-                [headers setObject:device forKey:@"X-Mme-Device-Id"];
-                [headers setObject:aq_base64([device dataUsingEncoding:NSUTF8StringEncoding]) forKey:@"X-Apple-I-MD-LU"];
-                [headers setObject:@"84215040" forKey:@"X-Apple-I-MD-RINFO"];
+    @synchronized([AQGSAProtocol class]) {
+        NSString *device = aq_device_field(aq_device_uuid());
+        if (!device) { *error = aq_error(13, @"Local Anisette is unavailable: this Mac has no hardware UUID."); return nil; }
+        @try {
+            NSDictionary *d = aq_dict([AQNativeAnisette headersForOwner:owner error:error]);
+            NSString *machine = aq_device_field([d objectForKey:@"X-Apple-MD-M"]);
+            NSString *oneTime = aq_device_field([d objectForKey:@"X-Apple-MD"]);
+            NSString *routing = aq_adi_routing([d objectForKey:@"X-Apple-I-MD-RINFO"]);
+            if (!machine || !oneTime || !routing) {
+                if (!*error) *error = aq_error(12, @"Local Anisette returned no usable device authentication data."); return nil;
             }
+            [headers setObject:machine forKey:@"X-Apple-I-MD-M"];
+            [headers setObject:oneTime forKey:@"X-Apple-I-MD"];
+            [headers setObject:routing forKey:@"X-Apple-I-MD-RINFO"];
+        } @catch (NSException *exception) {
+            *error = aq_error(11, @"Local Anisette failed inside AOSKit."); return nil;
         }
-        if (![headers count]) {
-            NSMutableURLRequest *req = aq_gsaport_request(aq_device_uuid(), [[NSDate date] timeIntervalSince1970]);
-            if (!req) { *error = aq_error(13, @"Could not create the device authentication request."); return nil; }
-            NSDictionary *remote = aq_remote_anisette(owner, req, error);
-            if (!remote) return nil;
-            [headers addEntriesFromDictionary:remote];
-        }
+        [headers setObject:device forKey:@"X-Mme-Device-Id"];
+        [headers setObject:aq_base64([device dataUsingEncoding:NSUTF8StringEncoding]) forKey:@"X-Apple-I-MD-LU"];
     }
-    for (NSString *key in [NSArray arrayWithObjects:@"X-Apple-I-MD", @"X-Apple-I-MD-M", @"X-Apple-I-MD-LU", @"X-Apple-I-MD-RINFO", @"X-Mme-Device-Id", nil]) {
-        if (!aq_string([headers objectForKey:key])) {
-            *error = aq_error(12, @"The anisette provider did not return the required device authentication data."); return nil;
-        }
-    }
-    /* Providers may still advertise the retired Xcode identity. Keep a supported
-     * identity consistent between HTTP headers and GrandSlam client data. */
-    NSString *client = aq_string([headers objectForKey:@"X-MMe-Client-Info"]);
-    if (!client || [client rangeOfString:@"Xcode" options:NSCaseInsensitiveSearch].location != NSNotFound)
-        [headers setObject:AQClient forKey:@"X-MMe-Client-Info"];
+    [headers setObject:AQClient forKey:@"X-MMe-Client-Info"];
     NSDateFormatter *date = [[[NSDateFormatter alloc] init] autorelease];
     [date setLocale:[[[NSLocale alloc] initWithLocaleIdentifier:@"en_US_POSIX"] autorelease]];
     [date setTimeZone:[NSTimeZone timeZoneForSecondsFromGMT:0]];
@@ -706,7 +641,7 @@ static NSArray *aq_device_header_names(void) {
 - (void)prepare {
     NSAutoreleasePool *pool = [[NSAutoreleasePool alloc] init];
     /* This runs on the authentication queue, never CFNetwork's callback thread.
-     * A short cache avoids an anisette-provider request for every DAV resource. */
+     * A short cache avoids native OTP generation for every DAV resource. */
     static NSDictionary *cached;
     static NSDate *expires;
     if (![self isStopped]) {
@@ -824,7 +759,7 @@ static NSData *aq_mail_initial_response(id self, SEL selector) {
 
     /* Mail asks synchronously on its authentication worker. Serialize and reuse
      * device data briefly for IMAP's connections and SMTP, never account tokens.
-     * A provider failure stops this attempt without sending a known-incomplete
+     * A local generation failure stops this attempt without sending a known-incomplete
      * token response to the mail server. */
     NSDictionary *headers = nil;
     NSError *error = nil;

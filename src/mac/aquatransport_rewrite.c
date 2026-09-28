@@ -136,6 +136,9 @@ static void load_gsa_once(void) {
 
 static void prepare_gsa(void) {
     void *(*get_class)(const char *) = dlsym(RTLD_DEFAULT, "objc_getClass");
+    /* The local device generator uses Foundation for its own provisioning
+     * requests. It must not load an authentication client inside itself. */
+    if (get_class && get_class("AQNativeAnisetteGenerator")) return;
     // A C-only request must not consume the once token: Foundation may arrive later.
     if (get_class && get_class("NSURLConnection")) pthread_once(&g_gsa_once, load_gsa_once);
 }

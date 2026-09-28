@@ -10,6 +10,7 @@
 #include <openssl/sha.h>
 #include <openssl/hmac.h>
 #include <openssl/evp.h>
+#include "local-anisette-fixture.h"
 
 static NSString *mode;
 static int unexpected, anisetteCalls, initCalls, completeCalls, accountCalls, codeCalls;
@@ -22,9 +23,14 @@ static NSString *settingsAuth(void) {
 }
 
 static NSString *expectedClient(void) {
-    return ([mode isEqual:@"old-client"] || [mode isEqual:@"missing-client"]) ?
-        @"<MacBookPro13,2> <macOS;13.1;22C65> <com.apple.AuthKit/1 (com.apple.akd/1.0)>" :
-        @"<fixture-device> <fixture-os> <fixture-client>";
+    return AQTestClient;
+}
+
+static id localOTP(id self, SEL selector, id owner, NSError **error) {
+    anisetteCalls++;
+    if (fixture(@"missing-anisette") || [mode isEqual:@"settings-missing"]) return @{};
+    return @{@"X-Apple-MD": @"fake-otp", @"X-Apple-MD-M": @"fake-machine", @"X-Apple-I-MD-RINFO": @"12345",
+        @"Authorization": @"MUST-NOT-BE-FORWARDED", @"X-MMe-Client-Info": @"MUST-NOT-BE-FORWARDED"};
 }
 
 static NSData *plist(id obj) { return [NSPropertyListSerialization dataWithPropertyList:obj format:NSPropertyListXMLFormat_v1_0 options:0 error:NULL]; }
@@ -100,17 +106,7 @@ static NSData *encrypted_session(void) {
     }
     assert([NSURLProtocol propertyForKey:@"AquaTransportGSAHandled" inRequest:req]);
     assert(![req HTTPShouldHandleCookies]);
-    if ([host isEqual:@"127.0.0.1"]) {
-        anisetteCalls++;
-        assert(![req valueForHTTPHeaderField:@"Authorization"] && ![req HTTPBody]);
-        NSMutableDictionary *headers = [NSMutableDictionary dictionaryWithObjectsAndKeys:@"fake-otp", @"X-Apple-I-MD", @"fake-machine", @"X-Apple-I-MD-M",
-            @"fake-local", @"X-Apple-I-MD-LU", @"84215040", @"X-Apple-I-MD-RINFO", @"fake-device", @"X-Mme-Device-Id",
-            @"<fixture-device> <fixture-os> <fixture-client>", @"X-MMe-Client-Info", @"MUST-NOT-BE-FORWARDED", @"Authorization", nil];
-        if ([mode isEqual:@"old-client"]) [headers setObject:@"<fixture> <com.apple.dt.Xcode/3594.4.19>" forKey:@"X-MMe-Client-Info"];
-        if ([mode isEqual:@"missing-client"]) [headers removeObjectForKey:@"X-MMe-Client-Info"];
-        data = [NSJSONSerialization dataWithJSONObject:headers options:0 error:NULL];
-        if (fixture(@"missing-anisette") || [mode isEqual:@"settings-missing"]) data = bytes(@"{}");
-    } else if ([host isEqual:@"gsa.apple.com"] && [path isEqual:@"/grandslam/GsService2"]) {
+    if ([host isEqual:@"gsa.apple.com"] && [path isEqual:@"/grandslam/GsService2"]) {
         assert(![req valueForHTTPHeaderField:@"Authorization"]);
         assert(![req valueForHTTPHeaderField:@"X-Apple-I-MD"]);
         assert([[req valueForHTTPHeaderField:@"Accept"] isEqual:@"*/*"]);
@@ -150,7 +146,7 @@ static NSData *encrypted_session(void) {
         NSDictionary *body = parse([req HTTPBody]);
         assert([[body objectForKey:@"apple-id"] isEqual:@"test@example.invalid"]);
         assert([[body objectForKey:@"password"] isEqual:@"fake-pet"]);
-        assert([[body objectForKey:@"client-id"] isEqual:@"fake-device"]);
+        assert([[body objectForKey:@"client-id"] length] && [[body objectForKey:@"client-id"] isEqual:[req valueForHTTPHeaderField:@"X-Mme-Device-Id"]]);
         NSDictionary *delegates = [body objectForKey:@"delegates"];
         assert([delegates count] == 1 && [[delegates objectForKey:@"com.apple.madrid"] isKindOfClass:[NSDictionary class]]);
         assert([[req valueForHTTPHeaderField:@"Authorization"] isEqual:@"Basic dGVzdEBleGFtcGxlLmludmFsaWQ6ZmFrZS1wZXQ="]);
@@ -177,7 +173,7 @@ static NSData *encrypted_session(void) {
             assert([[req valueForHTTPHeaderField:@"Authorization"] isEqual:settingsAuth()]);
             assert([[req valueForHTTPHeaderField:@"X-Apple-I-MD"] isEqual:@"fake-otp"]);
             assert([[req valueForHTTPHeaderField:@"X-Apple-I-MD-M"] isEqual:@"fake-machine"]);
-            assert([[req valueForHTTPHeaderField:@"X-Mme-Device-Id"] isEqual:@"fake-device"]);
+            assert([[req valueForHTTPHeaderField:@"X-Mme-Device-Id"] length] == 36);
             assert([[req valueForHTTPHeaderField:@"X-Mme-Client-Info"] isEqual:expectedClient()]);
             assert([[req HTTPMethod] isEqual:@"POST"] && [[req HTTPBody] isEqual:bytes(@"refresh-body-fixture")]);
         } else assert([[req valueForHTTPHeaderField:@"Authorization"] isEqual:@"Basic MTIzNDU6ZmFrZS1tbWU="]);
@@ -241,6 +237,7 @@ int main(int argc, char **argv) {
     assert([NSGarbageCollector defaultCollector] != nil);
 #endif
     [NSURLProtocol registerClass:[AQMock class]];
+    if (!fixture(@"disabled")) aq_test_install_otp((IMP)localOTP);
     if ([mode hasPrefix:@"ids-"]) {
         NSURLResponse *response = nil; NSError *error = nil;
         NSData *data = [NSURLConnection sendSynchronousRequest:idsLogin(@"Synthetic:PassWord") returningResponse:&response error:&error];
@@ -347,8 +344,7 @@ int main(int argc, char **argv) {
         data = [NSURLConnection sendSynchronousRequest:login(@"Synthetic:PassWord123456") returningResponse:&response error:&error];
         assert(verified && codeCalls == 2);
     }
-    BOOL success = [mode isEqual:@"success"] || [mode isEqual:@"2fa"] ||
-        [mode isEqual:@"old-client"] || [mode isEqual:@"missing-client"];
+    BOOL success = [mode isEqual:@"success"] || [mode isEqual:@"2fa"];
     if (error) fprintf(stderr, "fixture error: %s (%ld), init=%d complete=%d account=%d\n", [[error localizedDescription] UTF8String], (long)[error code], initCalls, completeCalls, accountCalls);
     if (success) {
         assert(!error && [(NSHTTPURLResponse *)response statusCode] == 200);

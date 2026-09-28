@@ -12,6 +12,8 @@ fi
 echo "Please type in your password and press return. No characters will appear as you type."
 sudo true || exit 1
 
+sudo launchctl unload /usr/share/aquatransport/org.aquatransport.anisette.plist
+
 sudo launchctl unload /usr/share/aquatransport/airdrop/org.aquatransport.airdrop.plist
 sudo launchctl unload /Library/LaunchDaemons/org.aquatransport.bootstrap.plist
 sudo rm -f /Library/LaunchDaemons/org.aquatransport.bootstrap.plist

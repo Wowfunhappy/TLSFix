@@ -48,6 +48,8 @@ for lib in aquatransport_maps.dylib aquatransport_gsa.dylib aquatransport_engine
   [ -f "$SRC/$lib" ] || [ -f "$LIBDIR/$lib" ] ||
     { echo "missing $lib -- run ./build-macos.sh first"; exit 1; }
 done
+[ -f "$SRC/aquatransport-anisette" ] || [ -f "$LIBDIR/aquatransport-anisette" ] ||
+  { echo "missing local Anisette service -- run ./build-macos.sh first"; exit 1; }
 
 # A package install has already put the library in place; a build in this tree supersedes it,
 # by rename rather than in-place write, so a load in progress never sees a partial file.
@@ -63,6 +65,11 @@ for lib in aquatransport_maps.dylib aquatransport_gsa.dylib aquatransport_engine
 done
 [ -f "$DYLIB" ] || { echo "no library at $DYLIB -- run ./build-macos.sh first"; exit 1; }
 [ -f "$ENGINE" ] || { echo "no engine at $ENGINE -- run ./build-macos.sh first"; exit 1; }
+if [ -f "$SRC/aquatransport-anisette" ]; then
+  install -o root -g wheel -m 755 "$SRC/aquatransport-anisette" "$LIBDIR/aquatransport-anisette.new"
+  mv -f "$LIBDIR/aquatransport-anisette.new" "$LIBDIR/aquatransport-anisette"
+fi
+install -o root -g wheel -m 644 "$DIR/src/mac/org.aquatransport.anisette.plist" "$LIBDIR/"
 # Seed each rule file from the shipped default when it is not already present, so a reinstall
 # keeps a user's edits. flags.txt has no default and starts empty.
 for f in headers.txt redirects.txt disabled.txt; do

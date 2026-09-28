@@ -4,28 +4,21 @@
 #import <objc/message.h>
 #include <assert.h>
 #include <dlfcn.h>
+#include "local-anisette-fixture.h"
 
 static NSString *mode;
 static int providerCalls;
+static id localOTP(id self, SEL selector, id owner, NSError **error) {
+    providerCalls++;
+    return [mode hasPrefix:@"missing"] ? @{} : @{@"X-Apple-MD": @"fixture-otp", @"X-Apple-MD-M": @"fixture-machine", @"X-Apple-I-MD-RINFO": @"12345"};
+}
 @interface MailMock : NSURLProtocol @end
 @implementation MailMock
 + (BOOL)canInitWithRequest:(NSURLRequest *)r { return YES; }
 + (NSURLRequest *)canonicalRequestForRequest:(NSURLRequest *)r { return r; }
 - (void)stopLoading {}
 - (void)startLoading {
-    NSURLRequest *r = [self request];
-    assert([[[r URL] absoluteString] isEqual:@"http://127.0.0.1:9/anisette"]);
-    assert(![r valueForHTTPHeaderField:@"Authorization"] && ![r HTTPBody]);
-    providerCalls++;
-    NSDictionary *h = [mode hasPrefix:@"missing"] ? @{} : @{
-        @"X-Apple-I-MD":@"fixture-otp", @"X-Apple-I-MD-M":@"fixture-machine",
-        @"X-Apple-I-MD-LU":@"fixture-user", @"X-Apple-I-MD-RINFO":@"1",
-        @"X-Mme-Device-Id":@"fixture-device", @"X-MMe-Client-Info":@"<fixture-client>"};
-    NSHTTPURLResponse *response = [[[NSHTTPURLResponse alloc] initWithURL:[r URL] statusCode:200
-        HTTPVersion:@"HTTP/1.1" headerFields:nil] autorelease];
-    [[self client] URLProtocol:self didReceiveResponse:response cacheStoragePolicy:NSURLCacheStorageNotAllowed];
-    [[self client] URLProtocol:self didLoadData:[NSJSONSerialization dataWithJSONObject:h options:0 error:NULL]];
-    [[self client] URLProtocolDidFinishLoading:self];
+    assert(!"Local Mail device authentication must not make HTTP requests");
 }
 @end
 
@@ -72,6 +65,7 @@ int main(int argc, char **argv) {
         prepare(host);
     assert(!NSClassFromString(@"AQMailTokenAdapter"));
     prepare(a->host);
+    if (![mode hasPrefix:@"disabled"]) aq_test_install_otp((IMP)localOTP);
     if ([mode hasPrefix:@"disabled"]) {
         assert(!NSClassFromString(@"AQMailTokenAdapter") && [response(clientFor(a)) isEqual:native]);
         assert(providerCalls == 0);
@@ -82,7 +76,7 @@ int main(int argc, char **argv) {
     } else {
         assert(NSClassFromString(@"AQMailTokenAdapter"));
         NSData *expected = joined(@[@"123456789", @"123456789", token,
-            @"fixture-machine", @"fixture-otp", @"<fixture-client>"]);
+            @"fixture-machine", @"fixture-otp", AQTestClient]);
         for (NSString *host in @[@"p32-imap.mail.me.com", @"p32-smtp.mail.me.com", @"imap.mail.me.com",
                 @"smtp.mail.me.com", @"imap.mail.icloud.com", @"smtp.mail.icloud.com", @"P32-IMAP.MAIL.ME.COM"]) {
             a->host = host; id c = clientFor(a); assert([response(c) isEqual:expected]);
@@ -93,7 +87,7 @@ int main(int argc, char **argv) {
         assert([response(clientFor(a)) isEqual:native]);
         a->host = @"imap.mail.me.com"; a->token = @"another-opaque-token";
         assert([response(clientFor(a)) isEqual:joined(@[@"123456789", @"123456789", @"another-opaque-token",
-            @"fixture-machine", @"fixture-otp", @"<fixture-client>"])]);
+            @"fixture-machine", @"fixture-otp", AQTestClient])]);
         assert(providerCalls == 1);
         NSString *flags = [[NSString stringWithUTF8String:getenv("AQUATRANSPORT_DIR")] stringByAppendingPathComponent:@"flags.txt"];
         [NSThread sleepForTimeInterval:1.1]; // The shared config checks mtime once a second.

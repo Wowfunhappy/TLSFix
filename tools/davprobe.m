@@ -3,8 +3,13 @@
 #import <Foundation/Foundation.h>
 #import <objc/message.h>
 #include <assert.h>
+#include "local-anisette-fixture.h"
 static NSString *mode;
 static int providerCalls, davCalls, authCalls, unexpected;
+static id localOTP(id self, SEL selector, id owner, NSError **error) {
+    providerCalls++;
+    return [mode isEqual:@"missing"] ? @{} : @{@"X-Apple-MD": @"otp", @"X-Apple-MD-M": @"machine", @"X-Apple-I-MD-RINFO": @"12345"};
+}
 static NSData *data(NSString *s) { return [s dataUsingEncoding:NSUTF8StringEncoding]; }
 @interface DAVMock : NSURLProtocol <NSURLAuthenticationChallengeSender> @end
 @implementation DAVMock
@@ -21,16 +26,6 @@ static NSData *data(NSString *s) { return [s dataUsingEncoding:NSUTF8StringEncod
 }
 - (void)startLoading {
     NSURLRequest *r=[self request]; NSString *host=[[r URL] host];
-    if ([host isEqual:@"127.0.0.1"]) {
-        providerCalls++;
-        assert(![r valueForHTTPHeaderField:@"Authorization"]);
-        NSDictionary *h=[mode isEqual:@"missing"]?@{}:@{@"X-Apple-I-MD":@"otp",@"X-Apple-I-MD-M":@"machine",
-            @"X-Apple-I-MD-LU":@"user",@"X-Apple-I-MD-RINFO":@"1",@"X-Mme-Device-Id":@"device"};
-        NSHTTPURLResponse *response=[[[NSHTTPURLResponse alloc] initWithURL:[r URL] statusCode:200 HTTPVersion:@"HTTP/1.1" headerFields:nil] autorelease];
-        [[self client] URLProtocol:self didReceiveResponse:response cacheStoragePolicy:NSURLCacheStorageNotAllowed];
-        [[self client] URLProtocol:self didLoadData:[NSJSONSerialization dataWithJSONObject:h options:0 error:NULL]];
-        [[self client] URLProtocolDidFinishLoading:self];return;
-    }
     if ([mode isEqual:@"disabled"]) {
         assert(![r valueForHTTPHeaderField:@"X-Apple-I-MD"]);[self respond];return;
     }
@@ -112,6 +107,7 @@ static void checkRedirectsAndCancellation(Class protocol, NSURLRequest *request)
 int main(int argc,char **argv) {
     NSAutoreleasePool *pool=[NSAutoreleasePool new];assert(argc==2);mode=[NSString stringWithUTF8String:argv[1]];
     [NSURLProtocol registerClass:[DAVMock class]];
+    if (![mode isEqual:@"disabled"]) aq_test_install_otp((IMP)localOTP);
     NSMutableURLRequest *r=[NSMutableURLRequest requestWithURL:[NSURL URLWithString:@"https://p402-caldav.icloud.com/"]];
     if([mode isEqual:@"native-calendar"]) [r setURL:[NSURL URLWithString:@"https://fixture%40example.invalid@p402-caldav.icloud.com:8443/resource?query=fixture"]];
     if([mode isEqual:@"native-contacts"]) [r setURL:[NSURL URLWithString:@"https://fixture%40example.invalid@p402-contacts.icloud.com:8843/resource"]];

@@ -138,6 +138,11 @@ for a in "${ARCHS[@]}"; do
     "$gobj" "$cobj" "$OBJDIR/aquatransport_config-$a.o" "$LS_OUT/lib/libcrypto.a" \
     -framework Foundation -framework IOKit -lz -Wl,-exported_symbols_list,"$BUILD/nothing.exp"
   gsa_slices+=("$gout")
+  aout="$OBJDIR/aquatransport-anisette-$a"
+  clang -arch "$a" -mmacosx-version-min=10.7 -O2 -fvisibility=hidden -Wall -Wno-deprecated-declarations \
+    -I"$LS_OUT/include" "$DIR/src/mac/aquatransport_anisette_service.m" \
+    "$LS_OUT/lib/libcrypto.a" -framework Foundation -framework IOKit \
+    -Wl,-exported_symbols_list,"$BUILD/nothing.exp" -o "$aout"
   mout="$OBJDIR/aquatransport_maps-$a.dylib"
   "$GSA_CC" -arch "$a" -mmacosx-version-min=10.9 -O2 -fPIC -fvisibility=hidden \
     -fobjc-gc -Wall -dynamiclib "$DIR/src/mac/aquatransport_maps.m" \
@@ -170,6 +175,8 @@ lipo -create "${slices[@]}" -output "$ST/aquatransport_engine.dylib"
 lipo -create "${loader_slices[@]}" -output "$ST/aquatransport.dylib"
 lipo -create "${gsa_slices[@]}" -output "$ST/aquatransport_gsa.dylib"
 lipo -create "${maps_slices[@]}" -output "$ST/aquatransport_maps.dylib"
+lipo -create "$OBJDIR/aquatransport-anisette-x86_64" "$OBJDIR/aquatransport-anisette-i386" -output "$ST/aquatransport-anisette"
+cp "$DIR/src/mac/org.aquatransport.anisette.plist" "$ST/"
 
 # AirDrop is a separate Mavericks-only image, loaded after the C eligibility gate.
 bash "$DIR/tools/build-airdrop.sh"
@@ -187,7 +194,7 @@ bash "$DIR/tools/build-airdrop.sh"
 #   Added in 10.7:  strndup strnlen getline getdelim memmem arc4random_buf
 #   Added in 10.12: getentropy clock_gettime clock_gettime_nsec_np
 echo "==> verifying"
-for img in aquatransport.dylib aquatransport_engine.dylib aquatransport_gsa.dylib aquatransport_maps.dylib; do
+for img in aquatransport.dylib aquatransport_engine.dylib aquatransport_gsa.dylib aquatransport_maps.dylib aquatransport-anisette; do
 have=$(lipo -info "$ST/$img" | sed 's/.*://')
 echo "    $img architectures:$have"
 POST106='^_(strndup|strnlen|getline|getdelim|memmem|getentropy|clock_gettime|clock_gettime_nsec_np|arc4random_buf|dispatch_activate|os_unfair_lock_lock)$'
@@ -201,6 +208,13 @@ for a in "${ARCHS[@]}"; do
 done
 done
 echo "    per slice: present, only the WebKit hook exported, no post-$MIN imports"
+for img in aquatransport_gsa.dylib aquatransport-anisette; do
+  for a in "${ARCHS[@]}"; do
+    target=$(otool -arch "$a" -l "$ST/$img" | awk '/LC_VERSION_MIN_MACOSX/{found=1} found && $1=="version"{print $2; exit}')
+    [ "$target" = 10.7 ] || { echo "FATAL: $img $a must target Lion (found $target)"; exit 1; }
+  done
+done
+echo "    iCloud client and local generator: both slices target 10.7"
 # OS X's Objective-C collector is x86_64 only; i386 uses retain/release.
 otool -arch x86_64 -ov "$ST/aquatransport_gsa.dylib" | grep -q 'OBJC_IMAGE_SUPPORTS_GC' ||
   { echo "FATAL: GSA x86_64 does not support Objective-C garbage collection"; exit 1; }

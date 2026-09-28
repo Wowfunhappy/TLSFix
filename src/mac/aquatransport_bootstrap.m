@@ -4,6 +4,7 @@
 #import <CoreWLAN/CoreWLAN.h>
 #include "aquatransport_airdrop_hardware.h"
 #include "aquatransport_config.h"
+#include "aquatransport_anisette_service.h"
 #include <sys/stat.h>
 #include <sys/utsname.h>
 #include <sys/wait.h>
@@ -26,6 +27,20 @@ static BOOL supportsAirDropChannel(CWInterface *wifi) {
     return NO;
 }
 
+static void loadJob(const char *path) {
+    char *arguments[]={"launchctl","load",(char *)path,NULL};
+    char *environment[]={"PATH=/usr/bin:/bin:/usr/sbin:/sbin","LC_ALL=C",NULL};
+    pid_t child=0;
+    if(!posix_spawn(&child,"/bin/launchctl",NULL,NULL,arguments,environment)) waitpid(child,NULL,0);
+}
+
+static void loadAnisetteIfEligible(void) {
+    struct utsname os;
+    if(uname(&os) || atoi(os.release)<11 || tf_flag("disable-icloud-gsa") ||
+       !trusted(@AQ_ANISETTE_JOB) || !trusted(@AQ_ANISETTE_EXECUTABLE)) return;
+    loadJob(AQ_ANISETTE_JOB);
+}
+
 static void loadAirDropIfEligible(void) {
     struct utsname os; char interface[32]={0}; struct stat tap;
     if(uname(&os) || atoi(os.release)!=13 || sizeof(void *)!=8 || tf_flag("disable-modern-airdrop") ||
@@ -33,14 +48,12 @@ static void loadAirDropIfEligible(void) {
        !hardware_supported(interface,sizeof(interface)) || !trusted(@AQ_AIRDROP_JOB)) return;
     if(!supportsAirDropChannel([CWInterface interfaceWithName:[NSString stringWithUTF8String:interface]])) return;
 
-    char *arguments[]={"launchctl","load",AQ_AIRDROP_JOB,NULL};
-    char *environment[]={"PATH=/usr/bin:/bin:/usr/sbin:/sbin","LC_ALL=C",NULL};
-    pid_t child=0;
-    if(!posix_spawn(&child,"/bin/launchctl",NULL,NULL,arguments,environment)) waitpid(child,NULL,0);
+    loadJob(AQ_AIRDROP_JOB);
 }
 
 int main(void) { @autoreleasepool {
     if(geteuid()!=0) return 1;
+    loadAnisetteIfEligible();
     loadAirDropIfEligible();
     return 0;
 } }
