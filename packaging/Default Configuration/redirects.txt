@@ -13,3 +13,7 @@ https://twb.preloading.dev/
 *
 https://upload.twitter.com/
 https://twb.preloading.dev/
+
+Safari
+https://extensions.apple.com/*/
+https://mavericksforever.com/safari-extensions-gallery/
