@@ -2,6 +2,7 @@
  * Loaded by the AquaTransport gate at sharingd's pre-daemon startup boundary. */
 #import <Foundation/Foundation.h>
 #import <CFNetwork/CFNetwork.h>
+#import <IOBluetooth/IOBluetooth.h>
 #import <objc/runtime.h>
 #include <dns_sd.h>
 #include <net/if.h>
@@ -31,8 +32,18 @@ static dispatch_source_t heartbeat;
 static BOOL radio_running;
 static uint64_t radio_release_generation;
 static NSHashTable *radio_owners;
+static NSHashTable *active_browsers;
+static NSHashTable *active_servers;
+static NSHashTable *pending_browsers;
+static NSHashTable *pending_servers;
+static dispatch_source_t radio_retry_timer;
+static _Atomic(BOOL) native_mode;
+static void apply_pending_mode(void);
+#define AQ_NATIVE_MODE native_mode
+#define AQ_APPLY_PENDING_MODE() apply_pending_mode()
 static int adapter_installed;
 __attribute__((visibility("default"))) int AQAirDropInstalled(void) { return adapter_installed; }
+__attribute__((visibility("default"))) int AQAirDropModernActive(void) { return adapter_installed && !native_mode; }
 
 static NSDictionary *helper(NSString *command) {
     int fd=socket(AF_UNIX,SOCK_STREAM,0); if(fd<0) return nil;
@@ -60,46 +71,51 @@ static BOOL is_airdrop_browser(id browser) {
 }
 #include "AQDiscovery.inc"
 static BOOL valid_interface(id browser,SEL selector,uint32_t index) {
-    if(is_airdrop_browser(browser)) { uint32_t tap=if_nametoindex("tap0"); return tap && index==tap; }
+    if(is_airdrop_browser(browser) && !native_mode) { uint32_t tap=if_nametoindex("tap0"); return tap && index==tap; }
     return original_valid_interface(browser,selector,index);
 }
 static void start_browser(id browser,SEL selector) {
-    if(is_airdrop_browser(browser) && !acquire_radio(browser)) return;
+    if(is_airdrop_browser(browser)) {
+        [active_browsers addObject:browser];
+        if(!native_mode && !acquire_radio(browser)) { [pending_browsers addObject:browser]; return; }
+        [pending_browsers removeObject:browser];
+    }
     original_browser_start(browser,selector);
 }
 static void stop_browser(id browser,SEL selector) {
+    if(is_airdrop_browser(browser)) { [active_browsers removeObject:browser]; [pending_browsers removeObject:browser]; }
     if(is_airdrop_browser(browser)) cancel_discovery(browser);
     original_browser_stop(browser,selector);
-    if(is_airdrop_browser(browser)) release_radio(browser);
+    if(is_airdrop_browser(browser) && !native_mode) release_radio(browser);
 }
 static BOOL air_drop_type(const char *type) { return type && (!strcasecmp(type,"_airdrop._tcp") || !strcasecmp(type,"_airdrop._tcp.")); }
 static DNSServiceFlags modern_flags(DNSServiceFlags flags) { return flags & ~(0x20000U|0x100000U); }
 #include "AQPublication.inc"
 static Boolean set_txt(CFNetServiceRef service,CFDataRef data) {
     NSString *type=(__bridge NSString *)CFNetServiceGetType(service);
-    if(air_drop_type(type.UTF8String)) return original_set_txt(service,(__bridge CFDataRef)modern_txt((__bridge NSData *)data));
+    if(!native_mode && air_drop_type(type.UTF8String)) return original_set_txt(service,(__bridge CFDataRef)modern_txt((__bridge NSData *)data));
     return original_set_txt(service,data);
 }
 static DNSServiceErrorType browse(DNSServiceRef *ref,DNSServiceFlags flags,uint32_t index,const char *type,const char *domain,DNSServiceBrowseReply callback,void *context) {
-    if(air_drop_type(type)) { index=ensure_radio(); if(!index) return kDNSServiceErr_NotInitialized; flags=modern_flags(flags); }
+    if(!native_mode && air_drop_type(type)) { index=ensure_radio(); if(!index) return kDNSServiceErr_NotInitialized; flags=modern_flags(flags); }
     return original_browse(ref,flags,index,type,domain,callback,context);
 }
 static DNSServiceErrorType resolve(DNSServiceRef *ref,DNSServiceFlags flags,uint32_t index,const char *name,const char *type,const char *domain,DNSServiceResolveReply callback,void *context) {
-    if(air_drop_type(type)) { index=ensure_radio(); if(!index) return kDNSServiceErr_NotInitialized; flags=modern_flags(flags); }
+    if(!native_mode && air_drop_type(type)) { index=ensure_radio(); if(!index) return kDNSServiceErr_NotInitialized; flags=modern_flags(flags); }
     return original_resolve(ref,flags,index,name,type,domain,callback,context);
 }
 static DNSServiceErrorType register_service(DNSServiceRef *ref,DNSServiceFlags flags,uint32_t index,const char *name,const char *type,const char *domain,const char *host,uint16_t port,uint16_t length,const void *txt,DNSServiceRegisterReply callback,void *context) {
     NSData *modern=nil;
-    if(air_drop_type(type)) { index=ensure_radio(); if(!index) return kDNSServiceErr_NotInitialized; flags=modern_flags(flags); modern=modern_txt([NSData dataWithBytes:txt length:length]); length=(uint16_t)modern.length; txt=modern.bytes; }
+    if(!native_mode && air_drop_type(type)) { index=ensure_radio(); if(!index) return kDNSServiceErr_NotInitialized; flags=modern_flags(flags); modern=modern_txt([NSData dataWithBytes:txt length:length]); length=(uint16_t)modern.length; txt=modern.bytes; }
     return original_register(ref,flags,index,name,type,domain,host,port,length,txt,callback,context);
 }
 static DNSServiceErrorType query(DNSServiceRef *ref,DNSServiceFlags flags,uint32_t index,const char *name,uint16_t type,uint16_t dnsclass,DNSServiceQueryRecordReply callback,void *context) {
-    if(name && strstr(name,"._airdrop._tcp.")) { index=ensure_radio(); if(!index) return kDNSServiceErr_NotInitialized; flags=modern_flags(flags); }
+    if(!native_mode && name && strstr(name,"._airdrop._tcp.")) { index=ensure_radio(); if(!index) return kDNSServiceErr_NotInitialized; flags=modern_flags(flags); }
     return original_query(ref,flags,index,name,type,dnsclass,callback,context);
 }
 static Boolean register_net_service(CFNetServiceRef service,CFOptionFlags flags,CFStreamError *error) {
     CFStringRef type=CFNetServiceGetType(service);
-    if(type && (CFEqual(type,CFSTR("_airdrop._tcp.")) || CFEqual(type,CFSTR("_airdrop._tcp")))) {
+    if(!native_mode && type && (CFEqual(type,CFSTR("_airdrop._tcp.")) || CFEqual(type,CFSTR("_airdrop._tcp")))) {
         if(!ensure_radio()) { if(error) { error->domain=kCFStreamErrorDomainNetServices; error->error=kCFNetServicesErrorNotFound; } return false; }
         flags&=~(0x20000UL|0x100000UL);
         set_txt(service,CFNetServiceGetTXTData(service));
@@ -115,7 +131,7 @@ static NSDictionary *capabilities(void) {
 }
 #include "AQOutgoing.inc"
 static CFTypeRef response(AQRequest request,CFHTTPMessageRef message,CFDataRef body) {
-    if(CFHTTPMessageGetResponseStatusCode(message)==200 && [[path_for_request(request) lastPathComponent] isEqual:@"Ask"] && body) {
+    if(!native_mode && CFHTTPMessageGetResponseStatusCode(message)==200 && [[path_for_request(request) lastPathComponent] isEqual:@"Ask"] && body) {
         // The native offer/acceptance state belongs to this HTTP connection.
         // Mavericks labels every response "close"; modern CFNetwork then opens
         // a new connection for Upload, which has no accepted offer. Keep the
@@ -132,27 +148,37 @@ static CFTypeRef response(AQRequest request,CFHTTPMessageRef message,CFDataRef b
 }
 static void received_request(id connection,SEL selector,AQRequest request) {
     NSString *path=path_for_request(request);
+    if([path isEqual:@"/Ask"]) begin_transfer(connection,YES);
+    if(native_mode) { original_request(connection,selector,request); return; }
     if([path isEqual:@"/Discover"]) {
         NSData *data=[NSPropertyListSerialization dataWithPropertyList:capabilities() format:NSPropertyListBinaryFormat_v1_0 options:0 error:NULL];
         SEL reply=@selector(enqueueResponse:code:body:);
         ((void (*)(id,SEL,AQRequest,NSInteger,CFDataRef))[connection methodForSelector:reply])(connection,reply,request,200,(__bridge CFDataRef)data);
         return;
     }
-    if([path isEqual:@"/Ask"]) begin_transfer(connection,YES);
     original_request(connection,selector,request);
 }
 static void start_server(id server,SEL selector) {
-    if(!acquire_radio(server)) { NSLog(@"AquaTransport AirDrop: radio unavailable"); return; }
+    prepare_server_drain(server);
+    [active_servers addObject:server];
+    if(native_mode) { original_start(server,selector); return; }
+    if(!acquire_radio(server)) { [pending_servers addObject:server]; NSLog(@"AquaTransport AirDrop: radio unavailable"); return; }
+    [pending_servers removeObject:server];
     resume_transfer_server(server);
     original_start(server,selector);
 }
 static void stop_server(id server,SEL selector) {
+    [active_servers removeObject:server];
+    [pending_servers removeObject:server];
+    if(native_mode) { original_stop(server,selector); return; }
     if(defer_transfer_server_stop(server)) return;
     forget_transfer_server(server);
     original_stop(server,selector);
     drain_after_stop(server);
     release_radio(server);
 }
+#include "AQMode.inc"
+#include "AQPendingRetry.inc"
 static Method checked_method(NSString *class_name,const char *selector,const char *encoding) {
     Method method=class_getInstanceMethod(NSClassFromString(class_name),sel_registerName(selector));
     if(!method || strcmp(method_getTypeEncoding(method),encoding)) return NULL;
@@ -219,6 +245,17 @@ __attribute__((constructor)) static void install_airdrop(void) { @autoreleasepoo
 #undef RESOLVE
     radio_lock=[NSLock new];
     radio_owners=[NSHashTable weakObjectsHashTable];
+    active_browsers=[NSHashTable weakObjectsHashTable];
+    active_servers=[NSHashTable weakObjectsHashTable];
+    pending_browsers=[NSHashTable weakObjectsHashTable];
+    pending_servers=[NSHashTable weakObjectsHashTable];
+    radio_retry_timer=dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER,0,0,dispatch_get_main_queue());
+    dispatch_source_set_timer(radio_retry_timer,dispatch_time(DISPATCH_TIME_NOW,5*NSEC_PER_SEC),5*NSEC_PER_SEC,NSEC_PER_SEC);
+    dispatch_source_set_event_handler(radio_retry_timer,^{
+        expire_mode_owner();
+        retry_pending_radio([IOBluetoothHostController defaultController].powerState==kBluetoothHCIPowerStateON);
+    });
+    dispatch_resume(radio_retry_timer);
     struct rebinding hooks[]={ {"DNSServiceBrowse",(void *)&browse,NULL},{"DNSServiceResolve",(void *)&resolve,NULL},{"DNSServiceRegister",(void *)&register_service,NULL},{"DNSServiceQueryRecord",(void *)&query,NULL},{"CFNetServiceRegisterWithOptions",(void *)&register_net_service,NULL},{"CFNetServiceSetTXTData",(void *)&set_txt,NULL},{"_CFHTTPServerResponseCreateWithData",(void *)&response,NULL},{"connect",(void *)&scoped_connect,NULL},{"connectx",(void *)&scoped_connectx,NULL} };
     if(rebind_symbols(hooks,sizeof(hooks)/sizeof(hooks[0]))) return;
     struct rebinding outgoing={"CFURLConnectionCreateWithProperties",(void *)&create_connection,NULL};
@@ -243,5 +280,6 @@ __attribute__((constructor)) static void install_airdrop(void) { @autoreleasepoo
     original_send_request=(void *)method_setImplementation(send,(IMP)send_request);
     original_received_response=(void *)method_setImplementation(gotResponse,(IMP)received_response);
     adapter_installed=1;
+    install_mode_observer();
     NSLog(@"AquaTransport AirDrop: native daemon transport adapter installed");
 } }

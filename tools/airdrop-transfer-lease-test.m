@@ -14,6 +14,8 @@ static unsigned test_interface(const char*n){return radio_running?10:0;}
 #define AQ_RADIO_RELEASE_NS (20*NSEC_PER_MSEC)
 #include "../src/mac/airdrop/AQRadio.inc"
 static void (*original_stop)(id,SEL);
+static BOOL native_mode_fixture;
+#define AQ_NATIVE_MODE native_mode_fixture
 #include "../src/mac/airdrop/AQTransferLease.inc"
 static void drain_after_stop(id server){}
 @interface Operation : NSObject { @public void *_askRequest; }
@@ -57,5 +59,10 @@ int main(void){@autoreleasepool {
  receive_event(incoming,NULL,10);wait_release();assert(radio_running && receiving_transfers==1);
  receive_stop(other,NULL);wait_release();assert(!radio_running && !receiving_transfers && server_stops==2);
  helper_ok=NO;transfer_start(send,NULL);assert(!objc_getAssociatedObject(send,&transfer_lease_key) && !radio_owners.count);
- puts("PASS: navigation, progress, finish, cancel, failure, parallel sends/receives, abandoned operation, deferred receive stop, reopen and helper failure");
+ native_mode_fixture=YES;
+ transfer_start(send,NULL);assert(active_transfers==1 && !radio_owners.count);
+ transfer_event(send,NULL,9,NULL);assert(!active_transfers);
+ begin_transfer(incoming,YES);assert(active_transfers==1 && !receiving_transfers && !radio_owners.count);
+ receive_event(incoming,NULL,10);assert(!active_transfers);
+ puts("PASS: navigation, progress, finish, cancel, failure, parallel sends/receives, native transfer deferral, abandoned operation, deferred receive stop, reopen and helper failure");
 }return 0;}

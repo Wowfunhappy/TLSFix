@@ -44,7 +44,7 @@ struct daemon_state {
 	const char *dump;
 	uint64_t channel_checked_at;
     int telemetry;
-    uint64_t diag_tx, diag_fail, diag_wait, diag_mismatch;
+    uint64_t diag_tx, diag_fail, diag_action_fail, diag_multicast_fail, diag_wait, diag_mismatch;
     uint64_t diag_switches, diag_switch_us, diag_switch_max_us, diag_actual_wrong;
     int64_t diag_rx_age_max;
 };

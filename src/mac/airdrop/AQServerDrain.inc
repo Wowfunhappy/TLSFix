@@ -12,10 +12,31 @@
 static ptrdiff_t server_http_offset,server_connections_offset;
 static Ivar server_queue_ivar;
 static void (*server_connection_invalidate)(const void *);
-static void drain_server(id server,NSUInteger attempt) {
+static char server_drain_key;
+@interface AQServerDrainState : NSObject
+@property(weak) id server;
+@property NSUInteger generation;
+@end
+@implementation AQServerDrainState
+@end
+static void prepare_server_drain(id server) {
+    AQServerDrainState *state=objc_getAssociatedObject(server,&server_drain_key);
+    if(!state) {
+        state=[AQServerDrainState new]; state.server=server;
+        objc_setAssociatedObject(server,&server_drain_key,state,OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    }
+    ++state.generation;
+}
+static void drain_server(AQServerDrainState *state,NSUInteger generation,NSUInteger attempt) {
+    id server=state.server;
+    if(!server || state.generation!=generation) return;
     dispatch_queue_t queue=object_getIvar(server,server_queue_ivar);
     if(!queue) return;
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW,AQ_SERVER_DRAIN_NS),queue,^{
+        // stop is also called from native dealloc. Never capture/retain a
+        // receiver there: its ivars can be destroyed before this callback.
+        id server=state.server;
+        if(!server || state.generation!=generation) return;
         char *base=(char *)(__bridge void *)server;
         // A restarted server owns its connection table again.
         if(*(void **)(base+server_http_offset)) return;
@@ -35,7 +56,10 @@ static void drain_server(id server,NSUInteger attempt) {
             for(CFIndex i=0;i<count;i++) { server_connection_invalidate(keys[i]); CFRelease(keys[i]); }
             free(keys);
         }
-        drain_server(server,attempt+1);
+        drain_server(state,generation,attempt+1);
     });
 }
-static void drain_after_stop(id server) { drain_server(server,0); }
+static void drain_after_stop(id server) {
+    AQServerDrainState *state=objc_getAssociatedObject(server,&server_drain_key);
+    if(state) drain_server(state,state.generation,0);
+}

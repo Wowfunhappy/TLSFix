@@ -373,6 +373,10 @@ int wlan_send(const struct io_state *state, const uint8_t *buf, int len) {
 		log_error("unable to inject %d-byte packet (%s)", len, pcap_geterr(state->wlan_handle));
 		return err;
 	}
+	if (err != len) {
+		log_error("short packet injection: %d of %d bytes", err, len);
+		return -EIO;
+	}
 	return 0;
 }
 

@@ -9,6 +9,10 @@ ANIS_LIB=/usr/share/aquatransport
 ANIS_JOB="$ANIS_LIB/org.aquatransport.anisette.plist"
 BOOT_JOB=/Library/LaunchDaemons/org.aquatransport.bootstrap.plist
 launchctl unload "$ANIS_JOB" >/dev/null 2>&1 || true
+# Refresh the socket job before bootstrap loads it again. Mavericks launchctl
+# can replace a socket path while rejecting a duplicate load, leaving the old
+# registered listener unreachable (ECONNREFUSED).
+launchctl unload "$ANIS_LIB/airdrop/org.aquatransport.airdrop.plist" >/dev/null 2>&1 || true
 # Migrate the development version that used a per-user LaunchAgent.
 OLD_AGENT=/Library/LaunchAgents/org.aquatransport.anisette.plist
 if [ -f "$OLD_AGENT" ]; then

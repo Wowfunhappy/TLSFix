@@ -1,0 +1,9 @@
+/* AirDrop UI translations. */
+"Turn on Bluetooth to use AirDrop." = "AirDropを使用するにはBluetoothをオンにしてください。";
+"Turn On Bluetooth" = "Bluetoothをオンにする";
+"Turning on Bluetooth…" = "Bluetoothをオンにしています…";
+"Could not turn on Bluetooth." = "Bluetoothをオンにできませんでした。";
+"Don't see who you're looking for?" = "探している相手が表示されませんか？";
+"Search for an Older Mac" = "古いMacを検索";
+"Searching for older Macs…" = "古いMacを検索中…";
+"To share with someone using iOS, ask them to open Control Center and set AirDrop to Everyone. On a Mac, ask them to go to AirDrop in the Finder." = "iOSを使用している相手と共有するには、コントロールセンターを開き、AirDropを「すべての人」に設定するよう相手に依頼してください。Macの場合は、FinderでAirDropを開くよう依頼してください。";

@@ -49,3 +49,11 @@ static void release_radio(id owner) {
     }
     [radio_lock unlock];
 }
+static void force_stop_radio(void) {
+    [radio_lock lock];
+    ++radio_release_generation;
+    if(heartbeat) { dispatch_source_cancel(heartbeat); heartbeat=nil; }
+    if(radio_running) helper(@"stop");
+    radio_running=NO;
+    [radio_lock unlock];
+}

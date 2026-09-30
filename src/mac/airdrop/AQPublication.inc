@@ -1,3 +1,4 @@
+#include "AQModeScope.h"
 static NSData *modern_txt(NSData *data) {
     NSMutableDictionary *txt=data ? [[NSNetService dictionaryFromTXTRecordData:data] mutableCopy] : nil;
     if(!txt) txt=[NSMutableDictionary dictionary];
@@ -52,6 +53,7 @@ static void stop_publication_probe(id publisher) {
 static void publication_callback(id publisher,SEL selector,CFStreamError *error) {
     original_publication_callback(publisher,selector,error);
     stop_publication_probe(publisher);
+    if(AQ_NATIVE_MODE) return;
     if(!error || error->error) return;
     CFNetServiceRef service=*(CFNetServiceRef *)((char *)(__bridge void *)publisher+publication_service_offset);
     if(!service) return;

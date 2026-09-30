@@ -23,13 +23,16 @@ make -C "$DIR/deps/owl" BUILD="$BUILD/owl" \
   INCLUDES="-I$DIR/deps/owl/src -I$DIR/deps/owl/radiotap -I$DIR/deps/owl/daemon -I$BUILD/libev-4.33" \
   LIBS="-lpcap $BUILD/libev-4.33/.libs/libev.a -framework Foundation -framework CoreWLAN -framework SystemConfiguration"
 SOURCES="$DIR/src/mac/airdrop"
+rm -rf "$ST/airdrop/AirDropUI.bundle"
+ditto "$SOURCES/AirDropUI.bundle" "$ST/airdrop/AirDropUI.bundle"
 printf '_AQAirDropInstalled\n' > "$BUILD/exports.txt"
+printf '_AQAirDropModernActive\n' >> "$BUILD/exports.txt"
 FLAGS=(-arch x86_64 -mmacosx-version-min=10.9 -O2 -fobjc-arc -fblocks -fvisibility=hidden -Wall -Wextra)
-clang "${FLAGS[@]}" -dynamiclib "$SOURCES/AQAirDrop.m" "$DIR/deps/fishhook/fishhook.c" \
-  -framework Foundation -framework CFNetwork -Wl,-exported_symbols_list,"$BUILD/exports.txt" \
+clang "${FLAGS[@]}" -dynamiclib "$SOURCES/AQAirDrop.m" "$SOURCES/AQUI.m" "$DIR/deps/fishhook/fishhook.c" \
+  -framework Foundation -framework CFNetwork -framework AppKit -framework IOBluetooth -framework CoreWLAN -Wl,-exported_symbols_list,"$BUILD/exports.txt" \
   -install_name /usr/share/aquatransport/aquatransport_airdrop.dylib -o "$ST/aquatransport_airdrop.dylib"
 clang "${FLAGS[@]}" "$SOURCES/AQHelper.m" "$SOURCES/AQWiFiLease.m" \
-  -framework Foundation -framework CoreWLAN -framework SystemConfiguration -o "$ST/airdrop/org.aquatransport.airdrop"
+  -framework Foundation -framework CoreWLAN -framework IOBluetooth -framework SystemConfiguration -o "$ST/airdrop/org.aquatransport.airdrop"
 bootstrap_slices=()
 for arch in x86_64 i386; do
   bootstrap="$BUILD/aquatransport-bootstrap-$arch"

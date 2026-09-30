@@ -16,11 +16,14 @@
 #include <stdlib.h>
 #include <stdio.h>
 #include <unistd.h>
+#include <dispatch/dispatch.h>
+#include "aquatransport_airdrop_hardware.h"
 
 static void (*native_cache_limit)(int,int);
 static pthread_once_t load_once=PTHREAD_ONCE_INIT;
 static int adapter_active;
-int tf_airdrop_active(void) { return adapter_active; }
+static int (*modern_active)(void);
+int tf_airdrop_active(void) { return adapter_active && (!modern_active || modern_active()); }
 static int tap_available(void) { struct stat st; return !lstat("/dev/tap0",&st) && S_ISCHR(st.st_mode); }
 static int trusted_file(const char *path) {
     struct stat st; char parent[1024];
@@ -34,13 +37,41 @@ static int trusted_file(const char *path) {
     }
     return 1;
 }
-#include "aquatransport_airdrop_hardware.h"
+static int trusted_airdrop_runtime(void) {
+    return trusted_file("/usr/share/aquatransport/airdrop/org.aquatransport.airdrop") &&
+        trusted_file("/usr/share/aquatransport/airdrop/org.aquatransport.airdrop.plist") &&
+        trusted_file("/usr/share/aquatransport/airdrop/owl") &&
+        trusted_file("/usr/share/aquatransport/airdrop/ad_ble_wake");
+}
+static void load_ui_adapter(void *unused) {
+    (void)unused;
+    char interface[32]={0};
+    if(tf_flag("disable-modern-airdrop") || !tap_available() ||
+       !trusted_airdrop_runtime() || !hardware_supported(interface,sizeof(interface))) return;
+    Dl_info owner; char path[1024];
+    if(!dladdr((void *)&load_ui_adapter,&owner) || !owner.dli_fname) return;
+    const char *slash=strrchr(owner.dli_fname,'/'); if(!slash) return;
+    int length=snprintf(path,sizeof(path),"%.*s/aquatransport_airdrop.dylib",(int)(slash-owner.dli_fname),owner.dli_fname);
+    if(length<0 || (size_t)length>=sizeof(path) || !trusted_file(path)) return;
+    dlopen(path,RTLD_NOW|RTLD_LOCAL);
+}
+static void air_drop_ui_image_added(const struct mach_header *header,intptr_t slide) {
+    (void)slide;
+    static const char root[]="/System/Library/PrivateFrameworks/ShareKit.framework/";
+    static const char suffix[]="/PlugIns/AirDrop.sharingservice/Contents/MacOS/AirDrop";
+    for(uint32_t i=0;i<_dyld_image_count();i++) if(_dyld_get_image_header(i)==header) {
+        const char *name=_dyld_get_image_name(i);
+        size_t length=name ? strlen(name) : 0;
+        if(length>sizeof(root)-1 && length>=sizeof(suffix)-1 &&
+           !strncmp(name,root,sizeof(root)-1) &&
+           !strcmp(name+length-(sizeof(suffix)-1),suffix))
+            dispatch_async_f(dispatch_get_main_queue(),NULL,load_ui_adapter);
+        return;
+    }
+}
 static void load_adapter(void) {
     if(tf_flag("disable-modern-airdrop") || !tap_available()) return;
-    if(!trusted_file("/usr/share/aquatransport/airdrop/org.aquatransport.airdrop") ||
-       !trusted_file("/usr/share/aquatransport/airdrop/org.aquatransport.airdrop.plist") ||
-       !trusted_file("/usr/share/aquatransport/airdrop/owl") ||
-       !trusted_file("/usr/share/aquatransport/airdrop/ad_ble_wake")) return;
+    if(!trusted_airdrop_runtime()) return;
     const struct mach_header *header=_dyld_get_image_header(0);
     if(!header || header->magic!=MH_MAGIC_64) return;
     static const unsigned char supported_uuid[16]={0xc4,0xfa,0x48,0x77,0x6f,0x18,0x37,0x15,0xa5,0xc8,0xde,0xdf,0x90,0x26,0xbd,0xf9};
@@ -60,6 +91,7 @@ static void load_adapter(void) {
     void *module=dlopen(path,RTLD_NOW|RTLD_LOCAL);
     if(module) {
         int (*installed)(void)=dlsym(module,"AQAirDropInstalled");
+        modern_active=dlsym(module,"AQAirDropModernActive");
         adapter_active=installed && installed();
     }
     if(!module && tf_debug()) tf_log("AirDrop adapter unavailable: %s",dlerror());
@@ -70,7 +102,13 @@ static void air_drop_cache_limit(int connection_type,int limit) {
 }
 void tf_airdrop_install(void) {
     struct utsname os; char executable[1024]; uint32_t size=sizeof(executable);
-    if(uname(&os) || _NSGetExecutablePath(executable,&size) ||
+    if(uname(&os) || _NSGetExecutablePath(executable,&size)) return;
+    if(atoi(os.release)==13 && sizeof(void *)==8 && tap_available() && !tf_flag("disable-modern-airdrop")) {
+        if(!strcmp(executable,"/System/Library/CoreServices/Finder.app/Contents/MacOS/Finder"))
+            dispatch_async_f(dispatch_get_main_queue(),NULL,load_ui_adapter);
+        else _dyld_register_func_for_add_image(air_drop_ui_image_added);
+    }
+    if(
        !aq_airdrop_platform_supported((unsigned)atoi(os.release),sizeof(void *),executable,tap_available()) || tf_flag("disable-modern-airdrop")) return;
     native_cache_limit=dlsym(RTLD_DEFAULT,"_CFNetworkHTTPConnectionCacheSetLimit");
     if(!native_cache_limit) return;

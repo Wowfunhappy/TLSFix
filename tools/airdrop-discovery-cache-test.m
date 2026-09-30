@@ -19,13 +19,20 @@ static BOOL is_airdrop_browser(id browser) { (void)browser; return airDrop; }
 - (void)clearCacheAndNotify { dispatch_async(dispatch_get_main_queue(),^{ self.cache=nil; [self notifyClient]; }); }
 @end
 static id observed_email;
+static NSString *removed_name;
 static void update_person(id browser,SEL selector,id service,id flags,id name,id picture,id email) {
     (void)selector; (void)service; (void)flags; (void)picture; (void)email;
     observed_email=email;
     [(CachedBrowser *)browser setBacking:name ? @[name] : @[]];
 }
+static void remove_person(id browser,SEL selector,id name,id type,id domain) {
+    (void)selector; (void)type; (void)domain;
+    removed_name=name;
+    [(CachedBrowser *)browser setBacking:@[]];
+}
 int main(void) { @autoreleasepool {
     original_person=update_person;
+    original_remove_service=remove_person;
     CachedBrowser *browser=[CachedBrowser new]; browser.backing=@[];
     [browser notifyClient]; assert(browser.published.count==0);
     AQDiscoveryProbe *probe=[AQDiscoveryProbe new]; probe.browser=browser;
@@ -46,6 +53,15 @@ int main(void) { @autoreleasepool {
     airDrop=NO;
     person_changed(browser,changed,probe.service,@"3",@"Unrelated service",nil,@"preserved-hash");
     assert([observed_email isEqual:@"preserved-hash"]);
+    airDrop=YES;
+    browser.backing=@[@"Test iPhone"]; [browser notifyClient];
+    probes(browser)[probe.service.name.lowercaseString]=probe;
+    remove_service(browser,@selector(removeService:type:domain:),probe.service.name,probe.service.type,probe.service.domain);
+    end=[NSDate dateWithTimeIntervalSinceNow:1];
+    while(browser.published.count && end.timeIntervalSinceNow>0) [[NSRunLoop mainRunLoop] runMode:NSDefaultRunLoopMode beforeDate:[NSDate dateWithTimeIntervalSinceNow:0.01]];
+    assert([removed_name isEqualToString:probe.service.name]);
+    assert(probe.cancelled && !probes(browser).count && !browser.published.count);
     puts("PASS: late HTTP metadata replaces a previously cached empty native peer list");
     puts("PASS: named AirDrop peers do not seed Apple ID claims; unrelated discovery is unchanged");
+    puts("PASS: removed iPhone identities clear Finder's cached peer list");
 } }

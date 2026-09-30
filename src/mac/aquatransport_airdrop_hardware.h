@@ -38,11 +38,9 @@ static int hardware_supported(char *interface,size_t capacity) {
     if(!services(0,matching("IOBluetoothHCIController"),&iterator)) {
         while((item=next(iterator))) {
             CFTypeRef features=aq_registry_property(property,item,"HCISupportedFeatures");
-            CFTypeRef connected=aq_registry_property(property,item,"BluetoothTransportConnected");
             if(features && CFGetTypeID(features)==CFDataGetTypeID() &&
-               connected && CFGetTypeID(connected)==CFBooleanGetTypeID() && CFBooleanGetValue(connected) &&
                aq_airdrop_bluetooth_supported(CFDataGetBytePtr(features),(unsigned)CFDataGetLength(features))) bluetooth++;
-            if(features) CFRelease(features); if(connected) CFRelease(connected);
+            if(features) CFRelease(features);
             release(item);
         }
         release(iterator);

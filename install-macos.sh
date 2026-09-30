@@ -101,6 +101,13 @@ if [ -f "$SRC/aquatransport_airdrop.dylib" ]; then
   install -d -o root -g wheel -m 755 "$LIBDIR/airdrop"
   install -o root -g wheel -m 755 "$SRC/airdrop/"{ad_ble_wake,org.aquatransport.airdrop,owl} "$LIBDIR/airdrop/"
   install -o root -g wheel -m 644 "$SRC/airdrop/org.aquatransport.airdrop.plist" "$LIBDIR/airdrop/"
+  install -d -o root -g wheel -m 755 "$LIBDIR/airdrop/AirDropUI.bundle/Contents/Resources"
+  install -o root -g wheel -m 644 "$SRC/airdrop/AirDropUI.bundle/Contents/Info.plist" "$LIBDIR/airdrop/AirDropUI.bundle/Contents/"
+  for locale in "$SRC/airdrop/AirDropUI.bundle/Contents/Resources/"*.lproj; do
+    locale_dest="$LIBDIR/airdrop/AirDropUI.bundle/Contents/Resources/$(basename "$locale")"
+    install -d -o root -g wheel -m 755 "$locale_dest"
+    install -o root -g wheel -m 644 "$locale/Localizable.strings" "$locale_dest/"
+  done
   install -o root -g wheel -m 755 "$SRC/aquatransport_airdrop.dylib" "$LIBDIR/"
 fi
 if [ -f "$SRC/aquatransport-bootstrap" ]; then

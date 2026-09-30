@@ -1,4 +1,5 @@
 /* Keep native sender/archive operations; adapt only modern wire metadata. */
+#include "AQModeScope.h"
 static NSData *(*original_ask_body)(id,SEL,NSInteger);
 static void (*original_send_request)(id,SEL,CFStringRef);
 static void (*original_received_response)(id,SEL,const void *);
@@ -15,6 +16,7 @@ static NSString *transfer_id(id client) {
 }
 static NSData *ask_body(id client,SEL selector,NSInteger format) {
     NSData *native=original_ask_body(client,selector,format);
+    if(AQ_NATIVE_MODE) return native;
     id fields=[NSPropertyListSerialization propertyListWithData:native options:NSPropertyListMutableContainers format:NULL error:NULL];
     if(![fields isKindOfClass:[NSMutableDictionary class]]) return native;
     // Modern discovery here advertises Everyone mode without an Apple ID
@@ -29,11 +31,12 @@ static NSData *ask_body(id client,SEL selector,NSInteger format) {
     return [NSPropertyListSerialization dataWithPropertyList:fields format:(NSPropertyListFormat)format options:0 error:NULL] ?: native;
 }
 static void send_request(id client,SEL selector,CFStringRef operation) {
+    if(AQ_NATIVE_MODE) { original_send_request(client,selector,operation); return; }
     void *previous=outgoing_client; outgoing_client=(__bridge void *)client;
     @try { original_send_request(client,selector,operation); } @finally { outgoing_client=previous; }
 }
 static const void *create_connection(CFAllocatorRef allocator,const void *request,const void *callbacks,CFDictionaryRef nativeProperties) {
-    if(!outgoing_client) return original_create_connection(allocator,request,callbacks,nativeProperties);
+    if(AQ_NATIVE_MODE || !outgoing_client) return original_create_connection(allocator,request,callbacks,nativeProperties);
     id client=(__bridge id)outgoing_client;
     const void *modified=copy_mutable_request(allocator,request);
     if(!modified) return original_create_connection(allocator,request,callbacks,nativeProperties);
@@ -51,6 +54,7 @@ static const void *create_connection(CFAllocatorRef allocator,const void *reques
     CFRelease(modified); return connection;
 }
 static void received_response(id client,SEL selector,const void *response) {
+    if(AQ_NATIVE_MODE) { original_received_response(client,selector,response); return; }
     CFHTTPMessageRef message=response_message(response);
     NSLog(@"AquaTransport AirDrop: native outgoing HTTP %ld",message ? (long)CFHTTPMessageGetResponseStatusCode(message) : 0);
     original_received_response(client,selector,response);

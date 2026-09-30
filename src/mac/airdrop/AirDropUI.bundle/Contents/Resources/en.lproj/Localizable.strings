@@ -1,0 +1,9 @@
+/* AirDrop UI translations. */
+"Turn on Bluetooth to use AirDrop." = "Turn on Bluetooth to use AirDrop.";
+"Turn On Bluetooth" = "Turn On Bluetooth";
+"Turning on Bluetooth…" = "Turning on Bluetooth…";
+"Could not turn on Bluetooth." = "Could not turn on Bluetooth.";
+"Don't see who you're looking for?" = "Don't see who you're looking for?";
+"Search for an Older Mac" = "Search for an Older Mac";
+"Searching for older Macs…" = "Searching for older Macs…";
+"To share with someone using iOS, ask them to open Control Center and set AirDrop to Everyone. On a Mac, ask them to go to AirDrop in the Finder." = "To share with someone using iOS, ask them to open Control Center and set AirDrop to Everyone. On a Mac, ask them to go to AirDrop in the Finder.";

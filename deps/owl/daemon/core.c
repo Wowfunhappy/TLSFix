@@ -219,7 +219,7 @@ void awdl_send_action(struct daemon_state *state, enum awdl_action_type type) {
 	if (len < 0)
 		return;
 	log_trace("send %s", awdl_frame_as_str(type));
-	wlan_send(&state->io, buf, len);
+	if (wlan_send(&state->io, buf, len) < 0) state->diag_action_fail++;
 
 	state->awdl_state.stats.tx_action++;
 }
@@ -317,7 +317,8 @@ void awdl_send_multicast(struct ev_loop *loop, ev_timer *timer, int revents) {
 		if (awdl_is_multicast_eaw(awdl_state, now) && (in == 0)) { /* we can send now */
 			void *next;
 			circular_buf_get(state->tx_queue_multicast, &next, 0);
-			awdl_send_data((struct buf *) next, &state->io, &state->awdl_state, &state->ieee80211_state);
+			if (awdl_send_data((struct buf *) next, &state->io, &state->awdl_state,
+			                   &state->ieee80211_state) != TX_OK) state->diag_multicast_fail++;
 			buf_free(next);
 			state->awdl_state.stats.tx_data_multicast++;
 		} else { /* try later */
@@ -527,8 +528,9 @@ void awdl_clean_peers(struct ev_loop *loop, ev_timer *timer, int revents) {
         int active = 0;
         for (int i=0; i<AWDL_CHANSEQ_LENGTH; i++) if (awdl_chan_num(state->awdl_state.channel.sequence[i], state->awdl_state.channel.enc)) active++;
         struct pcap_stat ps; memset(&ps, 0, sizeof(ps)); pcap_stats(state->io.wlan_handle, &ps);
-        syslog(LOG_NOTICE, "radio_us=%llu tx=%llu inject_fail=%llu waits=%llu tx_wrong_channel=%llu switches=%llu switch_us=%llu switch_max_us=%llu actual_wrong=%llu rx_age_max_us=%lld pcap_drop=%u active_slots=%d",
+        syslog(LOG_NOTICE, "radio_us=%llu tx=%llu inject_fail=%llu action_fail=%llu multicast_fail=%llu waits=%llu tx_wrong_channel=%llu switches=%llu switch_us=%llu switch_max_us=%llu actual_wrong=%llu rx_age_max_us=%lld pcap_drop=%u active_slots=%d",
             (unsigned long long)clock_time_us(), (unsigned long long)state->diag_tx, (unsigned long long)state->diag_fail,
+            (unsigned long long)state->diag_action_fail, (unsigned long long)state->diag_multicast_fail,
             (unsigned long long)state->diag_wait, (unsigned long long)state->diag_mismatch, (unsigned long long)state->diag_switches,
             (unsigned long long)state->diag_switch_us, (unsigned long long)state->diag_switch_max_us,
             (unsigned long long)state->diag_actual_wrong, (long long)state->diag_rx_age_max, ps.ps_drop, active);
@@ -553,7 +555,7 @@ int awdl_init(struct daemon_state *state, const char *wlan, const char *host, st
 	int err;
 	state->channel_checked_at = 0;
     state->telemetry = 0;
-    state->diag_tx = state->diag_fail = state->diag_wait = state->diag_mismatch = 0;
+    state->diag_tx = state->diag_fail = state->diag_action_fail = state->diag_multicast_fail = state->diag_wait = state->diag_mismatch = 0;
     state->diag_switches = state->diag_switch_us = state->diag_switch_max_us = state->diag_actual_wrong = 0;
     state->diag_rx_age_max = 0;
 	char hostname[HOST_NAME_LENGTH_MAX + 1];

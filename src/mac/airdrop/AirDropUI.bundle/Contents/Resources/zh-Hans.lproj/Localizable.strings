@@ -1,0 +1,9 @@
+/* AirDrop UI translations. */
+"Turn on Bluetooth to use AirDrop." = "打开蓝牙以使用隔空投送。";
+"Turn On Bluetooth" = "打开蓝牙";
+"Turning on Bluetooth…" = "正在打开蓝牙…";
+"Could not turn on Bluetooth." = "无法打开蓝牙。";
+"Don't see who you're looking for?" = "没有看到你要找的人？";
+"Search for an Older Mac" = "搜索较旧的 Mac";
+"Searching for older Macs…" = "正在搜索较旧的 Mac…";
+"To share with someone using iOS, ask them to open Control Center and set AirDrop to Everyone. On a Mac, ask them to go to AirDrop in the Finder." = "要与使用 iOS 的人共享，请让对方打开控制中心，并将隔空投送设为“所有人”。在 Mac 上，请让对方在访达中打开隔空投送。";

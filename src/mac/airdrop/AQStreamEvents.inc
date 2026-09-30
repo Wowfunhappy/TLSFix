@@ -1,6 +1,7 @@
 /* A native offer body must launch its asynchronous parser only once.
  * CF stream completion can be reported again while the first parser is busy.
  * Retain native parsing/UI, but make EOF delivery idempotent per stream open. */
+#include "AQModeScope.h"
 static void (*original_offer_stream_event)(id,SEL,CFReadStreamRef,CFStreamEventType);
 static char offer_stream_state_key;
 @interface AQOfferStreamState : NSObject
@@ -10,6 +11,7 @@ static char offer_stream_state_key;
 @implementation AQOfferStreamState
 @end
 static void offer_stream_event(id connection,SEL selector,CFReadStreamRef stream,CFStreamEventType event) {
+    if(AQ_NATIVE_MODE) { original_offer_stream_event(connection,selector,stream,event); return; }
     @synchronized(connection) {
         AQOfferStreamState *state=objc_getAssociatedObject(connection,&offer_stream_state_key);
         if(!state) {

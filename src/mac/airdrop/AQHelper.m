@@ -1,5 +1,6 @@
 #import "AQHelperSupport.h"
 #import "AQWiFiLease.h"
+#import <IOBluetooth/IOBluetooth.h>
 #import <CoreWLAN/CoreWLAN.h>
 #import <SystemConfiguration/SystemConfiguration.h>
 #include <sys/un.h>
@@ -95,7 +96,9 @@ int main(void) { @autoreleasepool {
             if([command isEqual:@"start"]) {
                 AQRequire(AQHasTAP(),@"The TAP driver is not installed.");
                 if(!owlPID) {
-                    char interface[32]={0}; AQRequire(hardware_supported(interface,sizeof(interface)),@"AirDrop requires an unambiguous Wi-Fi interface and a connected Bluetooth LE controller."); NSString *interfaceName=[NSString stringWithUTF8String:interface]; CWInterface *wifi=[CWInterface interfaceWithName:interfaceName];
+                    char interface[32]={0}; AQRequire(hardware_supported(interface,sizeof(interface)),@"AirDrop requires an unambiguous Wi-Fi interface and a Bluetooth LE controller.");
+                    AQRequire([IOBluetoothHostController defaultController].powerState==kBluetoothHCIPowerStateON,@"Turn on Bluetooth to use AirDrop.");
+                    NSString *interfaceName=[NSString stringWithUTF8String:interface]; CWInterface *wifi=[CWInterface interfaceWithName:interfaceName];
                     AQRequire(wifi!=nil,@"The Wi-Fi interface is unavailable.");
                     AQRequire(supportsAirDropChannel(wifi),@"The Wi-Fi interface does not support AirDrop's configured channel 149.");
                     int (*autoJoin)(NSString *)=dlsym(RTLD_DEFAULT,"CWInterfaceStartAutoJoin");

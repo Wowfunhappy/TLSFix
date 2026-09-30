@@ -4,6 +4,7 @@
  * waits forever for another HTTP chunk. Once BOM has returned, nobody consumes
  * that worker's output: close its input, then let the original join, status,
  * file placement, metadata, and response code run unchanged. */
+#include "AQModeScope.h"
 static int (*original_zipper_copy)(id,SEL,id,id,id);
 static int (*original_bom_copy)(void *,const char *,const char *,CFDictionaryRef);
 static void *(*bom_user_data)(void *);
@@ -21,6 +22,7 @@ static int incoming_bom_copy(void *copier,const char *source,const char *destina
     return result;
 }
 static int incoming_copy(id zipper,SEL selector,id source,id destination,id options) {
+    if(AQ_NATIVE_MODE) return original_zipper_copy(zipper,selector,source,destination,options);
     CFReadStreamRef previous_stream=incoming_consumed_stream;
     void *previous_zipper=incoming_zipper;
     CFReadStreamRef stream=NULL;

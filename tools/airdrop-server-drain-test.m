@@ -19,7 +19,7 @@ static void (*original_stop)(id,SEL);
 @interface Server : NSObject { @public void *_server; CFMutableDictionaryRef _connections; id _queue; }
 @end
 @implementation Server
-- (void)dealloc { if(_connections) CFRelease(_connections); }
+- (void)dealloc { drain_after_stop(self); if(_connections) CFRelease(_connections); }
 @end
 @interface Operation : NSObject { @public void *_askRequest; }
 @end
@@ -37,6 +37,7 @@ static Server *stopped_server(int connections){
  Server *server=[Server new];server->_queue=dispatch_get_main_queue();
  server->_connections=CFDictionaryCreateMutable(NULL,0,&kCFTypeDictionaryKeyCallBacks,&kCFTypeDictionaryValueCallBacks);
  for(int i=0;i<connections;i++)CFDictionarySetValue(server->_connections,(__bridge const void *)[NSObject new],(__bridge const void *)@YES);
+ prepare_server_drain(server);
  current=server;invalidations=0;return server;
 }
 int main(void){@autoreleasepool {
@@ -65,5 +66,14 @@ int main(void){@autoreleasepool {
  // A connection that never closes is retried a bounded number of times.
  stubborn=YES;server=stopped_server(1);drain_after_stop(server);wait_ms(600);
  assert(invalidations==AQ_SERVER_DRAIN_ATTEMPTS);
- puts("PASS: stopped-server drain, native close, restarted server, active receive and bounded retries");
+ server=nil;current=nil;stubborn=NO;
+ // Native dealloc calls stop again. Queued cleanup must not retain a receiver
+ // through that path or touch the connection dictionary after it is destroyed.
+ __weak Server *released;
+ @autoreleasepool {
+   Server *temporary=stopped_server(1);released=temporary;
+   drain_after_stop(temporary);current=nil;
+ }
+ assert(!released);wait_ms(80);assert(!invalidations);
+ puts("PASS: stopped-server drain, native close, restart, active receive, bounded retries and receiver destruction before cleanup");
 }return 0;}

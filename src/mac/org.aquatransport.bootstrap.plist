@@ -6,5 +6,19 @@
 <string>/usr/share/aquatransport/aquatransport-bootstrap</string>
 </array>
 <key>RunAtLoad</key><true/>
+<!-- Watch the parent directory: launchd opens WatchPaths, and opening tap0
+     reserves that device so OWL would be forced onto tap1. -->
+<key>WatchPaths</key><array><string>/dev</string></array>
+<key>LaunchEvents</key><dict>
+<key>com.apple.iokit.matching</key><dict>
+<key>WiFiAvailable</key><dict>
+<key>IOProviderClass</key><string>IO80211Interface</string>
+<key>IOMatchLaunchStream</key><true/>
+</dict>
+<key>BluetoothAvailable</key><dict>
+<key>IOProviderClass</key><string>IOBluetoothHCIController</string>
+<key>IOMatchLaunchStream</key><true/>
+</dict>
+</dict></dict>
 <key>ProcessType</key><string>Background</string>
 </dict></plist>

@@ -1,0 +1,9 @@
+/* AirDrop UI translations. */
+"Turn on Bluetooth to use AirDrop." = "Ative o Bluetooth para usar o AirDrop.";
+"Turn On Bluetooth" = "Ativar Bluetooth";
+"Turning on Bluetooth…" = "Ativando o Bluetooth…";
+"Could not turn on Bluetooth." = "Não foi possível ativar o Bluetooth.";
+"Don't see who you're looking for?" = "Não encontra quem está procurando?";
+"Search for an Older Mac" = "Buscar um Mac mais antigo";
+"Searching for older Macs…" = "Buscando Macs mais antigos…";
+"To share with someone using iOS, ask them to open Control Center and set AirDrop to Everyone. On a Mac, ask them to go to AirDrop in the Finder." = "Para compartilhar com alguém que usa iOS, peça que abra a Central de Controle e ajuste o AirDrop para Todos. Em um Mac, peça que abra o AirDrop no Finder.";

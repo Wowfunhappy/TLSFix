@@ -1,4 +1,5 @@
 /* HTTP discovery fills the original Bonjour node; Finder still owns its UI. */
+#include "AQModeScope.h"
 #include <arpa/inet.h>
 #include <dlfcn.h>
 #include "AQSocket.inc"
@@ -113,7 +114,7 @@ static NSMutableDictionary *probes(id browser) {
 }
 @end
 static void person_changed(id browser,SEL selector,NSNetService *service,id flags,id name,id picture,id email) {
-    if(!is_airdrop_browser(browser)) { original_person(browser,selector,service,flags,name,picture,email); return; }
+    if(AQ_NATIVE_MODE || !is_airdrop_browser(browser)) { original_person(browser,selector,service,flags,name,picture,email); return; }
     // A named Bonjour peer can otherwise seed the native cache with an Apple
     // ID claim before /Ask arrives. TAP discovery provides no verified identity.
     email=nil;
@@ -133,9 +134,16 @@ static void cancel_discovery(id browser) {
     for(AQDiscoveryProbe *probe in items.allValues) [probe cancel]; [items removeAllObjects];
 }
 static void remove_service(id browser,SEL selector,NSString *name,id type,id domain) {
-    if(is_airdrop_browser(browser)) {
+    BOOL modern=!AQ_NATIVE_MODE && is_airdrop_browser(browser);
+    if(modern) {
         NSMutableDictionary *items=objc_getAssociatedObject(browser,&discovery_key);
         [items[name.lowercaseString] cancel]; [items removeObjectForKey:name.lowercaseString];
     }
     original_remove_service(browser,selector,name,type,domain);
+    // The native removal updates its service list but Finder can keep a
+    // cached node snapshot after an iPhone rotates its Bonjour identity.
+    if(modern) {
+        SEL notify=@selector(clearCacheAndNotify);
+        ((void (*)(id,SEL))[browser methodForSelector:notify])(browser,notify);
+    }
 }
