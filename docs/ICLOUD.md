@@ -214,9 +214,25 @@ For trusted-device two-factor authentication, the first attempt requests a code 
 returns an authentication failure to the old client. Approve the request on the
 trusted device, then retry within five minutes using **your password immediately
 followed by the six-digit code**. A code by itself is not supported. Keep the same
-preference pane/helper process running between attempts. Pending state stores only
-the verification session, not the password, and is bounded to 32 accounts per process.
-Expired entries are removed on the next attempt.
+preference pane/helper process running between attempts. If you dismiss or miss the
+code, retry with just your password to request another one, even if your password
+ends in six or more digits. An appended code is recognized only when the input is
+exactly six characters longer than the original password and ends in six ASCII
+digits. Length and slicing both use NSString's UTF-16 code units, so Unicode
+passwords follow the same rule.
+
+Length is only a format hint: a different password exactly six characters longer
+and ending in six digits can be mistaken for password-plus-code while verification
+is pending. Apple must validate the code and then the password through SRP before
+sign-in succeeds. If you changed your password into that shape, wait for the pending
+session to expire or restart the preference pane/helper process before retrying.
+
+Pending state stores the verification session, password length, and expiration time.
+No password fingerprint or plaintext password is retained in pending state.
+The state is bounded to 32 accounts per process and expires after five minutes;
+expired records are removed on the next attempt. Expiration limits validity, not
+memory retention: an idle process can retain an expired record until its next
+attempt or process exit. Removing a record does not guarantee its memory is erased.
 
 The old pane may show a generic authentication failure rather than instructions for
 entering the code. The user completed this two-attempt flow with a real account. SMS-only
@@ -480,7 +496,11 @@ any attempt to use it fails the tests. Coverage includes independent Python SRP
 server vectors for `s2k`, `s2k_fo`, leading-zero salts, short public keys and short
 shared secrets; invalid public values and
 iteration counts; short/incorrect/repeated proofs; full token conversion; malformed
-responses; missing anisette; refused redirects; trusted-device retry; cancellation;
+responses; missing anisette; refused redirects; trusted-device retry (including
+password-only resends, passwords ending in six or more digits, numeric-only
+passwords, Unicode, changed passwords outside the code format, correction after a
+rejected code, and wrong passwords of the expected length that cannot bypass SRP);
+cancellation;
 endpoint scoping; conflicting rewrite rules; and
 the real AOSKit CFURLConnection path, including Basic authentication with a
 mixed-case account and password. Saved-token refresh tests cover native AOSKit,

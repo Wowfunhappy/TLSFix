@@ -15,8 +15,18 @@
 static NSString *mode;
 static int unexpected, anisetteCalls, initCalls, completeCalls, accountCalls, codeCalls;
 static NSData *serverB, *serverKey, *serverProof;
-static BOOL verified;
+static BOOL verified, changedPassword;
 static BOOL fixture(NSString *name) { return [mode isEqual:name] || [mode isEqual:[@"ids-" stringByAppendingString:name]]; }
+static BOOL twoFactor(void) { return [mode hasPrefix:@"2fa"] || [mode hasPrefix:@"ids-2fa"]; }
+static NSString *testPassword(void) {
+    if (fixture(@"2fa-changed-nondigit") && changedPassword) return @"Alternate:PassWordABCDEF";
+    if (fixture(@"2fa-unicode")) return @"P\u00e4ss\U0001f511123456";
+    if (fixture(@"2fa-changed") && changedPassword) return @"Alternate:PassWord1234567";
+    if (fixture(@"2fa-digits")) return @"iamcool123456";
+    if (fixture(@"2fa-long-digits")) return @"iamcool123456789";
+    if (fixture(@"2fa-numeric")) return @"12345678";
+    return @"Synthetic:PassWord";
+}
 static BOOL opaqueSettings(void) { return [mode hasSuffix:@"-opaque"]; }
 static NSString *settingsAuth(void) {
     return opaqueSettings() ? @"Basic MTIzNDU6b3BhcXVlLWZpeHR1cmU=" : @"Basic MTIzNDU6RS1maXh0dXJlLW1tZQ==";
@@ -56,7 +66,7 @@ static void server_start(NSData *clientA) {
     const SRP_gN *gn = SRP_get_default_gN("2048"); BN_CTX *ctx = BN_CTX_new();
     BIGNUM *A = number(clientA), *b = BN_new(), *v = BN_new(), *B = BN_new(), *tmp = BN_new(), *S = BN_new();
     BN_set_word(b, 1234567);
-    unsigned char derived[32]; NSData *password = hash(bytes(@"Synthetic:PassWord"));
+    unsigned char derived[32]; NSData *password = hash(bytes(testPassword()));
     PKCS5_PBKDF2_HMAC([password bytes], 32, (unsigned char *)"ordinarysalt1234", 16, 5, EVP_sha256(), 32, derived);
     NSData *inner = hash(cat([NSArray arrayWithObjects:bytes(@":"), [NSData dataWithBytes:derived length:32], nil]));
     BIGNUM *x = number(hash(cat([NSArray arrayWithObjects:bytes(@"ordinarysalt1234"), inner, nil])));
@@ -125,7 +135,9 @@ static NSData *encrypted_session(void) {
             if ([mode isEqual:@"malformed"]) result = [NSDictionary dictionaryWithObject:@"invalid" forKey:@"s"];
         } else {
             completeCalls++;
-            assert([[payload objectForKey:@"M1"] isEqual:[serverProof subdataWithRange:NSMakeRange(0,32)]]);
+            BOOL matches = [[payload objectForKey:@"M1"] isEqual:[serverProof subdataWithRange:NSMakeRange(0,32)]];
+            BOOL wrongPasswordAttempt = fixture(@"2fa-wrong-password") && completeCalls == 3;
+            assert(wrongPasswordAttempt ? !matches : matches);
             NSMutableData *m2 = [[[serverProof subdataWithRange:NSMakeRange(32,32)] mutableCopy] autorelease];
             if (fixture(@"bad-proof")) ((unsigned char *)[m2 mutableBytes])[0] ^= 1;
             if ([mode isEqual:@"short-proof"]) [m2 setLength:1];
@@ -133,14 +145,23 @@ static NSData *encrypted_session(void) {
         }
         NSMutableDictionary *r = [[result mutableCopy] autorelease];
         NSMutableDictionary *s = [NSMutableDictionary dictionaryWithObjectsAndKeys:@0, @"ec", @200, @"hsc", nil];
-        if (completeCalls && fixture(@"2fa") && !verified) { [s setObject:@"trustedDeviceSecondaryAuth" forKey:@"au"]; [s setObject:@409 forKey:@"hsc"]; }
+        if (fixture(@"2fa-wrong-password") && completeCalls == 3 && [[payload objectForKey:@"o"] isEqual:@"complete"]) {
+            /* A valid code and matching length cannot substitute for the password. */
+            [s setObject:@-20101 forKey:@"ec"];
+            [r removeAllObjects];
+        }
+        if (completeCalls && twoFactor() && !verified) { [s setObject:@"trustedDeviceSecondaryAuth" forKey:@"au"]; [s setObject:@409 forKey:@"hsc"]; }
         [r setObject:s forKey:@"Status"]; result = [NSDictionary dictionaryWithObject:r forKey:@"Response"];
     } else if ([host isEqual:@"gsa.apple.com"] && [path isEqual:@"/auth/verify/trusteddevice"]) {
         codeCalls++; assert([req valueForHTTPHeaderField:@"X-Apple-Identity-Token"]);
         result = [NSDictionary dictionary];
     } else if ([host isEqual:@"gsa.apple.com"] && [path isEqual:@"/grandslam/GsService2/validate"]) {
-        codeCalls++; assert([[req valueForHTTPHeaderField:@"security-code"] isEqual:@"123456"]); verified = YES;
-        result = [NSDictionary dictionaryWithObject:[NSDictionary dictionaryWithObject:@0 forKey:@"ec"] forKey:@"Status"];
+        codeCalls++;
+        NSString *code = [req valueForHTTPHeaderField:@"security-code"];
+        assert([code isEqual:@"123456"] || [code isEqual:@"000000"]);
+        verified = [code isEqual:@"123456"];
+        result = [NSDictionary dictionaryWithObject:[NSDictionary dictionaryWithObject:
+            verified ? @0 : @-21669 forKey:@"ec"] forKey:@"Status"];
     } else if ([host isEqual:@"setup.icloud.com"] && [path isEqual:@"/setup/iosbuddy/loginDelegates"]) {
         accountCalls++;
         NSDictionary *body = parse([req HTTPBody]);
@@ -222,7 +243,7 @@ static NSMutableURLRequest *idsLogin(NSString *password) {
     [req setValue:@"application/x-apple-plist" forHTTPHeaderField:@"Content-Type"];
     [req setValue:@"fixture-client-id" forHTTPHeaderField:@"x-ds-client-id"];
     [req setValue:@"7" forHTTPHeaderField:@"x-protocol-version"];
-    if (fixture(@"gzip") || fixture(@"2fa") || fixture(@"bad-gzip") || fixture(@"gzip-limit") || fixture(@"gzip-trailing")) {
+    if (fixture(@"gzip") || twoFactor() || fixture(@"bad-gzip") || fixture(@"gzip-limit") || fixture(@"gzip-trailing")) {
         NSData *plain = fixture(@"gzip-limit") ? [NSMutableData dataWithLength:1024*1024+1] : [req HTTPBody];
         NSMutableData *compressed = [[gzip(plain) mutableCopy] autorelease];
         if (fixture(@"bad-gzip")) [compressed setLength:[compressed length]-4];
@@ -230,6 +251,45 @@ static NSMutableURLRequest *idsLogin(NSString *password) {
         [req setHTTPBody:compressed]; [req setValue:@"gzip" forHTTPHeaderField:@"Content-Encoding"];
     }
     return req;
+}
+static NSData *finishTwoFactor(BOOL ids, NSURLResponse **response, NSError **error) {
+    /* Dismiss the first code and retry the unmodified password. Even numeric
+     * passwords must complete SRP again and request a replacement code. */
+    /* Changed passwords outside the appended-code format also start fresh. */
+    changedPassword = YES;
+    *response = nil; *error = nil;
+    NSMutableURLRequest *retry = ids ? idsLogin(testPassword()) : login(testPassword());
+    NSData *data = [NSURLConnection sendSynchronousRequest:retry returningResponse:response error:error];
+    if (ids) assert(!*error && [[parse(data) objectForKey:@"status"] integerValue] == 5000);
+    else assert([(NSHTTPURLResponse *)*response statusCode] == 401 || [*error code] == NSURLErrorUserCancelledAuthentication);
+    assert(initCalls == 2 && completeCalls == 2 && codeCalls == 2 && !verified && !accountCalls);
+
+    /* A rejected appended code must leave the session available for correction. */
+    *response = nil; *error = nil;
+    NSString *wrong = [testPassword() stringByAppendingString:@"000000"];
+    [NSURLConnection sendSynchronousRequest:ids ? idsLogin(wrong) : login(wrong) returningResponse:response error:error];
+    assert(*error && !verified && codeCalls == 3 && initCalls == 2 && !accountCalls);
+
+    if (fixture(@"2fa-wrong-password")) {
+        /* A different prefix of the expected length looks like password+code.
+         * Code validation succeeds, but SRP must reject the wrong password. */
+        *response = nil; *error = nil;
+        NSString *wrongPassword = @"Alternate:PassWord123456";
+        [NSURLConnection sendSynchronousRequest:ids ? idsLogin(wrongPassword) : login(wrongPassword)
+            returningResponse:response error:error];
+        assert(*error && verified && codeCalls == 4 && initCalls == 3 && completeCalls == 3 && !accountCalls);
+        *response = nil; *error = nil;
+        data = [NSURLConnection sendSynchronousRequest:ids ? idsLogin(testPassword()) : login(testPassword())
+            returningResponse:response error:error];
+        assert(initCalls == 4 && completeCalls == 4 && codeCalls == 4);
+        return data;
+    }
+
+    *response = nil; *error = nil;
+    NSString *correct = [testPassword() stringByAppendingString:@"123456"];
+    data = [NSURLConnection sendSynchronousRequest:ids ? idsLogin(correct) : login(correct) returningResponse:response error:error];
+    assert(verified && codeCalls == 4 && initCalls == 3 && completeCalls == 3);
+    return data;
 }
 int main(int argc, char **argv) {
     NSAutoreleasePool *pool = [NSAutoreleasePool new]; mode = argc > 1 ? [NSString stringWithUTF8String:argv[1]] : @"success";
@@ -240,7 +300,7 @@ int main(int argc, char **argv) {
     if (!fixture(@"disabled")) aq_test_install_otp((IMP)localOTP);
     if ([mode hasPrefix:@"ids-"]) {
         NSURLResponse *response = nil; NSError *error = nil;
-        NSData *data = [NSURLConnection sendSynchronousRequest:idsLogin(@"Synthetic:PassWord") returningResponse:&response error:&error];
+        NSData *data = [NSURLConnection sendSynchronousRequest:idsLogin(testPassword()) returningResponse:&response error:&error];
         if (fixture(@"disabled")) {
             assert(!error && [[parse(data) objectForKey:@"fixture"] isEqual:@"native"]);
             assert(anisetteCalls == 0 && initCalls == 0 && NSClassFromString(@"AQGSAProtocol") == Nil);
@@ -251,11 +311,9 @@ int main(int argc, char **argv) {
         } else if (fixture(@"rejected") || fixture(@"bad-delegate") || fixture(@"missing-token") || fixture(@"missing-profile") || fixture(@"bad-status-type")) {
             assert(error && accountCalls == 1 && !data);
         } else {
-            if (fixture(@"2fa")) {
+            if (twoFactor()) {
                 assert(!error && [[parse(data) objectForKey:@"status"] integerValue] == 5000 && codeCalls == 1 && !accountCalls);
-                response = nil; error = nil;
-                data = [NSURLConnection sendSynchronousRequest:idsLogin(@"Synthetic:PassWord123456") returningResponse:&response error:&error];
-                assert(verified && codeCalls == 2);
+                data = finishTwoFactor(YES, &response, &error);
             }
             assert(!error && [(NSHTTPURLResponse *)response statusCode] == 200 && accountCalls == 1);
             NSDictionary *body = parse(data);
@@ -330,21 +388,19 @@ int main(int argc, char **argv) {
         puts("PASS: offline sign-in via native AOSRequest / CFURLConnection"); [pool drain]; return 0;
     }
     NSURLResponse *response = nil; NSError *error = nil;
-    NSData *data = [NSURLConnection sendSynchronousRequest:login(@"Synthetic:PassWord") returningResponse:&response error:&error];
+    NSData *data = [NSURLConnection sendSynchronousRequest:login(testPassword()) returningResponse:&response error:&error];
     if ([mode isEqual:@"disabled"]) {
         assert(!error && [[parse(data) objectForKey:@"fixture"] isEqual:@"native"]);
         assert(anisetteCalls == 0 && initCalls == 0 && NSClassFromString(@"AQGSAProtocol") == Nil);
         puts("PASS: disable-icloud-gsa preserves native requests and leaves the module unloaded");
         [pool drain]; return 0;
     }
-    if ([mode isEqual:@"2fa"]) {
+    if (twoFactor()) {
         /* CFNetwork may surface a synthetic 401 as NSURLErrorUserCancelledAuthentication. */
         assert(([(NSHTTPURLResponse *)response statusCode] == 401 || [error code] == NSURLErrorUserCancelledAuthentication) && codeCalls == 1 && accountCalls == 0);
-        error = nil; response = nil;
-        data = [NSURLConnection sendSynchronousRequest:login(@"Synthetic:PassWord123456") returningResponse:&response error:&error];
-        assert(verified && codeCalls == 2);
+        data = finishTwoFactor(NO, &response, &error);
     }
-    BOOL success = [mode isEqual:@"success"] || [mode isEqual:@"2fa"];
+    BOOL success = [mode isEqual:@"success"] || twoFactor();
     if (error) fprintf(stderr, "fixture error: %s (%ld), init=%d complete=%d account=%d\n", [[error localizedDescription] UTF8String], (long)[error code], initCalls, completeCalls, accountCalls);
     if (success) {
         assert(!error && [(NSHTTPURLResponse *)response statusCode] == 200);

@@ -56,7 +56,7 @@ for a in x86_64 i386; do
     AQUATRANSPORT_DIR="$CONF/diagnostic" arch -"$a" build/gsa-diagnose --selftest
     AQUATRANSPORT_DIR="$CONF/diagnostic" arch -"$a" build/anisette-service-test
     AQUATRANSPORT_DIR="$CONF/diagnostic" arch -"$a" build/anisette-ipc-test
-    for mode in success bad-proof short-proof malformed redirect missing-anisette 2fa aos aos-basic aos-mixed settings settings-opaque settings-missing settings-redirect aos-settings aos-settings-opaque ids-success ids-gzip ids-2fa ids-rejected ids-bad-gzip ids-gzip-limit ids-gzip-trailing ids-bad-proof ids-missing-anisette ids-redirect ids-bad-delegate ids-missing-token ids-missing-profile ids-bad-status-type; do
+    for mode in success bad-proof short-proof malformed redirect missing-anisette 2fa 2fa-digits 2fa-long-digits 2fa-numeric 2fa-changed 2fa-changed-nondigit 2fa-wrong-password 2fa-unicode aos aos-basic aos-mixed settings settings-opaque settings-missing settings-redirect aos-settings aos-settings-opaque ids-success ids-gzip ids-2fa ids-2fa-digits ids-2fa-long-digits ids-2fa-numeric ids-2fa-changed ids-2fa-changed-nondigit ids-2fa-wrong-password ids-2fa-unicode ids-rejected ids-bad-gzip ids-gzip-limit ids-gzip-trailing ids-bad-proof ids-missing-anisette ids-redirect ids-bad-delegate ids-missing-token ids-missing-profile ids-bad-status-type; do
         AQUATRANSPORT_DIR="$CONF" DYLD_INSERT_LIBRARIES="$LIB" arch -"$a" build/gsaprobe "$mode"
     done
 done
@@ -67,7 +67,7 @@ done
     src/mac/aquatransport_config.c build/openssl/lib/libcrypto.a \
     -framework Foundation -framework IOKit -lz -o build/anisette-ipc-test-gc
 AQUATRANSPORT_DIR="$CONF/diagnostic" build/anisette-ipc-test-gc
-for mode in success 2fa aos aos-basic aos-mixed settings settings-opaque aos-settings aos-settings-opaque ids-gzip ids-2fa ids-rejected ids-bad-gzip; do
+for mode in success 2fa 2fa-digits 2fa-long-digits 2fa-numeric 2fa-changed 2fa-changed-nondigit 2fa-wrong-password 2fa-unicode aos aos-basic aos-mixed settings settings-opaque aos-settings aos-settings-opaque ids-gzip ids-2fa ids-2fa-digits ids-2fa-long-digits ids-2fa-numeric ids-2fa-changed ids-2fa-changed-nondigit ids-2fa-wrong-password ids-2fa-unicode ids-rejected ids-bad-gzip; do
     AQUATRANSPORT_DIR="$CONF" DYLD_INSERT_LIBRARIES="$LIB" build/gsaprobe-gc "$mode"
 done
 printf 'disable-icloud-gsa\n' > "$CONF/flags.txt"

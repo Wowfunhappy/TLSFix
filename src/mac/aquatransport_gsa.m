@@ -356,12 +356,19 @@ static NSDictionary *aq_login(AQGSAProtocol *owner, NSString *user, NSString *pa
     NSString *account = [user lowercaseString];
     NSDictionary *pending = [AQPending objectForKey:account];
     if (pending) {
-        NSString *code = [password length] > 6 ? [password substringFromIndex:[password length]-6] : nil;
-        if (!code || [code rangeOfCharacterFromSet:[[NSCharacterSet characterSetWithCharactersInString:@"0123456789"] invertedSet]].location != NSNotFound) {
-            *error = aq_error(401, @"Enter your password followed by the six-digit verification code."); return nil;
+        NSUInteger length = [password length];
+        NSNumber *originalLength = [pending objectForKey:@"passwordLength"];
+        /* Retrying the original password must never consume its numeric suffix
+         * as a code. Length is a format hint; SRP still checks the password.
+         * NSString length and slicing both use UTF-16 code units. */
+        NSString *code = originalLength && length > 6 && length-6 == [originalLength unsignedIntegerValue] ?
+            [password substringFromIndex:length-6] : nil;
+        if (code && [code rangeOfCharacterFromSet:[[NSCharacterSet characterSetWithCharactersInString:@"0123456789"] invertedSet]].location == NSNotFound) {
+            if (!aq_second_factor(owner, [pending objectForKey:@"identity"], code, error)) return nil;
+            password = [password substringToIndex:length-6];
         }
-        if (!aq_second_factor(owner, [pending objectForKey:@"identity"], code, error)) return nil;
-        password = [password substringToIndex:[password length]-6];
+        /* Otherwise this is a fresh password attempt, including a retry of a
+         * password ending in digits. Authenticate it intact to request a new code. */
         [AQPending removeObjectForKey:account];
     }
     NSDictionary *headers = aq_anisette(owner, error);
@@ -405,6 +412,7 @@ static NSDictionary *aq_login(AQGSAProtocol *owner, NSString *user, NSString *pa
             if (!aq_second_factor(owner, identity, nil, error)) return nil;
             if ([AQPending count] >= 32) [AQPending removeAllObjects];
             [AQPending setObject:[NSDictionary dictionaryWithObjectsAndKeys:identity, @"identity",
+                [NSNumber numberWithUnsignedInteger:[password length]], @"passwordLength",
                 [NSDate dateWithTimeIntervalSinceNow:300], @"expires", nil] forKey:account];
             *error = aq_error(401, @"Approve sign-in on your trusted device, then enter your password followed by the six-digit code."); return nil;
         }
