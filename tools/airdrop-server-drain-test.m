@@ -8,6 +8,7 @@ static BOOL radio_running;
 static uint64_t radio_release_generation;
 static NSHashTable *radio_owners;
 static NSDictionary *helper(NSString *cmd){return @{@"ok":@YES};}
+static BOOL wifi_powered(void){return YES;}
 static unsigned test_interface(const char*n){return radio_running?10:0;}
 #define if_nametoindex test_interface
 #define AQ_RADIO_RELEASE_NS (20*NSEC_PER_MSEC)

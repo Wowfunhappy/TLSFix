@@ -6,9 +6,8 @@
 <string>/usr/share/aquatransport/aquatransport-bootstrap</string>
 </array>
 <key>RunAtLoad</key><true/>
-<!-- Watch the parent directory: launchd opens WatchPaths, and opening tap0
-     reserves that device so OWL would be forced onto tap1. -->
-<key>WatchPaths</key><array><string>/dev</string></array>
+<!-- launchd delivers matching services that exist when the job loads as well
+     as ones that register later. -->
 <key>LaunchEvents</key><dict>
 <key>com.apple.iokit.matching</key><dict>
 <key>WiFiAvailable</key><dict>

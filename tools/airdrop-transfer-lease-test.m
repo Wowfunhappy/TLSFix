@@ -4,11 +4,12 @@
 #include <stdint.h>
 static NSLock *radio_lock;
 static dispatch_source_t heartbeat;
-static BOOL radio_running,helper_ok=YES;
+static BOOL radio_running,helper_ok=YES,wifi_on=YES;
 static uint64_t radio_release_generation;
 static NSHashTable *radio_owners;
-static int radio_stops,server_stops;
-static NSDictionary *helper(NSString *cmd){if([cmd isEqual:@"stop"])radio_stops++;return @{@"ok":@(helper_ok)};}
+static int radio_starts,radio_stops,server_stops;
+static NSDictionary *helper(NSString *cmd){if([cmd isEqual:@"start"])radio_starts++;if([cmd isEqual:@"stop"])radio_stops++;return @{@"ok":@(helper_ok)};}
+static BOOL wifi_powered(void){return wifi_on;}
 static unsigned test_interface(const char*n){return radio_running?10:0;}
 #define if_nametoindex test_interface
 #define AQ_RADIO_RELEASE_NS (20*NSEC_PER_MSEC)
@@ -58,11 +59,15 @@ int main(void){@autoreleasepool {
  acquire_radio(server);resume_transfer_server(server);begin_transfer(incoming,YES);begin_transfer(other,YES);assert(defer_transfer_server_stop(server));
  receive_event(incoming,NULL,10);wait_release();assert(radio_running && receiving_transfers==1);
  receive_stop(other,NULL);wait_release();assert(!radio_running && !receiving_transfers && server_stops==2);
+ // With Wi-Fi off the helper is never asked to start; turning it on allows the radio again.
+ wifi_on=NO;int starts=radio_starts;assert(!acquire_radio(browser) && !radio_running && radio_starts==starts && !radio_owners.count);
+ transfer_start(send,NULL);assert(!objc_getAssociatedObject(send,&transfer_lease_key) && radio_starts==starts);
+ wifi_on=YES;assert(acquire_radio(browser) && radio_starts==starts+1);release_radio(browser);wait_release();assert(!radio_running);
  helper_ok=NO;transfer_start(send,NULL);assert(!objc_getAssociatedObject(send,&transfer_lease_key) && !radio_owners.count);
  native_mode_fixture=YES;
  transfer_start(send,NULL);assert(active_transfers==1 && !radio_owners.count);
  transfer_event(send,NULL,9,NULL);assert(!active_transfers);
  begin_transfer(incoming,YES);assert(active_transfers==1 && !receiving_transfers && !radio_owners.count);
  receive_event(incoming,NULL,10);assert(!active_transfers);
- puts("PASS: navigation, progress, finish, cancel, failure, parallel sends/receives, native transfer deferral, abandoned operation, deferred receive stop, reopen and helper failure");
+ puts("PASS: navigation, progress, finish, cancel, failure, parallel sends/receives, native transfer deferral, abandoned operation, deferred receive stop, reopen and helper failure, Wi-Fi off");
 }return 0;}

@@ -3,6 +3,7 @@
 #import <Foundation/Foundation.h>
 #import <CFNetwork/CFNetwork.h>
 #import <IOBluetooth/IOBluetooth.h>
+#import <CoreWLAN/CoreWLAN.h>
 #import <objc/runtime.h>
 #include <dns_sd.h>
 #include <net/if.h>
@@ -63,6 +64,8 @@ static NSDictionary *helper(NSString *command) {
     }
     close(fd); return reply;
 }
+// Eligibility guarantees a single Wi-Fi interface, so the default one is AirDrop's.
+static BOOL wifi_powered(void) { return [CWInterface interface].powerOn; }
 #include "AQRadio.inc"
 #include "AQTransferLease.inc"
 #include "AQServerDrain.inc"
@@ -162,7 +165,16 @@ static void start_server(id server,SEL selector) {
     prepare_server_drain(server);
     [active_servers addObject:server];
     if(native_mode) { original_start(server,selector); return; }
-    if(!acquire_radio(server)) { [pending_servers addObject:server]; NSLog(@"AquaTransport AirDrop: radio unavailable"); return; }
+    if(!acquire_radio(server)) {
+        [pending_servers addObject:server];
+        NSLog(wifi_powered() ? @"AquaTransport AirDrop: radio unavailable" : @"AquaTransport AirDrop: waiting for Wi-Fi to be turned on");
+        // A started server publishes WirelessEnabled to Finder's AirDrop
+        // listener. Finder relays out only when that value changes, so publish
+        // the current value now; otherwise Finder misses the later power-on.
+        SEL publish=@selector(publishedInfoChanged:);
+        ((void (*)(id,SEL,id))[server methodForSelector:publish])(server,publish,nil);
+        return;
+    }
     [pending_servers removeObject:server];
     resume_transfer_server(server);
     original_start(server,selector);
@@ -227,7 +239,8 @@ __attribute__((constructor)) static void install_airdrop(void) { @autoreleasepoo
        !checked_method(@"SDFileZipper","copyReadStream","^{__CFReadStream=}16@0:8")) return;
 
     Method remove=checked_method(@"SDBonjourBrowser","removeService:type:domain:","v40@0:8@16@24@32");
-    if(!person || !remove || !valid || !checked_method(@"SDBonjourBrowser","clearCacheAndNotify","v16@0:8")) return;
+    if(!person || !remove || !valid || !checked_method(@"SDBonjourBrowser","clearCacheAndNotify","v16@0:8") ||
+       !checked_method(@"SDWormholeServer","publishedInfoChanged:","v24@0:8@16")) return;
     Ivar air_drop=class_getInstanceVariable(NSClassFromString(@"SDBonjourBrowser"),"_isAirDrop");
     if(!start || !stop || !request || !browser_start || !browser_stop || !air_drop || strcmp(ivar_getTypeEncoding(air_drop),"c") || !checked_method(@"SDWormholeConnection","enqueueResponse:code:body:","v40@0:8^{_CFHTTPServerRequest=}16q24^{__CFData=}32")) return;
     browser_airdrop_offset=ivar_getOffset(air_drop);
@@ -253,9 +266,15 @@ __attribute__((constructor)) static void install_airdrop(void) { @autoreleasepoo
     dispatch_source_set_timer(radio_retry_timer,dispatch_time(DISPATCH_TIME_NOW,5*NSEC_PER_SEC),5*NSEC_PER_SEC,NSEC_PER_SEC);
     dispatch_source_set_event_handler(radio_retry_timer,^{
         expire_mode_owner();
-        retry_pending_radio([IOBluetoothHostController defaultController].powerState==kBluetoothHCIPowerStateON);
+        retry_pending_radio([IOBluetoothHostController defaultController].powerState==kBluetoothHCIPowerStateON && wifi_powered());
     });
     dispatch_resume(radio_retry_timer);
+    // Retry as soon as sharingd reports Wi-Fi power on; the timer remains the fallback.
+    [[NSNotificationCenter defaultCenter] addObserverForName:@"com.apple.sharingd.WirelessPowerChanged" object:nil
+        queue:[NSOperationQueue mainQueue] usingBlock:^(NSNotification *note) {
+        (void)note;
+        retry_pending_radio([IOBluetoothHostController defaultController].powerState==kBluetoothHCIPowerStateON && wifi_powered());
+    }];
     struct rebinding hooks[]={ {"DNSServiceBrowse",(void *)&browse,NULL},{"DNSServiceResolve",(void *)&resolve,NULL},{"DNSServiceRegister",(void *)&register_service,NULL},{"DNSServiceQueryRecord",(void *)&query,NULL},{"CFNetServiceRegisterWithOptions",(void *)&register_net_service,NULL},{"CFNetServiceSetTXTData",(void *)&set_txt,NULL},{"_CFHTTPServerResponseCreateWithData",(void *)&response,NULL},{"connect",(void *)&scoped_connect,NULL},{"connectx",(void *)&scoped_connectx,NULL} };
     if(rebind_symbols(hooks,sizeof(hooks)/sizeof(hooks[0]))) return;
     struct rebinding outgoing={"CFURLConnectionCreateWithProperties",(void *)&create_connection,NULL};

@@ -1,5 +1,4 @@
 #import <Foundation/Foundation.h>
-#import <CoreWLAN/CoreWLAN.h>
 #include <launch.h>
 #include <spawn.h>
 #include <sys/stat.h>
@@ -11,31 +10,17 @@
 #include <dispatch/dispatch.h>
 #include <Block.h>
 
-static BOOL tapPresent,hardwareReady,channelReady,disabled,registered;
-static int loads,queryError=ESRCH,spawnError,childStatus,interruptWait;
-static BOOL noResponse;
-static int hardwareChecks,channelChecks,queries;
+static BOOL tapInstalled,hardwareReady,disabled,registered,noResponse,unsafeJob;
+static int loads,queries,hardwareChecks,devChecks,queryError=ESRCH,spawnError,childStatus,interruptWait;
 static int darwin=13;
-static BOOL unsafeJob;
-@interface AQTestChannel : NSObject
-- (NSUInteger)channelNumber;
-@end
-@implementation AQTestChannel
-- (NSUInteger)channelNumber { return 149; }
-@end
-@interface AQTestInterface : NSObject
-+ (id)interfaceWithName:(NSString *)name;
-- (NSArray *)supportedWLANChannels;
-@end
-@implementation AQTestInterface
-+ (id)interfaceWithName:(NSString *)name { (void)name; return [[[self alloc] init] autorelease]; }
-- (NSArray *)supportedWLANChannels { channelChecks++; return channelReady ? @[[[[AQTestChannel alloc] init] autorelease]] : @[]; }
-@end
 static int fakeHardware(char *name,size_t size) { hardwareChecks++; strlcpy(name,"en1",size); return hardwareReady; }
 static int fakeStat(const char *path,struct stat *st) {
     memset(st,0,sizeof(*st));
+    // Boot order on the development Mac: the tap kext creates its device node
+    // after launchd starts the bootstrap job.
+    if(!strncmp(path,"/dev/",5)) { devChecks++; return -1; }
+    if(strstr(path,"/tap.kext")) { st->st_mode=S_IFDIR; return tapInstalled ? 0 : -1; }
     if(unsafeJob) return -1;
-    if(!strcmp(path,"/dev/tap0")) { st->st_mode=S_IFCHR; return tapPresent ? 0 : -1; }
     st->st_mode=strstr(path,".plist") ? S_IFREG : S_IFDIR;
     return 0;
 }
@@ -45,8 +30,7 @@ static launch_data_t fakeLaunch(launch_data_t request) {
     queries++;
     assert(!strcmp(launch_data_get_string(launch_data_dict_lookup(request,LAUNCH_KEY_GETJOB)),"org.aquatransport.airdrop"));
     if(noResponse) return NULL;
-    launch_data_t result=launch_data_alloc(registered ? LAUNCH_DATA_DICTIONARY : LAUNCH_DATA_ERRNO);
-    return result;
+    return launch_data_alloc(registered ? LAUNCH_DATA_DICTIONARY : LAUNCH_DATA_ERRNO);
 }
 static int fakeLaunchErrno(launch_data_t response) { (void)response; return queryError; }
 static int fakeSpawn(pid_t *pid,const char *path,const posix_spawn_file_actions_t *actions,
@@ -78,63 +62,57 @@ static void fakeExit(int status) { assert(status==0); exitCalls++; }
 #define launch_data_get_errno fakeLaunchErrno
 #define posix_spawn fakeSpawn
 #define waitpid fakeWait
-#define CWInterface AQTestInterface
-#define CWChannel AQTestChannel
 #define main bootstrap_main
 #include "../src/mac/aquatransport_bootstrap.m"
 #undef main
 int main(void) { @autoreleasepool {
-    // Boot before drivers exist must not prevent a subsequent successful check.
-    loadAirDropIfEligible(); assert(loads==0);
-    tapPresent=YES; loadAirDropIfEligible(); assert(loads==0);
-    hardwareReady=YES; loadAirDropIfEligible(); assert(loads==0);
-    channelReady=YES; disabled=YES; loadAirDropIfEligible(); assert(loads==0);
-    disabled=NO; interruptWait=1; loadAirDropIfEligible(); assert(loads==1 && registered);
-    int hardwareBefore=hardwareChecks,channelsBefore=channelChecks;
-    for(int i=0;i<10;i++) loadAirDropIfEligible(); assert(loads==1);
-    assert(hardwareChecks==hardwareBefore && channelChecks==channelsBefore);
-    // Failed queries must never be mistaken for absent jobs.
-    registered=NO; queryError=EACCES; loadAirDropIfEligible(); assert(loads==1);
-    noResponse=YES; loadAirDropIfEligible(); assert(loads==1); noResponse=NO;
-    queryError=ESRCH; spawnError=EAGAIN; loadAirDropIfEligible(); assert(loads==2 && !registered);
-    spawnError=0; childStatus=1<<8; loadAirDropIfEligible(); assert(loads==3 && !registered);
-    childStatus=0; loadAirDropIfEligible(); assert(loads==4 && registered);
-    NSDictionary *job=[NSDictionary dictionaryWithContentsOfFile:@"src/mac/org.aquatransport.bootstrap.plist"];
-    assert([job[@"RunAtLoad"] boolValue] && !job[@"StartInterval"] && !job[@"KeepAlive"]);
-    NSDictionary *events=job[@"LaunchEvents"][@"com.apple.iokit.matching"];
-    assert(events.count==2);
-    assert([events[@"WiFiAvailable"][@"IOProviderClass"] isEqual:@"IO80211Interface"]);
-    assert([events[@"BluetoothAvailable"][@"IOProviderClass"] isEqual:@"IOBluetoothHCIController"]);
-    for(NSDictionary *event in events.allValues) assert([event[@"IOMatchLaunchStream"] boolValue]);
-    // launchd opens WatchPaths; a watch on tap0 reserves it before OWL starts.
-    assert([job[@"WatchPaths"] isEqual:@[@"/dev"]]);
-    // Unsupported OS and explicit disablement do not query launchd or hardware.
-    registered=NO; loads=queries=hardwareChecks=channelChecks=0;
-    darwin=12; hardwareAvailable(NULL);
-    assert(!queries && !hardwareChecks && !channelChecks && !loads);
-    darwin=13; disabled=YES; hardwareAvailable(NULL);
-    assert(!queries && !hardwareChecks && !channelChecks && !loads);
-    disabled=NO; unsafeJob=YES; hardwareAvailable(NULL);
-    assert(!queries && !hardwareChecks && !channelChecks && !loads);
+    // Unsupported OS, explicit disablement and an untrusted job neither query
+    // launchd nor inspect hardware.
+    darwin=12; hardwareAvailable(NULL); assert(!queries && !hardwareChecks && !loads);
+    darwin=13; disabled=YES; hardwareAvailable(NULL); assert(!queries && !hardwareChecks && !loads);
+    disabled=NO; unsafeJob=YES; hardwareAvailable(NULL); assert(!queries && !hardwareChecks && !loads);
     unsafeJob=NO;
-    // Startup without prerequisites does one check and schedules no retries.
-    tapPresent=hardwareReady=channelReady=NO;
-    loadAirDropIfEligible(); assert(queries==1 && !hardwareChecks && !loads);
-    // Arrival events rerun eligibility, regardless of how late they arrive.
-    tapPresent=YES; hardwareAvailable(NULL);
-    assert(queries==2 && hardwareChecks==1 && !loads);
-    hardwareReady=YES; hardwareAvailable(NULL);
-    assert(queries==3 && hardwareChecks==2 && channelChecks==1 && !loads);
-    channelReady=YES; hardwareAvailable(NULL);
-    assert(registered && loads==1);
-    queries=hardwareChecks=channelChecks=0;
-    hardwareAvailable(NULL);
-    assert(queries==1 && !hardwareChecks && !channelChecks && loads==1);
+    // Without the TAP driver installed the job is never registered, and the
+    // IOKit hardware is not inspected.
+    tapInstalled=NO; hardwareReady=YES;
+    assert(!loadAirDropIfEligible()); hardwareAvailable(NULL);
+    assert(!loads && !hardwareChecks);
+    // Without one Wi-Fi interface and one Bluetooth LE controller the job is
+    // never registered.
+    tapInstalled=YES; hardwareReady=NO;
+    assert(!loadAirDropIfEligible()); assert(!loads && hardwareChecks==1);
+    // A controller that registers after startup arrives as a matching event.
+    hardwareReady=YES; interruptWait=1; hardwareAvailable(NULL);
+    assert(loads==1 && registered && hardwareChecks==2);
+    // Registration never waits for the TAP device node.
+    assert(!devChecks);
+    // Later events leave the registered helper and its hardware alone.
+    for(int i=0;i<10;i++) hardwareAvailable(NULL);
+    assert(loads==1 && hardwareChecks==2);
+    // Failed queries must never be mistaken for absent jobs.
+    registered=NO; queryError=EACCES; assert(!loadAirDropIfEligible()); assert(loads==1);
+    noResponse=YES; assert(!loadAirDropIfEligible()); assert(loads==1); noResponse=NO;
+    // Failed loads are reported and a later event can still register the job.
+    queryError=ESRCH; spawnError=EAGAIN; assert(!loadAirDropIfEligible()); assert(loads==2 && !registered);
+    spawnError=0; childStatus=1<<8; assert(!loadAirDropIfEligible()); assert(loads==3 && !registered);
+    childStatus=0; hardwareAvailable(NULL); assert(loads==4 && registered);
+    assert(!devChecks);
     // Old idle exits cannot end a newer event; the final exit performs no check.
     int queriesBefore=queries;
     for(int i=0;i<scheduledExits-1;i++) exits[i]();
     assert(!exitCalls);
     exits[scheduledExits-1](); assert(exitCalls==1 && queries==queriesBefore);
     for(int i=0;i<scheduledExits;i++) Block_release(exits[i]);
-    puts("Bootstrap: startup and hardware events, unsupported systems, late readiness, registered-job isolation and idle exit passed.");
+    // The job runs at load and on IOKit arrival of either radio. It has no
+    // timers or path watches: launchd opens WatchPaths targets, and the TAP
+    // device node is runtime state for the helper.
+    NSDictionary *job=[NSDictionary dictionaryWithContentsOfFile:@"src/mac/org.aquatransport.bootstrap.plist"];
+    assert([job[@"RunAtLoad"] boolValue]);
+    assert(!job[@"StartInterval"] && !job[@"KeepAlive"] && !job[@"WatchPaths"]);
+    NSDictionary *events=job[@"LaunchEvents"][@"com.apple.iokit.matching"];
+    assert([job[@"LaunchEvents"] count]==1 && events.count==2);
+    assert([events[@"WiFiAvailable"][@"IOProviderClass"] isEqual:@"IO80211Interface"]);
+    assert([events[@"BluetoothAvailable"][@"IOProviderClass"] isEqual:@"IOBluetoothHCIController"]);
+    for(NSDictionary *event in events.allValues) assert([event[@"IOMatchLaunchStream"] boolValue]);
+    puts("Bootstrap: unsupported systems, missing TAP driver or radios, late hardware events, registration before the TAP node, registered-job isolation, load failures and idle exit passed.");
 } return 0; }

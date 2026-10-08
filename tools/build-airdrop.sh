@@ -38,7 +38,7 @@ for arch in x86_64 i386; do
   bootstrap="$BUILD/aquatransport-bootstrap-$arch"
   clang -arch "$arch" -mmacosx-version-min=10.6 -O2 -fblocks -Wall -Wextra \
     "$DIR/src/mac/aquatransport_bootstrap.m" "$DIR/src/mac/aquatransport_config.c" \
-    -framework Foundation -framework CoreWLAN -o "$bootstrap"
+    -framework Foundation -o "$bootstrap"
   bootstrap_slices+=("$bootstrap")
 done
 lipo -create "${bootstrap_slices[@]}" -output "$ST/aquatransport-bootstrap"

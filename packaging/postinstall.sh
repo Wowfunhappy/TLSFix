@@ -43,7 +43,7 @@ mv -f "$SECURITY_BIN.new" "$SECURITY_BIN"
 update_dyld_shared_cache
 fi
 
-# Run the same eligibility checks used at boot (Anisette starts at Lion).
+# Register optional feature jobs exactly as at boot (Anisette starts at Lion).
 if [ -f "$BOOT_JOB" ]; then
     launchctl unload "$BOOT_JOB" >/dev/null 2>&1 || true
     launchctl load "$BOOT_JOB"

@@ -61,6 +61,6 @@ int main(void) { @autoreleasepool {
     retry_pending_radio(NO);
     assert(!events.count);
     puts("PASS: mode changes defer during transfers, clear Finder's stale peers, restart native owners, and restore modern discovery on request or expired Finder session");
-    puts("PASS: pending receiver retries stop when Finder closes or Bluetooth is off");
+    puts("PASS: pending receiver retries stop when Finder closes or Bluetooth or Wi-Fi is off");
     return 0;
 } }

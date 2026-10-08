@@ -3,11 +3,11 @@
 - (BOOL)powerOn;
 - (NSString *)ssid;
 - (NSString *)interfaceName;
-- (BOOL)setPower:(BOOL)power error:(NSError **)error;
 - (void)disassociate;
 @end
 @interface AQWiFiLease : NSObject
 - (instancetype)initWithInterface:(id<AQWiFiInterface>)interface autoJoin:(int (^)(NSString *))autoJoin;
+// Requires Wi-Fi to be powered on; the lease never changes Wi-Fi power.
 - (void)begin;
 - (void)restore;
 @end

@@ -22,7 +22,7 @@
 static volatile sig_atomic_t stopping;
 static void stopSignal(int sig) { (void)sig; stopping=1; }
 static pid_t owlPID,blePID; static uid_t owner=(uid_t)-1; static double lease;
-static AQWiFiLease *wifiLease;
+static AQWiFiLease *wifiLease; static CWInterface *radioWiFi;
 static double monotonicTime(void) { mach_timebase_info_data_t scale; mach_timebase_info(&scale); return (double)mach_absolute_time()*scale.numer/scale.denom/1e9; }
 
 static BOOL tapReady(void) {
@@ -60,7 +60,7 @@ static pid_t launch(NSString *name,NSArray *arguments) {
 }
 static void reap(pid_t *pid) { if(*pid>0 && waitpid(*pid,NULL,WNOHANG)==*pid) *pid=0; }
 static void terminate(pid_t *pid) { if(*pid>0) { kill(*pid,SIGTERM); for(int i=0;i<30;i++) { if(waitpid(*pid,NULL,WNOHANG)==*pid) { *pid=0; return; } usleep(100000); } kill(*pid,SIGKILL); waitpid(*pid,NULL,0); *pid=0; } }
-static void radioStop(void) { terminate(&blePID); terminate(&owlPID); [wifiLease restore]; wifiLease=nil; owner=(uid_t)-1; }
+static void radioStop(void) { terminate(&blePID); terminate(&owlPID); [wifiLease restore]; wifiLease=nil; radioWiFi=nil; owner=(uid_t)-1; }
 int main(void) { @autoreleasepool {
     if(geteuid()!=0) return 1; umask(077); signal(SIGTERM,stopSignal); signal(SIGINT,stopSignal); signal(SIGPIPE,SIG_IGN);
     struct utsname os;
@@ -79,7 +79,8 @@ int main(void) { @autoreleasepool {
     while(!stopping) { @autoreleasepool {
         uid_t console=(uid_t)-1; gid_t group; CFStringRef user=SCDynamicStoreCopyConsoleUser(NULL,&console,&group); if(user) CFRelease(user);
         reap(&owlPID); reap(&blePID);
-        if(owner!=(uid_t)-1 && (monotonicTime()>lease || console!=owner || !owlPID)) radioStop();
+        // Turning Wi-Fi off ends the session; OWL would otherwise keep running on a powered-off radio.
+        if(owner!=(uid_t)-1 && (monotonicTime()>lease || console!=owner || !owlPID || !radioWiFi.powerOn)) radioStop();
         if(!owlPID && monotonicTime()>last_activity+30) break;
 
         if(owlPID && !blePID) @try { blePID=launch(@"ad_ble_wake",@[@"600"]); } @catch(NSException *e) { radioStop(); }
@@ -100,12 +101,14 @@ int main(void) { @autoreleasepool {
                     AQRequire([IOBluetoothHostController defaultController].powerState==kBluetoothHCIPowerStateON,@"Turn on Bluetooth to use AirDrop.");
                     NSString *interfaceName=[NSString stringWithUTF8String:interface]; CWInterface *wifi=[CWInterface interfaceWithName:interfaceName];
                     AQRequire(wifi!=nil,@"The Wi-Fi interface is unavailable.");
+                    // Finder shows its native Wi-Fi prompt; AirDrop never powers Wi-Fi on.
+                    AQRequire(wifi.powerOn,@"Turn on Wi-Fi to use AirDrop.");
                     AQRequire(supportsAirDropChannel(wifi),@"The Wi-Fi interface does not support AirDrop's configured channel 149.");
                     int (*autoJoin)(NSString *)=dlsym(RTLD_DEFAULT,"CWInterfaceStartAutoJoin");
                     int (^join)(NSString *)=autoJoin ? ^int(NSString *name){ return autoJoin(name); } : nil;
                     wifiLease=[[AQWiFiLease alloc] initWithInterface:(id<AQWiFiInterface>)wifi autoJoin:join];
                     @try {
-                        [wifiLease begin];
+                        [wifiLease begin]; radioWiFi=wifi;
 
                         // Retain OWL's normal RSSI admission/grace thresholds.
                         // Disabling them admitted distant masters whose schedule

@@ -1,9 +1,11 @@
 #ifndef AQ_RADIO_RELEASE_NS
 #define AQ_RADIO_RELEASE_NS (3*NSEC_PER_SEC)
 #endif
+// With Wi-Fi off, Finder shows its native Wi-Fi prompt. Starting the helper
+// then would fail, so AirDrop waits for the user to turn Wi-Fi on.
 static uint32_t ensure_radio(void) {
     [radio_lock lock];
-    if(!radio_running) {
+    if(!radio_running && wifi_powered()) {
         radio_running=[helper(@"start")[@"ok"] boolValue];
         if(radio_running && !heartbeat) {
             heartbeat=dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER,0,0,dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT,0));
@@ -16,7 +18,7 @@ static uint32_t ensure_radio(void) {
                 }
                 // A surviving browser/server must recover after helper exit or lease
                 // expiry. Keep retrying on this timer if the first start fails.
-                if(!radio_running && radio_owners.count) {
+                if(!radio_running && radio_owners.count && wifi_powered()) {
                     radio_running=[helper(@"start")[@"ok"] boolValue];
                     if(radio_running) NSLog(@"AquaTransport AirDrop: radio lease recovered");
                 }

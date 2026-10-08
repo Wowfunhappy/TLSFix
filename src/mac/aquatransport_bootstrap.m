@@ -1,7 +1,9 @@
-/* One-shot boot coordinator for optional AquaTransport features. Keep feature
- * eligibility here so their launchd jobs are not registered unnecessarily. */
+/* Boot coordinator for optional AquaTransport features. Feature jobs are
+ * registered only on systems that can use them, judged by durable facts: the
+ * OS, configuration flags, installed files and IOKit hardware. Runtime state
+ * such as device nodes and the Wi-Fi channel list is checked by the on-demand
+ * helpers instead, because it settles after launchd starts this job. */
 #import <Foundation/Foundation.h>
-#import <CoreWLAN/CoreWLAN.h>
 #include "aquatransport_airdrop_hardware.h"
 #include "aquatransport_config.h"
 #include "aquatransport_anisette_service.h"
@@ -23,12 +25,6 @@ static BOOL trusted(NSString *path) {
     for(NSString *parent=[path stringByDeletingLastPathComponent];parent.length>1;parent=[parent stringByDeletingLastPathComponent])
         if(lstat(parent.fileSystemRepresentation,&st) || !S_ISDIR(st.st_mode) || st.st_uid!=0 || (st.st_mode&022)) return NO;
     return YES;
-}
-
-static BOOL supportsAirDropChannel(CWInterface *wifi) {
-    if(!wifi) return NO;
-    for(CWChannel *channel in wifi.supportedWLANChannels) if(channel.channelNumber==149) return YES;
-    return NO;
 }
 
 typedef enum { AQJobUnknown, AQJobMissing, AQJobRegistered } AQJobState;
@@ -71,19 +67,39 @@ static void loadAnisetteIfEligible(void) {
     loadJob(AQ_ANISETTE_JOB,"org.aquatransport.anisette");
 }
 
-// One eligibility check per startup or hardware event; no timed retries.
+// tuntaposx installs its kext bundle and a LaunchDaemon that loads it; the
+// kext creates /dev/tap0 a few seconds into boot, so test the installed bundle.
+static BOOL tapDriverInstalled(void) {
+    static const char *const bundles[]={"/Library/Extensions/tap.kext","/System/Library/Extensions/tap.kext"};
+    struct stat st;
+    for(size_t i=0;i<sizeof(bundles)/sizeof(*bundles);i++)
+        if(!lstat(bundles[i],&st) && S_ISDIR(st.st_mode)) return YES;
+    return NO;
+}
+
+// Runs at load and again whenever launchd delivers a Wi-Fi interface or
+// Bluetooth controller, including ones that register after this job starts.
+// The /dev/tap0 node, channel 149 and Bluetooth power are runtime state that
+// sharingd's adapter and the helper's start command check on every request.
 static BOOL loadAirDropIfEligible(void) {
-    struct utsname os; char interface[32]={0}; struct stat tap;
+    struct utsname os; char interface[32]={0};
     if(uname(&os) || atoi(os.release)!=13 || sizeof(void *)!=8 || tf_flag("disable-modern-airdrop")) return YES;
-    if(!trusted(@AQ_AIRDROP_JOB)) return YES;
-    // Once registered, the helper owns all live radio checks. Bootstrap retries
-    // must not open CoreWLAN or inspect the hardware during an active session.
+    if(!trusted(@AQ_AIRDROP_JOB)) {
+        NSLog(@"AquaTransport bootstrap: %s is missing or not root-owned",AQ_AIRDROP_JOB);
+        return YES;
+    }
+    // Once registered, the helper owns all live radio checks. Later events
+    // must not inspect the hardware during an active session.
     AQJobState state=jobState("org.aquatransport.airdrop");
     if(state!=AQJobMissing) return state==AQJobRegistered;
-    if(lstat("/dev/tap0",&tap) || !S_ISCHR(tap.st_mode) ||
-       !hardware_supported(interface,sizeof(interface))) return NO;
-    if(!supportsAirDropChannel([CWInterface interfaceWithName:[NSString stringWithUTF8String:interface]])) return NO;
-
+    if(!tapDriverInstalled()) {
+        NSLog(@"AquaTransport bootstrap: AirDrop requires the TAP driver (tap.kext)");
+        return NO;
+    }
+    if(!hardware_supported(interface,sizeof(interface))) {
+        NSLog(@"AquaTransport bootstrap: AirDrop requires one Wi-Fi interface and one Bluetooth LE controller");
+        return NO;
+    }
     return loadJob(AQ_AIRDROP_JOB,"org.aquatransport.airdrop");
 }
 
