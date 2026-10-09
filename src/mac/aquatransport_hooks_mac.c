@@ -119,6 +119,8 @@ static OSStatus (*o_SSLCopyPeerTrust)(SSLContextRef, SecTrustRef *);
 static OSStatus (*o_SSLCopyPeerCertificates)(SSLContextRef, CFArrayRef *);
 static OSStatus (*o_SSLSetCertificate)(SSLContextRef, CFArrayRef);
 
+#include "aquatransport_reporting.inc"
+
 // Installs the URL rewriter's CFNetwork hooks. Pure C -- see src/mac/aquatransport_rewrite.c for
 // why it rebinds CFNetwork's C API by name. Safe in every process and installed unconditionally:
 // nothing is loaded, no framework is pulled in, and processes that never touch CFNetwork simply
@@ -255,7 +257,11 @@ static OSStatus my_SSLHandshake(SSLContextRef c) {
     OSStatus rv;
     if (!s->rf || !s->wf || !s->conn || s->clientBypass || (s->serverSide && (!server_tls_enabled() || s->serverBypass || !s->clientX509)) || s->state == -1) { rv = o_SSLHandshake(c); goto done; }
     sh_unblock_write(s);   // an entry like any other; see bio_bwrite
-    if (!s->inited) { if (ossl_init(s)) { s->state = -1; rv = o_SSLHandshake(c); goto done; } s->state = 1; }
+    if (!s->inited) {
+        capture_reporting(s);
+        if (ossl_init(s)) { s->state = -1; rv = o_SSLHandshake(c); goto done; }
+        s->state = 1;
+    }
     if (s->state == 3) s->approved = 1;   // app approved the server after the auth break, let it proceed
     ERR_clear_error();                    // see the note above my_SSLRead
     int ret = SSL_do_handshake(s->ssl);
@@ -441,15 +447,17 @@ static OSStatus my_SSLGetSessionState(SSLContextRef c, SSLSessionState *st) {
     return rv;
 }
 
-// Report a protocol/cipher from the era the caller understands. On 10.6/10.7 the
-// kTLSProtocol11/12 enum values do not exist at all, so kTLSProtocol1 (4) and
-// 0x002F are the only pair safe across the whole 10.6-10.9 range. The connection
-// underneath is whatever OpenSSL actually negotiated.
+// Present the native context's compatibility answers, never the wire version.
+// For example, Qt's TLS-1.2 minimum must not see the old hardcoded TLS-1.0 answer,
+// and a TLS-1.0-only client must not see the TLS 1.3 OpenSSL actually negotiated.
 static OSStatus my_SSLGetNegotiatedProtocolVersion(SSLContextRef c, SSLProtocol *p) {
     if (!tf_on()) return o_SSLGetNegotiatedProtocolVersion(c, p);
     Shadow *s = sh_get(c);
     OSStatus rv;
-    if (s && (s->state == 2 || s->state == 3)) { if (p) *p = kTLSProtocol1; rv = noErr; }
+    if (s && (s->state == 2 || s->state == 3)) {
+        rv = p ? s->reportedProtocolStatus : errSecParam;
+        if (p) *p = s->reportedProtocol;
+    }
     else rv = o_SSLGetNegotiatedProtocolVersion(c, p);
     sh_release(s);
     return rv;
@@ -460,8 +468,8 @@ static OSStatus my_SSLGetNegotiatedCipher(SSLContextRef c, SSLCipherSuite *ciphe
     Shadow *s = sh_get(c);
     OSStatus rv;
     if (s && (s->state == 2 || s->state == 3)) {
-        if (cipher) *cipher = 0x002F; // TLS_RSA_WITH_AES_128_CBC_SHA
-        rv = noErr;
+        rv = cipher ? s->reportedCipherStatus : errSecParam;
+        if (cipher) *cipher = s->reportedCipher;
     }
     else rv = o_SSLGetNegotiatedCipher(c, cipher);
     sh_release(s);
@@ -596,6 +604,10 @@ static pthread_once_t g_origs_once = PTHREAD_ONCE_INIT;
 static int g_origs_ok = 0;
 
 static void resolve_origs(void) {
+    native_protocol_min = (OSStatus (*)(SSLContextRef, SSLProtocol *))
+        dlsym(RTLD_DEFAULT, "SSLGetProtocolVersionMin");
+    native_protocol_max = (OSStatus (*)(SSLContextRef, SSLProtocol *))
+        dlsym(RTLD_DEFAULT, "SSLGetProtocolVersionMax");
     int ok = 1;
     for (size_t i = 0; i < NHOOKS; i++) {
         void *real = dlsym(RTLD_DEFAULT, kHooks[i].name);

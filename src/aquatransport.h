@@ -46,6 +46,12 @@ typedef struct {
     size_t           peerIDLen;
     int              inited;
     int              state;
+    // Native-context compatibility answers, frozen at handshake start. These never
+    // configure OpenSSL; its wire protocol/ciphers remain independent.
+    SSLProtocol      reportedProtocol;
+    SSLCipherSuite   reportedCipher;
+    OSStatus         reportedProtocolStatus;
+    OSStatus         reportedCipherStatus;
     int              breakAuth;
     // SSLSetEnableCertVerify(false): the caller has taken the certificate check on itself --
     // what curl's -k does on this platform. Secure Transport then completes the handshake

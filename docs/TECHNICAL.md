@@ -305,6 +305,33 @@ Two consequences for anyone editing `src/mac/aquatransport_hooks_mac.c`:
 trust-daemon deny list carries no hooks at all. The per-hook `tf_on()` gate still runs on
 every call: `tf_reentrant()` is dynamic and cannot be decided at install time.
 
+## Protocol and cipher compatibility reporting
+
+OpenSSL's wire negotiation is independent of the application's Secure Transport
+protocol and cipher settings. A caller restricted to TLS 1.0 can still reach a
+TLS-1.3-only server. The negotiated-version and negotiated-cipher getters present
+a synthetic native-compatible pair instead of exposing that upgrade to the caller.
+
+At handshake start, the hook reads the native context's effective configuration:
+the highest enabled protocol and the first enabled cipher suitable for that
+protocol, in native list order. Native setters remain untouched, so both explicit
+settings and OS defaults are reflected, including rejected setter calls leaving
+the old settings intact. The 10.8/10.9 min/max getters are resolved by name; the
+10.6/10.7 path uses per-version enable flags without importing newer APIs.
+
+The pair is frozen for the handshake and available at the server-authentication
+pause as well as after completion. No configured protocol/cipher pair means the
+reporting getters return an error; it does not restrict OpenSSL's negotiation.
+Debug logs label these values `compatibility`, while `handshake ok` continues to
+record the actual wire protocol and cipher. These are compatibility answers, not
+a claim to reproduce which cipher a particular server would have chosen natively.
+
+`bash tools/test-reporting.sh` runs x86_64 and i386 clients against an in-process
+TLS-1.3-only peer over socket pairs, checking defaults, exact and minimum versions,
+legacy setters, cipher restrictions, authentication-pause reporting and payload
+I/O. It also exercises simulated legacy enable flags without the newer getters.
+It installs nothing and works with AquaTransport already installed.
+
 ## Rules
 
 Blocks separated by blank lines, each beginning with a **scope** line: `*` for every
